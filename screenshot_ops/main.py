@@ -24,6 +24,9 @@ import torch
 
 from screenshot_ops.dispatch import RecordingDispatch, TensorTracker
 from screenshot_ops.excel_writer import ExcelWriter
+from screenshot_ops.graph import build_graph
+from screenshot_ops.graph_builder import build_compute_graph
+from screenshot_ops.fusion_pass import FusionRule, FusionPass, export_fusion_rules_json
 from screenshot_ops.model_loader import load_model
 from screenshot_ops.tracker import ModuleTracker
 
@@ -149,6 +152,15 @@ def run_trace(
 
     logger.info("Captured %d ops.", len(recorder.records))
 
+    # Build lightweight data-flow graph for correct fusion I/O resolution
+    graph = build_graph(recorder.records, tensor_tracker.passthroughs)
+    logger.info("Built data-flow graph (%d producers, %d passthroughs).",
+                len(graph.tensor_producer), len(graph.passthroughs))
+
+    # Build NetworkX ComputeGraph for graph-based fusion
+    compute_graph = build_compute_graph(recorder.records, tensor_tracker.passthroughs)
+    logger.info("Built compute graph (%s).", compute_graph)
+
     config_summary = build_config_summary(
         model_id, config, num_layers, batch_size, seq_len)
 
@@ -157,8 +169,22 @@ def run_trace(
         output_path = Path(f"{slug}_ops.xlsx")
     output_path = Path(output_path)
 
-    writer = ExcelWriter(tracker)
+    writer = ExcelWriter(tracker, graph)
     writer.write(recorder.records, output_path, config_summary)
+
+    # Apply graph-based fusion using discovered fusion rules
+    from screenshot_ops.fusion import FusionEngine
+    fusion_engine = FusionEngine(tracker, graph)
+    fused = fusion_engine.fuse(recorder.records)
+    specs = fusion_engine.extract_specs(fused)
+    fusion_rules = FusionRule.from_specs(specs)
+
+    fused_graph, fusion_result = FusionPass(fusion_rules).apply(compute_graph)
+    logger.info("Graph fusion: %s", fusion_result.summary())
+
+    json_path = export_fusion_rules_json(fusion_rules, output_path)
+    logger.info("Fusion rules exported to %s", json_path)
+
     logger.info("Output saved to %s", output_path)
 
     return output_path, recorder.records

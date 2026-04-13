@@ -13,3 +13,6 @@ transformers>=4.36.0,<5.0.0
 
 # openpyxl: write formatted Excel workbook
 openpyxl>=3.1.0
+
+# networkx: computation graph (DiGraph) for fusion pass
+networkx>=3.0

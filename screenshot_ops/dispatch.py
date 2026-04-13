@@ -20,15 +20,21 @@ class TensorTracker:
     """Assign stable unique IDs to tensors seen during tracing.
 
     id(tensor) is not reliable on meta device, so we maintain our own counter.
+
+    Also maintains ``passthroughs``: for every skip op (view/reshape/etc.) we
+    record  output_tensor_id → input_tensor_id  so that the DataFlowGraph can
+    resolve tensor identity chains that pass through skipped ops.
     """
 
     def __init__(self):
         self._counter = 0
         self._id_map: Dict[int, int] = {}
+        self.passthroughs: Dict[int, int] = {}   # skip-op output_id → input_id
 
     def reset(self):
         self._counter = 0
         self._id_map.clear()
+        self.passthroughs.clear()
 
     def get_id(self, t: torch.Tensor) -> int:
         oid = id(t)
@@ -63,6 +69,10 @@ class RecordingDispatch(TorchDispatchMode):
         output_ids = [self.tensor_tracker.get_id(t) for t in output_tensors]
 
         if self._skip_reshapes and func_name in SKIP_OPS:
+            # Record passthrough: each skip-op output inherits its input's ID,
+            # so the DataFlowGraph can resolve chains through skipped ops.
+            for out_id, in_id in zip(output_ids, input_ids[:len(output_ids)]):
+                self.tensor_tracker.passthroughs[out_id] = in_id
             return out
 
         module_path = ""

@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 class ExcelWriter:
     """Write operator records to a formatted Excel workbook + fusion rules JSON."""
 
-    def __init__(self, tracker: ModuleTracker):
+    def __init__(self, tracker: ModuleTracker, graph=None):
         self._tracker = tracker
-        self._fusion_engine = FusionEngine(tracker)
+        self._fusion_engine = FusionEngine(tracker, graph)
         self._header_fill = PatternFill(start_color="263238", end_color="263238", fill_type="solid")
         self._header_font_white = Font(bold=True, color="FFFFFF", size=11)
         self._header_font = Font(bold=True, size=12)
@@ -183,6 +183,8 @@ class ExcelWriter:
                 "fused_output_shapes": s.fused_output_shapes,
                 "fused_output_dtypes": s.fused_output_dtypes,
                 "fused_output_sources": s.fused_output_sources,
+                "input_map": s.input_map,
+                "output_map": s.output_map,
             }
             for s in specs
         ]
