@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
 
+from zrt.common.chip_spec import ChipSpec
+
 class PDDisaggregation(Enum):
     PREFILL = auto()
     DECODE = auto()
@@ -16,6 +18,9 @@ class PDDisaggregation(Enum):
 
 @dataclass
 class RuntimeConfig():
+    # chip
+    chip_spec: ChipSpec
+
     # Parallel
     parallel_config:"ParallelConfig"
     
@@ -28,6 +33,7 @@ class RuntimeConfig():
 
     # Chunked Prefill
     chunked_prefill_size:int
+
 
 @dataclass
 class ParallelConfig():

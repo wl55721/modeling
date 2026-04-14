@@ -1,0 +1,113 @@
+H100-SXM:
+  vendor: NVIDIA
+  cube_tflops:
+    float16: 989.0
+    bfloat16: 989.0
+    float8_e4m3: 1979.0
+    int8: 1979.0
+  vector_tflops:
+    float32: 67.0
+    float16: 134.0
+  hbm_bandwidth_gbps: 3350.0
+  hbm_capacity_gb: 80.0
+  l2_capacity_mb: 50.0
+  sram_capacity_mb: 50.0
+  interconnects:
+    scaleup:
+      name: NVLink4
+      bandwidth_gbps: 450.0
+    host:
+      name: PCIe5
+      bandwidth_gbps: 64.0
+  extras:
+    sm_count: 132
+
+H200-SXM:
+  vendor: NVIDIA
+  cube_tflops:
+    float16: 989.0
+    bfloat16: 989.0
+    float8_e4m3: 1979.0
+    int8: 1979.0
+  vector_tflops:
+    float32: 67.0
+    float16: 134.0
+  hbm_bandwidth_gbps: 4800.0
+  hbm_capacity_gb: 141.0
+  l2_capacity_mb: 50.0
+  sram_capacity_mb: 50.0
+  interconnects:
+    scaleup:
+      name: NVLink4
+      bandwidth_gbps: 450.0
+    host:
+      name: PCIe5
+      bandwidth_gbps: 64.0
+  extras:
+    sm_count: 132
+
+A100-SXM-80G:
+  vendor: NVIDIA
+  cube_tflops:
+    float16: 312.0
+    bfloat16: 312.0
+    int8: 624.0
+  vector_tflops:
+    float32: 19.5
+    float16: 78.0
+  hbm_bandwidth_gbps: 2039.0
+  hbm_capacity_gb: 80.0
+  l2_capacity_mb: 40.0
+  interconnects:
+    scaleup:
+      name: NVLink3
+      bandwidth_gbps: 300.0
+    host:
+      name: PCIe4
+      bandwidth_gbps: 32.0
+  extras:
+    sm_count: 108
+
+Ascend-910B:
+  vendor: ASCEND
+  cube_tflops:
+    float16: 376.0
+    bfloat16: 376.0
+    int8: 752.0
+  vector_tflops:
+    float32: 75.0
+    float16: 150.0
+  hbm_bandwidth_gbps: 1600.0
+  hbm_capacity_gb: 64.0
+  l2_capacity_mb: 192.0
+  interconnects:
+    scaleup:
+      name: HCCS
+      bandwidth_gbps: 392.0
+    host:
+      name: PCIe5
+      bandwidth_gbps: 64.0
+  extras:
+    ai_core_count: 24
+    cube_vector_ratio: "1:1"
+
+Ascend-910C:
+  vendor: ASCEND
+  cube_tflops:
+    float16: 752.0
+    bfloat16: 752.0
+    int8: 1504.0
+  vector_tflops:
+    float32: 150.0
+    float16: 300.0
+  hbm_bandwidth_gbps: 3200.0
+  hbm_capacity_gb: 128.0
+  interconnects:
+    scaleup:
+      name: HCCS
+      bandwidth_gbps: 784.0
+    host:
+      name: PCIe5
+      bandwidth_gbps: 64.0
+  extras:
+    die_count: 2
