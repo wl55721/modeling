@@ -3,6 +3,13 @@ class RuntimeConfig:
     def __init__(self):
         """初始化运行时配置"""
         self.ai_chip_config = None
+        # 命令行参数
+        self.model_target = []
+        self.operator = "MatMul"
+        self.batch_size = 32
+        self.seq_len = 1024
+        self.hidden_size = 768
+        self.policy_type = "priority"
 
 class AIChipConfig:
     """AI芯片配置类"""

@@ -97,23 +97,38 @@ def create_operator(operator_name: str, input_param: InputParam, hidden_size: in
         print(f"创建算子失败: {e}")
         return None
 
+def setup_runtime_config(args) -> RuntimeConfig:
+    """设置运行时配置"""
+    # 初始化配置
+    rt_config = RuntimeConfig()
+    rt_config.ai_chip_config = AIChipConfig()
+    
+    # 将命令行参数写入RuntimeConfig
+    rt_config.model_target = args.model_target
+    rt_config.operator = args.operator
+    rt_config.batch_size = args.batch_size
+    rt_config.seq_len = args.seq_len
+    rt_config.hidden_size = args.hidden_size
+    rt_config.policy_type = args.policy_type
+    
+    return rt_config
+
 def main():
     """主函数"""
     # 解析命令行参数
     args = parse_args()
     
-    # 初始化配置
-    rt_config = RuntimeConfig()
-    rt_config.ai_chip_config = AIChipConfig()
+    # 设置运行时配置
+    rt_config = setup_runtime_config(args)
     
     # 初始化输入参数
-    input_param = InputParam(batch_size=args.batch_size, seq_len=args.seq_len)
+    input_param = InputParam(batch_size=rt_config.batch_size, seq_len=rt_config.seq_len)
     
     # 初始化模型
-    cost_model_manager, policy_model_manager = initialize_models(args.model_target, rt_config)
+    cost_model_manager, policy_model_manager = initialize_models(rt_config.model_target, rt_config)
     
     # 创建算子
-    op = create_operator(args.operator, input_param, args.hidden_size)
+    op = create_operator(rt_config.operator, input_param, rt_config.hidden_size)
     if not op:
         return
     
@@ -123,14 +138,14 @@ def main():
     # 使用成本模型预测
     print("\n===== 成本模型预测 =====")
     cost = cost_model_manager.predict(op, input_tensors)
-    print(f"算子 {args.operator} 的预测成本: {cost}")
+    print(f"算子 {rt_config.operator} 的预测成本: {cost}")
     
     # 使用策略模型预测
     print("\n===== 策略模型预测 =====")
     try:
-        policy_type = PolicyType(args.policy_type)
+        policy_type = PolicyType(rt_config.policy_type)
         policy_score = policy_model_manager.predict(policy_type, op, input_tensors)
-        print(f"策略 {args.policy_type} 的预测分数: {policy_score}")
+        print(f"策略 {rt_config.policy_type} 的预测分数: {policy_score}")
     except ValueError as e:
         print(f"策略模型预测失败: {e}")
 
