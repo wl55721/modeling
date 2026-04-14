@@ -187,6 +187,14 @@ class FusionEngine:
             g.pop("_children", None)
         return groups
 
+    def fuse_keep_children(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Same as ``fuse`` but preserves ``_children`` for graph building."""
+        groups = self._pass1_leaf(records)
+        groups = self._pass2_parent(groups)
+        for i, g in enumerate(groups):
+            g["idx"] = i
+        return groups
+
     def extract_specs(self, fused: List[Dict[str, Any]]) -> List[FusionSpec]:
         specs_by_key: Dict[Tuple[str, str], FusionSpec] = {}
         for g in fused:

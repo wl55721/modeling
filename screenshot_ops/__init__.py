@@ -19,12 +19,17 @@ from screenshot_ops.classifier import (
     classify_component as _classify_component,
     extract_layer_idx as _extract_layer_idx,
 )
+from screenshot_ops.graph_builder import build_op_graph, build_fused_op_graph
+from screenshot_ops.graph_exporter import export_all as export_graphs
 
 __all__ = [
     "main",
     "run_trace",
     "build_config_summary",
     "load_model",
+    "build_op_graph",
+    "build_fused_op_graph",
+    "export_graphs",
     "_classify_component",
     "_extract_layer_idx",
     "_is_moe_module",

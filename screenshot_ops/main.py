@@ -1,15 +1,15 @@
-"""Entry point: load model, trace forward, write Excel + JSON.
+"""Entry point: load model, trace forward, write Excel + JSON + computation graph.
 
 Public API::
 
     from screenshot_ops import run_trace, build_config_summary, load_model
 
-    output_path, records = run_trace(
+    output_dir, records = run_trace(
         model_id="deepseek-ai/DeepSeek-V3-0324",
         num_layers=4,
         batch_size=1,
         seq_len=128,
-        output_path="output.xlsx",   # optional
+        output_dir="output/graph/DeepSeek-V3-0324",  # optional
     )
 """
 from __future__ import annotations
@@ -24,6 +24,8 @@ import torch
 
 from screenshot_ops.dispatch import RecordingDispatch, TensorTracker
 from screenshot_ops.excel_writer import ExcelWriter
+from screenshot_ops.graph_builder import build_op_graph, build_fused_op_graph
+from screenshot_ops.graph_exporter import export_all
 from screenshot_ops.model_loader import load_model
 from screenshot_ops.tracker import ModuleTracker
 
@@ -89,14 +91,20 @@ def build_config_summary(
     return {k: v for k, v in summary.items() if v is not None}
 
 
+def _make_model_slug(model_id: str) -> str:
+    """Create a filesystem-safe slug from a model ID."""
+    return re.sub(r"[^\w]+", "_", Path(model_id).name).strip("_")
+
+
 def run_trace(
     model_id: str,
     num_layers: int = 4,
     batch_size: int = 1,
     seq_len: int = 128,
-    output_path: Optional[Any] = None,
+    output_dir: Optional[Any] = None,
+    phase: str = "forward",
 ) -> Tuple[Path, List[Dict[str, Any]]]:
-    """Load *model_id*, trace one forward pass, write Excel, return results.
+    """Load *model_id*, trace one forward pass, write Excel + graph outputs.
 
     Parameters
     ----------
@@ -108,16 +116,18 @@ def run_trace(
         Dummy input batch size.
     seq_len:
         Dummy input sequence length.
-    output_path:
-        Path for the output ``.xlsx`` file.  Defaults to
-        ``<model_slug>_ops.xlsx`` in the current directory.
+    output_dir:
+        Directory for all output files.  Defaults to
+        ``output/graph/<model_slug>/``.
+    phase:
+        Phase name used in output file names (default: ``"forward"``).
 
     Returns
     -------
-    (output_path, records)
-        output_path — ``Path`` to the written Excel file.
-        records     — list of op-record dicts (``aten_op``, ``component``,
-                      ``layer``, ``module_path``, shape/dtype fields, …).
+    (output_dir, records)
+        output_dir — ``Path`` to the output directory containing all artifacts.
+        records    — list of op-record dicts (``aten_op``, ``component``,
+                     ``layer``, ``module_path``, shape/dtype fields, …).
     """
     logger.info("Loading model %s (%d layers) …", model_id, num_layers)
     model, config = load_model(model_id, num_hidden_layers=num_layers)
@@ -149,26 +159,54 @@ def run_trace(
 
     logger.info("Captured %d ops.", len(recorder.records))
 
+    # ── Resolve output directory ──────────────────────────────────────────
+    slug = _make_model_slug(model_id)
+    if output_dir is None:
+        output_dir = Path("output") / "graph" / slug
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     config_summary = build_config_summary(
         model_id, config, num_layers, batch_size, seq_len)
 
-    if output_path is None:
-        slug = re.sub(r"[^\w]+", "_", Path(model_id).name)
-        output_path = Path(f"{slug}_ops.xlsx")
-    output_path = Path(output_path)
-
+    # ── Write Excel (same as before, into the output dir) ────────────────
+    excel_path = output_dir / f"{slug}_{phase}_ops.xlsx"
     writer = ExcelWriter(tracker)
-    writer.write(recorder.records, output_path, config_summary)
-    logger.info("Output saved to %s", output_path)
+    writer.write(recorder.records, excel_path, config_summary)
+    logger.info("Excel saved to %s", excel_path)
 
-    return output_path, recorder.records
+    # ── Build and export computation graphs ──────────────────────────────
+    logger.info("Building computation graphs …")
+    raw_graph = build_op_graph(recorder.records)
+
+    from screenshot_ops.fusion import FusionEngine
+    fusion_engine = FusionEngine(tracker)
+    # Fuse but keep _children for graph building
+    fused_with_children = fusion_engine.fuse_keep_children(recorder.records)
+    fused_graph = build_fused_op_graph(fused_with_children, recorder.records)
+
+    graph_paths = export_all(
+        raw_graph=raw_graph,
+        fused_graph=fused_graph,
+        raw_records=recorder.records,
+        fused_records=fused_with_children,
+        output_dir=output_dir,
+        model_name=slug,
+        phase=phase,
+    )
+
+    logger.info("All outputs saved to %s", output_dir)
+    for artifact, path in graph_paths.items():
+        logger.info("  %s: %s", artifact, path)
+
+    return output_dir, recorder.records
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Trace LLM operator sequences and write Excel report.")
+        description="Trace LLM operator sequences and write Excel + computation graph.")
     parser.add_argument(
         "model_id", nargs="?",
         help="HF Hub model ID or local directory (e.g. deepseek-ai/DeepSeek-V3-0324)")
@@ -181,8 +219,10 @@ def main() -> None:
                         help="Dummy input batch size (default: 1)")
     parser.add_argument("--seq-len", type=int, default=128,
                         help="Dummy input sequence length (default: 128)")
-    parser.add_argument("--output", "-o",
-                        help="Output .xlsx path (default: <model_slug>_ops.xlsx)")
+    parser.add_argument("--output-dir", "-o",
+                        help="Output directory (default: output/graph/<model_slug>)")
+    parser.add_argument("--phase", default="forward",
+                        help="Phase name for file naming (default: forward)")
     args = parser.parse_args()
 
     # Resolve model_id: positional takes precedence over --model shorthand
@@ -195,14 +235,15 @@ def main() -> None:
     else:
         parser.error("Provide a model_id argument or --model v3/v3.2")
 
-    output_path = Path(args.output) if args.output else None
+    output_dir = Path(args.output_dir) if args.output_dir else None
 
     run_trace(
         model_id=model_id,
         num_layers=args.layers,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
-        output_path=output_path,
+        output_dir=output_dir,
+        phase=args.phase,
     )
 
 

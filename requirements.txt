@@ -13,3 +13,9 @@ transformers>=4.36.0,<5.0.0
 
 # openpyxl: write formatted Excel workbook
 openpyxl>=3.1.0
+
+# networkx: computation graph (DAG) construction and analysis
+networkx>=3.0
+
+# onnx: export computation graph for Netron visualization
+onnx>=1.14.0
