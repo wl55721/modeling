@@ -1,0 +1,4 @@
+torch>=2.7
+transformers>=4.40
+networkx>=3.2
+pytest>=8.0
