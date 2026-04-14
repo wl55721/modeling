@@ -41,6 +41,9 @@ class OperatorBase:
                 for dim in shape:
                     size *= dim
                 self.memory_bytes += size * dtype_size
+    
+    def get_overlap_cost(self, ai_chip_config):
+        return 0.0, 0.0
 
 class OpVectorBase(OperatorBase):
     def __init__(self, op_model, op_name):

@@ -14,19 +14,34 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 from zrt.policy_model.policy_register import register_model, PolicyType
 from zrt.policy_model.policy_model_manager import PolicyModelManager
+from zrt.runtime_config import RuntimeConfig, AIChipConfig
+from zrt.layers.op_base import OperatorBase
+from zrt.tensor_base import TensorBase
 
-# 假设的RuntimeConfig类
-class RuntimeConfig:
-    def __init__(self):
-        self.ai_chip_config = None
+# 创建测试用的算子类
+class TestOp(OperatorBase):
+    def __init__(self, op_model, op_name):
+        super().__init__(op_model, op_name, is_vector=True, op_dtype=None)
+    
+    def __call__(self, inputs, **kwargs):
+        pass
+    
+    def get_overlap_cost(self, ai_chip_config):
+        return 1.0, 2.0
 
-# 假设的OperatorBase类
-class OperatorBase:
-    pass
-
-# 假设的TensorBase类
-class TensorBase:
-    pass
+# 创建测试用的张量类
+class TestTensor(TensorBase):
+    def __init__(self, shape):
+        self.shape = shape
+    
+    def get_shape(self):
+        return self.shape
+    
+    def get_string(self):
+        return str(self.shape)
+    
+    def get_flops(self):
+        return 0.0
 
 def test_policy_model():
     """测试policy_model模块的功能"""
@@ -48,8 +63,8 @@ def test_policy_model():
         return False
     
     # 测试预测功能
-    op = OperatorBase()
-    input_tensor = [TensorBase()]
+    op = TestOp(None, "TestOp")
+    input_tensor = [TestTensor((1, 1024)), TestTensor((1024, 1024))]
     
     # 测试所有策略类型
     policy_types = [

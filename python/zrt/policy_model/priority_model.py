@@ -4,13 +4,7 @@ from zrt.layers.op_base import OperatorBase
 from zrt.tensor_base import TensorBase
 from zrt.runtime_config import RuntimeConfig
 from zrt.policy_model.policy_base_model import PolicyBaseModel
-
-class CostModelManager:
-    def __init__(self, ai_chip_config, rt_config, model_target):
-        pass
-    
-    def predict(self, op, input_tensor, **kwargs):
-        return 0.0
+from zrt.cost_model.cost_model_manager import CostModelManager
 
 class Modeltype(Enum):
     LOOKUP = auto()
