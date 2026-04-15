@@ -21,16 +21,30 @@ CostFn = Callable[[Node, ChipSpec], OpResult]
 ContentionFn = Callable[[Node, Node], float]
 
 
+from zrt.ops.op_base import get_class_by_name
+
 def _default_cost(node: Node, chip: ChipSpec) -> OpResult:
-    return OpResult(
-        static_cost=0.0,
-        total_compute_flops=0.0,
-        total_compute_time=1.0,
-        compute_formula="",
-        total_memory_bytes=0.0,
-        total_memory_time=0.0,
-        memory_formula="",
-    )
+    try:
+        # 根据 node 的 op_name 获取对应的算子类
+        op_class = get_class_by_name(node.op_name)
+        # 创建算子实例
+        op = op_class(chip)
+        # 设置输入和输出张量
+        op.inputs = node.inputs
+        op.outputs = node.outputs
+        # 调用 get_memory_cost 方法获取成本信息
+        return op.get_memory_cost()
+    except ValueError:
+        # 如果找不到对应的算子类，返回默认值
+        return OpResult(
+            static_cost=0.0,
+            total_compute_flops=0.0,
+            total_compute_time=1.0,
+            compute_formula="",
+            total_memory_bytes=0.0,
+            total_memory_time=0.0,
+            memory_formula="",
+        )
 
 
 def _default_contention(a: Node, b: Node) -> float:

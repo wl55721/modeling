@@ -2,7 +2,7 @@ from typing import Dict, Iterator
 
 import networkx as nx
 
-from python.zrt.graph.node import Node
+from zrt.graph.node import Node
 
 
 MAX_STREAMS_PER_RANK = 2

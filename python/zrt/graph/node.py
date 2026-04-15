@@ -1,6 +1,6 @@
 from typing import List, Mapping, Optional
 
-from python.zrt.common.tensor_base import TensorBase
+from zrt.common.tensor_base import TensorBase
 
 
 class Node:
