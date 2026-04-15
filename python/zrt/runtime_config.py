@@ -9,7 +9,11 @@ class RuntimeConfig:
         self.batch_size = 32
         self.seq_len = 1024
         self.hidden_size = 768
+        self.num_layers = 12
+        self.num_heads = 12
+        self.vocab_size = 50257
         self.policy_type = "priority"
+        self.output_file = None
 
 class AIChipConfig:
     """AI芯片配置类"""

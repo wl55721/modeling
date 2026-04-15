@@ -46,3 +46,40 @@ class ScaledDotProductAttention(OpVectorBase):
             dynamic_inputs.append(TensorBase(shape=in_shape, dtype=tensor.dtype))
         
         return dynamic_inputs
+    
+    def get_overlap_cost(self, ai_chip_config):
+        """计算算子的重叠成本"""
+        # 假设硬件参数
+        flops_per_second = 1e12  # 1 TFLOPS
+        memory_bandwidth = 1e12  # 1 TB/s
+        
+        # 计算FLOPS
+        flops = 0.0
+        if len(self.inputs) >= 3:
+            # 注意力计算: Q[B,S,D] * K^T[B,D,S] = [B,S,S], FLOPS = 2*B*S*S*D
+            shape = self.inputs[0].get_shape()
+            if len(shape) == 3:
+                B, S, D = shape
+                flops = 2 * B * S * S * D
+        
+        # 计算内存访问
+        memory_access = 0.0
+        for tensor in self.inputs:
+            shape = tensor.get_shape()
+            elements = 1
+            for dim in shape:
+                elements *= dim
+            memory_access += elements * 2  # 假设FP16
+        for tensor in self.outputs:
+            shape = tensor.get_shape()
+            elements = 1
+            for dim in shape:
+                elements *= dim
+            memory_access += elements * 2  # 假设FP16
+        
+        # 计算时间
+        compute_time = flops / flops_per_second * 1000  # 毫秒
+        memory_time = memory_access / memory_bandwidth * 1000  # 毫秒
+        
+        # 返回计算时间和内存时间
+        return compute_time, memory_time
