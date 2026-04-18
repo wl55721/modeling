@@ -47,43 +47,63 @@ openpyxl>=3.1.0
 
 ```bash
 # HF Hub 模型（只下载 config.json，不下载权重）
-python screenshot_ops.py deepseek-ai/DeepSeek-V3-0324 --layers 4
-python screenshot_ops.py deepseek-ai/DeepSeek-V3      --layers 4
-python screenshot_ops.py Qwen/Qwen3-8B                --layers 4
-python screenshot_ops.py Qwen/Qwen3-30B-A3B           --layers 4   # MoE 变体
-python screenshot_ops.py mistralai/Mistral-7B-v0.1    --layers 2
+python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3-0324 --layers 4
+python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3      --layers 4
+python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct     --layers 4
+python -m python.zrt.graph.main mistralai/Mistral-7B-v0.1    --layers 2
 
 # 本地目录（包含 config.json 即可）
-python screenshot_ops.py ./hf_models/deepseek_v3      --layers 4
-python screenshot_ops.py ./hf_models/llama3_8b        --layers 2
+python -m python.zrt.graph.main ./hf_models/deepseek_v3   --layers 4
+python -m python.zrt.graph.main ./hf_models/llama3_8b     --layers 2
+
+# 仅抓 prefill 阶段；指定输出目录
+python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 --phases prefill -o output/my_run
+
+# 抓图 + 打印性能报告（需指定硬件）
+python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 --hw nvidia_h100_sxm
+python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sxm --tp 8
 
 # 向后兼容的 --model 简写
-python -m screenshot_ops.main --model v3
-python -m screenshot_ops.main --model v3.2
+python -m python.zrt.graph.main --model v3
+python -m python.zrt.graph.main --model v3.2
 ```
 
-输出文件默认保存在当前目录，命名规则为 `<model_slug>_ops.xlsx`。
+输出文件默认保存在 `output/graph/<model_slug>/`，每个阶段（prefill / decode）各生成一组文件：`_ops.xlsx`、`_raw_graph.json/.onnx`、`_fused_graph.json/.onnx`。
 
 ### Python API
 
 ```python
-from screenshot_ops import run_trace
+from python.zrt.graph import run_trace_phases
 
-# 返回 (输出路径, 算子记录列表)
-output_path, records = run_trace(
+# 推荐：prefill + decode 一次完成
+result = run_trace_phases(
     model_id="deepseek-ai/DeepSeek-V3-0324",
     num_layers=4,
     batch_size=1,
     seq_len=128,
-    output_path="my_output.xlsx",   # 可选，默认自动命名
+    phases=("prefill", "decode"),   # 默认同时抓两阶段
 )
 
-print(f"捕获算子数: {len(records)}")
-print(f"输出文件: {output_path}")
+# 访问 OpGraph IR
+raw_graph, fused_graph = result.graphs["prefill"]
+print(f"prefill 原始图: {raw_graph}")      # OpGraph(nodes=..., edges=...)
+print(f"prefill 融合图: {fused_graph}")
 
-# records 是 list[dict]，每条包含:
-# idx, aten_op, module_path, layer, component,
-# input_shapes, input_dtypes, output_shapes, output_dtypes
+# 算子记录（list[dict]）
+records = result.phase_records["prefill"]
+print(f"捕获算子数: {len(records)}")
+print(f"输出目录:   {result.output_dir}")
+```
+
+```python
+from python.zrt.graph import run_trace
+
+# 单阶段（向后兼容）
+output_dir, records = run_trace(
+    model_id="deepseek-ai/DeepSeek-V3-0324",
+    num_layers=4,
+    phase="prefill",
+)
 ```
 
 ---

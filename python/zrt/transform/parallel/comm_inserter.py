@@ -1,0 +1,207 @@
+"""CommInserterPass: insert communication nodes at parallel split boundaries."""
+from __future__ import annotations
+
+import copy
+from typing import TYPE_CHECKING
+
+from python.zrt.ir.edge import Edge
+from python.zrt.ir.node import OpNode
+from python.zrt.transform.base import GraphPass
+
+if TYPE_CHECKING:
+    from python.zrt.ir.graph import OpGraph
+    from python.zrt.transform.context import TransformContext
+
+
+def _make_comm_node(node_id: str, collective: str,
+                    src_node: OpNode, group_size: int) -> OpNode:
+    """Create a comm.* OpNode that wraps src_node's outputs."""
+    return OpNode(
+        id=node_id,
+        op_type=f"comm.{collective}",
+        inputs=copy.deepcopy(src_node.outputs),
+        outputs=copy.deepcopy(src_node.outputs),  # all_reduce: shape unchanged
+        attrs={"group_size": group_size, "collective": collective},
+        scope=src_node.scope,
+        category="communication",
+    )
+
+
+def _rewire(g: "OpGraph", src_id: str, comm_node: OpNode) -> None:
+    """Insert comm_node between src_id and all its current successors.
+
+    Before: src → [s1, s2, ...]
+    After:  src → comm → [s1, s2, ...]
+    """
+    # Collect out-edges of src that we need to reroute
+    old_out = [e for e in g.edges if e.src == src_id]
+
+    # Remove those edges from the graph
+    g.edges = [e for e in g.edges if e.src != src_id]
+
+    # Add the comm node
+    g.nodes[comm_node.id] = comm_node
+    g._succ[comm_node.id] = []
+    g._pred[comm_node.id] = []
+
+    # src → comm (one edge per output slot of src)
+    src_node = g.nodes[src_id]
+    for i, out_tensor in enumerate(src_node.outputs):
+        g.edges.append(Edge(
+            src=src_id, src_idx=i,
+            dst=comm_node.id, dst_idx=i,
+            tensor=out_tensor,
+        ))
+
+    # comm → old successors
+    for e in old_out:
+        g.edges.append(Edge(
+            src=comm_node.id, src_idx=e.src_idx,
+            dst=e.dst, dst_idx=e.dst_idx,
+            tensor=e.tensor,
+        ))
+
+    g._rebuild_adjacency()
+
+
+class CommInserterPass(GraphPass):
+    """Insert comm nodes at positions annotated by TensorParallelPass / ExpertParallelPass.
+
+    TP all_reduce:
+        Inserted after every row-parallel linear node
+        (those with annotations["tp_split"]["comm_after"] = "all_reduce").
+
+    EP all-to-all:
+        For the first expert op in each MoE block, insert a dispatch A2A before it.
+        For the last expert op, insert a combine A2A after it.
+        (Simplified: annotates boundary nodes; full MoE block detection is heuristic.)
+    """
+
+    name = "comm_inserter"
+
+    def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
+        g = graph.clone()
+        self._insert_tp_comm(g, ctx)
+        self._insert_ep_comm(g, ctx)
+        return g
+
+    # ── TP: all_reduce after row-parallel linears ─────────────────────────────
+
+    def _insert_tp_comm(self, g: "OpGraph", ctx: "TransformContext") -> None:
+        tp = ctx.parallel.tp
+        if tp <= 1:
+            return
+
+        # Iterate over a snapshot; we'll mutate g.nodes during the loop
+        tp_nodes = [
+            n for n in list(g.topo_sort())
+            if n.annotations.get("tp_split", {}).get("comm_after") == "all_reduce"
+        ]
+        for i, node in enumerate(tp_nodes):
+            comm_id = f"comm_allreduce_{node.id}"
+            if comm_id in g.nodes:
+                continue
+            comm_node = _make_comm_node(comm_id, "all_reduce", node, tp)
+            comm_node.annotations["inserted_by"] = "tp_pass"
+            _rewire(g, node.id, comm_node)
+
+    # ── EP: all-to-all dispatch/combine around expert blocks ──────────────────
+
+    def _insert_ep_comm(self, g: "OpGraph", ctx: "TransformContext") -> None:
+        ep = ctx.parallel.ep
+        if ep <= 1:
+            return
+
+        # Find nodes that need A2A
+        ep_nodes = [
+            n for n in g.topo_sort()
+            if n.annotations.get("ep_needs_a2a")
+               and not n.annotations.get("ep_a2a_inserted")
+        ]
+        if not ep_nodes:
+            return
+
+        # Group by scope prefix (everything up to "experts")
+        # Insert one dispatch A2A before the first expert node in the block
+        # and one combine A2A after the last expert node in the block.
+        # Simple heuristic: treat all ep_nodes as one block per scope root.
+        processed_scopes: set[str] = set()
+        for node in ep_nodes:
+            scope_root = _moe_scope_root(node.scope)
+            if scope_root in processed_scopes:
+                continue
+            processed_scopes.add(scope_root)
+
+            # Nodes in this scope
+            block = [n for n in ep_nodes if _moe_scope_root(n.scope) == scope_root]
+            first, last = block[0], block[-1]
+
+            # dispatch A2A: insert before first expert node (as a predecessor)
+            dispatch_id = f"comm_a2a_dispatch_{first.id}"
+            combine_id  = f"comm_a2a_combine_{last.id}"
+
+            if dispatch_id not in g.nodes:
+                dispatch = OpNode(
+                    id=dispatch_id,
+                    op_type="comm.all_to_all",
+                    inputs=copy.deepcopy(first.inputs[:1]),
+                    outputs=copy.deepcopy(first.inputs[:1]),
+                    attrs={"group_size": ep, "collective": "all_to_all",
+                           "role": "dispatch"},
+                    scope=first.scope,
+                    category="communication",
+                )
+                dispatch.annotations["inserted_by"] = "ep_pass"
+                g.add_node(dispatch)
+                # Rewire: in-edges of first → dispatch → first
+                _prepend_comm(g, first.id, dispatch)
+
+            if combine_id not in g.nodes:
+                combine = OpNode(
+                    id=combine_id,
+                    op_type="comm.all_to_all",
+                    inputs=copy.deepcopy(last.outputs[:1]),
+                    outputs=copy.deepcopy(last.outputs[:1]),
+                    attrs={"group_size": ep, "collective": "all_to_all",
+                           "role": "combine"},
+                    scope=last.scope,
+                    category="communication",
+                )
+                combine.annotations["inserted_by"] = "ep_pass"
+                _rewire(g, last.id, combine)
+
+            for n in block:
+                n.annotations["ep_a2a_inserted"] = True
+
+
+def _moe_scope_root(scope: str) -> str:
+    """Return the scope prefix up to (not including) the expert index."""
+    for kw in ("experts.", "expert_"):
+        idx = scope.lower().find(kw)
+        if idx >= 0:
+            return scope[:idx]
+    return scope
+
+
+def _prepend_comm(g: "OpGraph", dst_id: str, comm_node: OpNode) -> None:
+    """Insert comm_node between all predecessors of dst_id and dst_id itself."""
+    in_edges = [e for e in g.edges if e.dst == dst_id]
+    g.edges = [e for e in g.edges if e.dst != dst_id]
+
+    # predecessors → comm
+    for e in in_edges:
+        g.edges.append(Edge(
+            src=e.src, src_idx=e.src_idx,
+            dst=comm_node.id, dst_idx=e.dst_idx,
+            tensor=e.tensor,
+        ))
+
+    # comm → dst
+    for i, out_tensor in enumerate(comm_node.outputs):
+        g.edges.append(Edge(
+            src=comm_node.id, src_idx=i,
+            dst=dst_id, dst_idx=i,
+            tensor=out_tensor,
+        ))
+
+    g._rebuild_adjacency()

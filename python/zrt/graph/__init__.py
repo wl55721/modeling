@@ -11,10 +11,14 @@ from python.zrt.graph.main import (
     main,
     run_trace,
     run_trace_phases,
+    TraceResult,
+    TracePhaseResult,
     build_config_summary,
     infer_layer_types,
     auto_target_layers,
 )
+from python.zrt.ir.graph import OpGraph
+from python.zrt.ir.adapter import records_to_opgraph, fused_records_to_opgraph
 from python.zrt.graph.model_loader import load_model
 from python.zrt.graph.patches import (
     _is_moe_module,
@@ -27,15 +31,34 @@ from python.zrt.graph.classifier import (
 from python.zrt.graph.graph_builder import build_op_graph, build_fused_op_graph
 from python.zrt.graph.graph_exporter import export_all as export_graphs
 from python.zrt.graph.compat import find_local_fallback, _LOCAL_REGISTRY
+from python.zrt.graph.fusion_rules import (
+    ALWAYS_TRANSPARENT,
+    SHAPE_OPS,
+    INIT_OPS,
+    PATTERN_SKIP,
+    SEMANTIC_LABELS,
+    PLATFORM_SUBPATTERNS,
+    PLATFORM_SETTINGS,
+    get_semantic_label,
+    get_subpatterns,
+    get_platform_settings,
+    match_subsequence,
+    SubPattern,
+)
 
 __all__ = [
     "main",
     "run_trace",
     "run_trace_phases",
+    "TraceResult",
+    "TracePhaseResult",
     "build_config_summary",
     "infer_layer_types",
     "auto_target_layers",
     "load_model",
+    "OpGraph",
+    "records_to_opgraph",
+    "fused_records_to_opgraph",
     "build_op_graph",
     "build_fused_op_graph",
     "export_graphs",
@@ -45,4 +68,17 @@ __all__ = [
     "_patch_moe_for_meta",
     "find_local_fallback",
     "_LOCAL_REGISTRY",
+    # fusion rules (new)
+    "ALWAYS_TRANSPARENT",
+    "SHAPE_OPS",
+    "INIT_OPS",
+    "PATTERN_SKIP",
+    "SEMANTIC_LABELS",
+    "PLATFORM_SUBPATTERNS",
+    "PLATFORM_SETTINGS",
+    "get_semantic_label",
+    "get_subpatterns",
+    "get_platform_settings",
+    "match_subsequence",
+    "SubPattern",
 ]

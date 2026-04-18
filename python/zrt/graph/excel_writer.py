@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 class ExcelWriter:
     """Write operator records to a formatted Excel workbook + fusion rules JSON."""
 
-    def __init__(self, tracker: ModuleTracker):
+    def __init__(self, tracker: ModuleTracker, platform: str = "generic"):
         self._tracker = tracker
-        self._fusion_engine = FusionEngine(tracker)
+        self._fusion_engine = FusionEngine(tracker, platform=platform)
         self._header_fill = PatternFill(start_color="263238", end_color="263238", fill_type="solid")
         self._header_font_white = Font(bold=True, color="FFFFFF", size=11)
         self._header_font = Font(bold=True, size=12)
@@ -174,7 +174,7 @@ class ExcelWriter:
 
         self._export_fusion_json(fusion_specs, output_path)
 
-    def _export_fusion_json(self, specs: List[FusionSpec], output_path: Path):
+    def _export_fusion_json(self, specs: List["FusionSpec"], output_path: Path):
         json_path = output_path.with_name(output_path.stem + "_fusion_rules.json")
         json_data = [
             {
@@ -196,6 +196,70 @@ class ExcelWriter:
         json_path.write_text(json.dumps(json_data, indent=2))
         logger.info("Exported fusion rules to %s", json_path)
 
+    def _write_summary_perf_sheet(self, ws, summary: "E2ESummary") -> None:
+        """Write one E2ESummary into a pre-created worksheet."""
+        header_font = Font(bold=True, size=11)
+        section_fill = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
+        section_font = Font(bold=True, size=10, color="1B5E20")
+
+        def _section(label: str) -> None:
+            row = ws.max_row + 1
+            cell = ws.cell(row=row, column=1, value=label)
+            cell.font = section_font
+            cell.fill = section_fill
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+
+        def _row(key: str, value: Any) -> None:
+            ws.append([key, value])
+
+        ws.column_dimensions["A"].width = 32
+        ws.column_dimensions["B"].width = 24
+        ws.cell(row=1, column=1, value="Metric").font = header_font
+        ws.cell(row=1, column=2, value="Value").font = header_font
+
+        _section("── Metadata ──")
+        _row("Model",         summary.model)
+        _row("Hardware",      summary.hardware)
+        _row("Phase",         summary.phase)
+        _row("Parallel",      summary.parallel_desc)
+        _row("Batch size",    summary.batch_size)
+        _row("Seq len",       summary.seq_len)
+
+        _section("── Latency ──")
+        _row("Total latency (ms)",  round(summary.latency_ms,     3))
+        if summary.ttft_ms is not None:
+            _row("TTFT (ms)",       round(summary.ttft_ms,        3))
+        if summary.tpot_ms is not None:
+            _row("TPOT (ms/token)", round(summary.tpot_ms,        3))
+        _row("Throughput (tok/s)",  round(summary.tokens_per_sec, 1))
+
+        _section("── Compute / Comm ──")
+        _row("Compute (ms)",        round(summary.compute_ms,      3))
+        _row("Comm (ms)",           round(summary.comm_ms,         3))
+        _row("Exposed comm (ms)",   round(summary.exposed_comm_ms, 3))
+        _row("Overlap ratio",       f"{summary.overlap_ratio:.1%}")
+
+        _section("── HW Efficiency ──")
+        _row("MFU",                 f"{summary.mfu:.2%}")
+        _row("HBM BW util",         f"{summary.hbm_bandwidth_util:.2%}")
+        _row("Total FLOPs (T)",     round(summary.total_flops / 1e12, 4))
+        _row("Total bytes (GB)",    round(summary.total_bytes / 1e9,  4))
+
+        if summary.by_component:
+            _section("── By Component (% of serial latency) ──")
+            for comp, pct in sorted(summary.by_component.items(), key=lambda x: -x[1]):
+                _row(comp, f"{pct:.1f}%")
+
+        if summary.by_layer:
+            _section("── By Layer (ms) ──")
+            for i, lat in enumerate(summary.by_layer):
+                _row(f"Layer {i}", round(lat, 4))
+
+        if summary.top_bottleneck_ops:
+            _section("── Top Bottleneck Ops (µs) ──")
+            for op_desc, lat_us in summary.top_bottleneck_ops:
+                _row(op_desc, round(lat_us, 2))
+
     def _write_header(self, ws, columns):
         for col_idx, (name, width) in enumerate(columns, 1):
             cell = ws.cell(row=1, column=col_idx, value=name)
@@ -213,3 +277,25 @@ class ExcelWriter:
                 cell.fill = fill
             if col_idx in center_cols:
                 cell.alignment = Alignment(horizontal="center")
+
+
+def append_perf_summary(xlsx_path: Path, summary: "E2ESummary") -> None:
+    """Open *xlsx_path* and append a performance-report sheet for *summary*.
+
+    Sheet name: ``Perf Report (<phase>)``.  Safe to call multiple times
+    (once per phase); each call adds one sheet.
+    """
+    from python.zrt.report.summary import E2ESummary  # local import avoids circular deps
+
+    wb = openpyxl.load_workbook(xlsx_path)
+    sheet_name = f"Perf Report ({summary.phase})"
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(sheet_name)
+
+    writer = ExcelWriter.__new__(ExcelWriter)   # create without __init__ (no tracker needed)
+    writer._header_font = Font(bold=True, size=12)
+    writer._write_summary_perf_sheet(ws, summary)
+
+    wb.save(xlsx_path)
+    logger.info("Appended '%s' sheet to %s", sheet_name, xlsx_path)

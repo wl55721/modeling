@@ -38,10 +38,71 @@ from python.zrt.graph.graph_builder import build_op_graph, build_fused_op_graph
 from python.zrt.graph.graph_exporter import export_all
 from python.zrt.graph.model_loader import load_model
 from python.zrt.graph.tracker import ModuleTracker
+from python.zrt.ir.adapter import (
+    records_to_opgraph,
+    fused_records_to_opgraph,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 logger = logging.getLogger(__name__)
+
+
+# ── Backward-compatible result types ──────────────────────────────────────────
+
+class TracePhaseResult(tuple):
+    """Return value of :func:`run_trace_phases`.
+
+    Behaves as a 2-tuple ``(output_dir, phase_records)`` for backward
+    compatibility.  New code can also access ``.graphs`` for the
+    ``OpGraph`` IR objects.
+
+    Attributes
+    ----------
+    graphs : Dict[str, Tuple[OpGraph, OpGraph]]
+        Maps each phase name to ``(raw_opgraph, fused_opgraph)``.
+    """
+
+    def __new__(cls, output_dir: Path, phase_records: Dict, phase_graphs: Dict):
+        instance = super().__new__(cls, (output_dir, phase_records))
+        instance.graphs: Dict[str, Tuple[Any, Any]] = phase_graphs
+        return instance
+
+    @property
+    def output_dir(self) -> Path:
+        return self[0]
+
+    @property
+    def phase_records(self) -> Dict:
+        return self[1]
+
+
+class TraceResult(tuple):
+    """Return value of :func:`run_trace`.
+
+    Behaves as a 2-tuple ``(output_dir, records)`` for backward
+    compatibility.  New code can also access ``.graphs``.
+
+    Attributes
+    ----------
+    graphs : Tuple[OpGraph, OpGraph] | None
+        ``(raw_opgraph, fused_opgraph)`` for the traced phase, or
+        ``None`` if graph building was skipped.
+    """
+
+    def __new__(cls, output_dir: Path, records: List, graphs):
+        instance = super().__new__(cls, (output_dir, records))
+        instance.graphs = graphs  # Tuple[OpGraph, OpGraph] | None
+        return instance
+
+    @property
+    def output_dir(self) -> Path:
+        return self[0]
+
+    @property
+    def records(self) -> List:
+        return self[1]
+
 
 # Backward-compat map for --model v3 / v3.2 shorthand
 _MODEL_DIRS = {
@@ -301,23 +362,40 @@ def _save_phase_outputs(
     slug: str,
     output_dir: Path,
     config_summary: Dict[str, Any],
-) -> None:
-    """Write Excel + JSON + ONNX graph files for one phase."""
+    platform: str = "generic",
+) -> Tuple[Any, Any]:
+    """Write Excel + JSON + ONNX graph files for one phase.
+
+    Returns
+    -------
+    (raw_opgraph, fused_opgraph)
+        Both are :class:`~python.zrt.ir.graph.OpGraph` instances built
+        from the raw and fused records respectively.
+    """
     from python.zrt.graph.fusion import FusionEngine
 
     excel_path = output_dir / f"{slug}_{phase}_ops.xlsx"
-    writer = ExcelWriter(tracker)
+    writer = ExcelWriter(tracker, platform=platform)
     writer.write(records, excel_path, config_summary)
     logger.info("Excel saved to %s", excel_path)
 
-    raw_graph = build_op_graph(records)
-    fusion_engine = FusionEngine(tracker)
+    # Build OpGraph IR (primary representation)
+    graph_name = f"{slug}_{phase}"
+    raw_opgraph = records_to_opgraph(records, name=graph_name, phase=phase)
+
+    fusion_engine = FusionEngine(tracker, platform=platform)
     fused_with_children = fusion_engine.fuse_keep_children(records)
-    fused_graph = build_fused_op_graph(fused_with_children, records)
+    fused_opgraph = fused_records_to_opgraph(
+        fused_with_children, name=f"{graph_name}_fused", phase=phase
+    )
+
+    # Build NX graphs for export (existing exporter expects nx.DiGraph)
+    raw_nx = build_op_graph(records)
+    fused_nx = build_fused_op_graph(fused_with_children, records)
 
     graph_paths = export_all(
-        raw_graph=raw_graph,
-        fused_graph=fused_graph,
+        raw_graph=raw_nx,
+        fused_graph=fused_nx,
         raw_records=records,
         fused_records=fused_with_children,
         output_dir=output_dir,
@@ -326,6 +404,8 @@ def _save_phase_outputs(
     )
     for artifact, path in graph_paths.items():
         logger.info("  %s: %s", artifact, path)
+
+    return raw_opgraph, fused_opgraph
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -339,6 +419,7 @@ def run_trace_phases(
     phases: Tuple[str, ...] = ("prefill", "decode"),
     target_layers: Optional[List[int]] = None,
     auto_layers: bool = True,
+    platform: str = "generic",
 ) -> Tuple[Path, Dict[str, List[Dict[str, Any]]]]:
     """Load *model_id* once, trace each requested phase, write separate files.
 
@@ -416,6 +497,7 @@ def run_trace_phases(
     )
 
     all_records: Dict[str, List[Dict[str, Any]]] = {}
+    all_graphs: Dict[str, Tuple[Any, Any]] = {}
     past_key_values: Any = None
     canonical_phases = [_PHASE_ALIASES.get(p, p) for p in phases]
 
@@ -448,15 +530,17 @@ def run_trace_phases(
                     target_layers, before, len(records),
                 )
 
-            _save_phase_outputs(
-                records, tracker, phase, slug, output_dir, config_summary)
+            raw_opgraph, fused_opgraph = _save_phase_outputs(
+                records, tracker, phase, slug, output_dir, config_summary,
+                platform=platform)
             all_records[phase] = records
+            all_graphs[phase] = (raw_opgraph, fused_opgraph)
 
     finally:
         fake_mode.__exit__(None, None, None)
 
     logger.info("All outputs saved to %s", output_dir)
-    return output_dir, all_records
+    return TracePhaseResult(output_dir, all_records, all_graphs)
 
 
 def run_trace(
@@ -468,6 +552,7 @@ def run_trace(
     phase: str = "prefill",
     target_layers: Optional[List[int]] = None,
     auto_layers: bool = False,
+    platform: str = "generic",
 ) -> Tuple[Path, List[Dict[str, Any]]]:
     """Load *model_id*, trace a single phase, write Excel + graph outputs.
 
@@ -492,7 +577,7 @@ def run_trace(
     -------
     (output_dir, records)
     """
-    output_dir, phase_records = run_trace_phases(
+    result = run_trace_phases(
         model_id=model_id,
         num_layers=num_layers,
         batch_size=batch_size,
@@ -501,9 +586,11 @@ def run_trace(
         phases=(_PHASE_ALIASES.get(phase, phase),),
         target_layers=target_layers,
         auto_layers=auto_layers,
+        platform=platform,
     )
     canonical = _PHASE_ALIASES.get(phase, phase)
-    return output_dir, phase_records[canonical]
+    phase_graphs = result.graphs.get(canonical)
+    return TraceResult(result.output_dir, result.phase_records[canonical], phase_graphs)
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
@@ -535,6 +622,29 @@ def main() -> None:
     parser.add_argument(
         "--phase", default=None,
         help="(legacy) Trace a single phase. Overrides --phases when set.")
+
+    parser.add_argument(
+        "--platform",
+        default="generic",
+        choices=["cuda", "ascend_npu", "cpu", "generic"],
+        help="Target inference platform for fusion labelling "
+             "(default: generic).  Controls which fused op names are assigned "
+             "(e.g. flash_attn on cuda, npu_fusion_attention on ascend_npu).",
+    )
+
+    # Performance report
+    parser.add_argument(
+        "--hw",
+        metavar="HW",
+        default=None,
+        help="Hardware spec name for performance report (e.g. nvidia_h100_sxm). "
+             "When set, prints an E2ESummary after tracing. "
+             f"Available: {', '.join(__import__('python.zrt.hardware.registry', fromlist=['list_available']).list_available())}",
+    )
+    parser.add_argument(
+        "--tp", type=int, default=1,
+        help="Tensor-parallel degree used when --hw is set (default: 1).",
+    )
 
     # Layer selection
     _layer_group = parser.add_mutually_exclusive_group()
@@ -587,7 +697,7 @@ def main() -> None:
     # auto_layers=True so the CLI behaves the same as the function default.
     effective_auto_layers = args.auto_layers or (target_layers is None)
 
-    run_trace_phases(
+    result = run_trace_phases(
         model_id=model_id,
         num_layers=args.layers,
         batch_size=args.batch_size,
@@ -596,7 +706,53 @@ def main() -> None:
         phases=tuple(phases),
         target_layers=target_layers,
         auto_layers=effective_auto_layers,
+        platform=args.platform,
     )
+
+    if args.hw:
+        from python.zrt.transform import (
+            build_default_pipeline, TransformContext,
+            ParallelConfig, StreamConfig,
+        )
+        from python.zrt.executor import DAGScheduler
+        from python.zrt.simulator import SimulatorHub
+        from python.zrt.report import build_summary
+        from python.zrt.graph.excel_writer import append_perf_summary
+        import python.zrt.hardware.registry as hw_registry
+
+        hw = hw_registry.load(args.hw)
+        ctx = TransformContext(
+            hw_spec=hw,
+            parallel=ParallelConfig(tp=args.tp),
+            stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+        )
+        pipe = build_default_pipeline()
+        hub = SimulatorHub.default()
+        scheduler = DAGScheduler(hw_spec=hw)
+
+        for phase, (raw_graph, _) in result.graphs.items():
+            g = pipe.run(raw_graph, ctx)
+            tl = scheduler.schedule(g)
+            sim_results = hub.simulate_graph(g, hw)
+            summary = build_summary(
+                model=model_id,
+                hardware=args.hw,
+                phase=phase,
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                graph=g,
+                sim_results=sim_results,
+                timeline=tl,
+                hw_spec=hw,
+                parallel_desc=f"TP{args.tp}",
+            )
+            print(f"\n{summary}")
+
+            slug = _make_model_slug(model_id)
+            xlsx_path = result.output_dir / f"{slug}_{phase}_ops.xlsx"
+            if xlsx_path.exists():
+                append_perf_summary(xlsx_path, summary)
+                logger.info("Performance summary written to %s", xlsx_path)
 
 
 if __name__ == "__main__":

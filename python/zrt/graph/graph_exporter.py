@@ -170,186 +170,116 @@ def _build_onnx_from_records(
 ) -> onnx.ModelProto:
     """Build an ONNX ModelProto from traced operator records.
 
-    - ``op_type``: clean short name (``mul``, ``mm``, ``softmax``, …)
-    - ``name``: ``<module_scope>/<op_short>_<idx>`` for Netron grouping
-    - Node attributes: module_class, component, layer, shapes, dtypes
+    Design goals (Netron-friendly):
+    - Each ONNX node  = one operator (raw aten op or fused op)
+    - Edges           = implicit data flow via shared tensor names
+    - Shape / dtype   = node attributes (readable in Netron sidebar)
+    - No value_info   = no edge-label clutter
+    - No weight boxes = weight / initialiser tensors are NOT declared as
+                        graph.input, so they don't appear as big input nodes
+
+    ``node.name`` uses ``/``-separated scopes so Netron collapses sub-graphs:
+    - Raw graph:   ``model/layers.0/self_attn/mm_5``
+    - Fused graph: ``layer0/rms_norm_0`` (flat layer prefix)
     """
     onnx_nodes: List[onnx.NodeProto] = []
-    tensor_info: Dict[str, Dict[str, Any]] = {}
     tid_to_name: Dict[int, str] = {}
 
-    # ── Pass 1: assign tensor names from producers ────────────────────────
+    # ── Pass 1: assign stable tensor names ───────────────────────────────
+    # Producers first so names come from output slots; consumers fill gaps.
     for rec in records:
-        idx = rec["node_id"]
-        out_ids = rec.get("_output_ids", [])
-        out_shapes = _split_shape_list(
-            rec.get("fused_output_shapes", rec.get("output_shapes", ""))
-            if is_fused else rec.get("output_shapes", ""))
-        out_dtypes = (
-            rec.get("fused_output_dtypes", rec.get("output_dtypes", ""))
-            if is_fused else rec.get("output_dtypes", "")).split(", ")
-
-        for slot, tid in enumerate(out_ids):
+        for tid in rec.get("_output_ids", []):
             if tid not in tid_to_name:
-                tname = f"t{tid}"
-                tid_to_name[tid] = tname
-                shape = _parse_shape(out_shapes[slot]) if slot < len(out_shapes) else []
-                dtype = out_dtypes[slot].strip() if slot < len(out_dtypes) else ""
-                tensor_info[tname] = {"shape": shape, "dtype": dtype}
-
-    # Register external-input tensors
+                tid_to_name[tid] = f"t{tid}"
     for rec in records:
-        in_ids = rec.get("_input_ids", [])
-        in_shapes = _split_shape_list(
-            rec.get("fused_input_shapes", rec.get("input_shapes", ""))
-            if is_fused else rec.get("input_shapes", ""))
-        in_dtypes = (
-            rec.get("fused_input_dtypes", rec.get("input_dtypes", ""))
-            if is_fused else rec.get("input_dtypes", "")).split(", ")
-
-        for slot, tid in enumerate(in_ids):
+        for tid in rec.get("_input_ids", []):
             if tid not in tid_to_name:
-                tname = f"t{tid}"
-                tid_to_name[tid] = tname
-                shape = _parse_shape(in_shapes[slot]) if slot < len(in_shapes) else []
-                dtype = in_dtypes[slot].strip() if slot < len(in_dtypes) else ""
-                tensor_info[tname] = {"shape": shape, "dtype": dtype}
+                tid_to_name[tid] = f"t{tid}"
 
-    # ── Pass 2: create ONNX nodes ────────────────────────────────────────
-    all_produced: set = set()
-    all_consumed: set = set()
-
+    # ── Pass 2: build ONNX nodes ──────────────────────────────────────────
     for rec in records:
-        idx = rec["node_id"]
-        module_path = rec.get("module_path", "")
+        idx          = rec["node_id"]
+        module_path  = rec.get("module_path",  "")
         module_class = rec.get("module_class", "")
-        component = rec.get("component", "")
-        layer = rec.get("layer", "")
+        component    = rec.get("component",    "")
+        layer        = rec.get("layer",        "")
 
         if is_fused:
-            raw_op_type = rec.get("fused_op", rec.get("aten_op", "op"))
-            # For fused: use the fused_op as the display name,
-            # but clean it up for op_type
+            fused_op     = rec.get("fused_op", "op")
+            op_type      = _clean_op_type(fused_op)   # safe identifier
             aten_ops_str = rec.get("aten_ops", "")
-            # e.g. "self_attn.q_a_proj (Linear)" → "q_a_proj"
-            # or "input_layernorm (DeepseekV3RMSNorm)" → "RMSNorm"
-            op_display = _fused_op_display_name(raw_op_type, module_class)
+            in_shapes    = rec.get("fused_input_shapes",  rec.get("input_shapes",  ""))
+            in_dtypes    = rec.get("fused_input_dtypes",  rec.get("input_dtypes",  ""))
+            out_shapes   = rec.get("fused_output_shapes", rec.get("output_shapes", ""))
+            out_dtypes   = rec.get("fused_output_dtypes", rec.get("output_dtypes", ""))
+            # Node name: flat layer scope for a clean fused graph
+            layer_scope  = f"layer{layer}" if layer else "global"
+            node_name    = f"{layer_scope}/{op_type}_{idx}"
         else:
-            raw_op_type = rec.get("aten_op", "op")
+            raw_op       = rec.get("aten_op", "op")
+            op_type      = _aten_op_short_name(raw_op)
             aten_ops_str = ""
-            op_display = _aten_op_short_name(raw_op_type)
+            in_shapes    = rec.get("input_shapes",  "")
+            in_dtypes    = rec.get("input_dtypes",  "")
+            out_shapes   = rec.get("output_shapes", "")
+            out_dtypes   = rec.get("output_dtypes", "")
+            # Node name: module-hierarchy scope for raw graph
+            scope        = _module_path_to_scope(module_path)
+            node_name    = f"{scope}/{op_type}_{idx}" if scope else f"{op_type}_{idx}"
 
-        # Build scope-based node name for Netron grouping
-        scope = _module_path_to_scope(module_path)
-        if scope:
-            node_name = f"{scope}/{op_display}_{idx}"
-        else:
-            node_name = f"{op_display}_{idx}"
-
-        in_ids = rec.get("_input_ids", [])
+        in_ids  = rec.get("_input_ids",  [])
         out_ids = rec.get("_output_ids", [])
-        input_names = [tid_to_name[tid] for tid in in_ids if tid in tid_to_name]
+        input_names  = [tid_to_name[tid] for tid in in_ids  if tid in tid_to_name]
         output_names = [tid_to_name[tid] for tid in out_ids if tid in tid_to_name]
 
-        for tid in in_ids:
-            all_consumed.add(tid)
-        for tid in out_ids:
-            all_produced.add(tid)
-
-        # Build ONNX node with attributes for Netron sidebar
         node = helper.make_node(
-            op_type=op_display,
+            op_type=op_type,
             inputs=input_names,
             outputs=output_names,
             name=node_name,
         )
 
-        # Add metadata as ONNX attributes (visible in Netron properties)
-        if module_path:
-            node.attribute.append(
-                helper.make_attribute("module_path", module_path))
-        if module_class:
-            node.attribute.append(
-                helper.make_attribute("module_class", module_class))
-        if component:
-            node.attribute.append(
-                helper.make_attribute("component", component))
-        if layer:
-            node.attribute.append(
-                helper.make_attribute("layer", layer))
+        # ── Attributes (visible in Netron properties panel) ───────────────
+        def _attr(name: str, val: Any) -> None:
+            if val is None:
+                return
+            if isinstance(val, int):
+                node.attribute.append(helper.make_attribute(name, val))
+            else:
+                s = str(val)
+                if s:
+                    node.attribute.append(helper.make_attribute(name, s))
 
-        # Raw aten op info
-        node.attribute.append(
-            helper.make_attribute("aten_op", raw_op_type))
+        _attr("layer",        layer)
+        _attr("module_class", module_class)
+        _attr("module_path",  module_path)
+        _attr("component",    component)
+        _attr("input_shapes",  in_shapes)
+        _attr("input_dtypes",  in_dtypes)
+        _attr("output_shapes", out_shapes)
+        _attr("output_dtypes", out_dtypes)
 
-        # Fused op extras
         if is_fused:
-            if aten_ops_str:
-                node.attribute.append(
-                    helper.make_attribute("aten_ops", aten_ops_str))
-            num_sub = rec.get("num_sub_ops", 0)
-            if num_sub:
-                node.attribute.append(
-                    helper.make_attribute("num_sub_ops", num_sub))
-            fl = rec.get("fusion_level", "")
-            if fl:
-                node.attribute.append(
-                    helper.make_attribute("fusion_level", fl))
-
-        # Shape/dtype as attributes too, for quick reference
-        in_shapes_str = (rec.get("fused_input_shapes", rec.get("input_shapes", ""))
-                         if is_fused else rec.get("input_shapes", ""))
-        out_shapes_str = (rec.get("fused_output_shapes", rec.get("output_shapes", ""))
-                          if is_fused else rec.get("output_shapes", ""))
-        if in_shapes_str:
-            node.attribute.append(
-                helper.make_attribute("input_shapes", in_shapes_str))
-        if out_shapes_str:
-            node.attribute.append(
-                helper.make_attribute("output_shapes", out_shapes_str))
+            _attr("fused_op",     fused_op)
+            _attr("aten_ops",     aten_ops_str)
+            _attr("num_sub_ops",  rec.get("num_sub_ops", 0))
+            _attr("fusion_level", rec.get("fusion_level", ""))
+        else:
+            _attr("aten_op", raw_op)
 
         onnx_nodes.append(node)
 
-    # ── Graph inputs / outputs / value_info ───────────────────────────────
-    external_in_tids = all_consumed - all_produced
-    external_out_tids = all_produced - all_consumed
-
-    graph_inputs = []
-    graph_outputs = []
-    value_infos = []
-
-    for tid, tname in sorted(tid_to_name.items(), key=lambda x: x[0]):
-        info = tensor_info.get(tname, {})
-        shape = info.get("shape", [])
-        dtype_str = info.get("dtype", "")
-        elem_type = _to_onnx_elem_type(dtype_str)
-
-        type_proto = helper.make_tensor_type_proto(
-            elem_type, shape if shape else None)
-        vi = helper.make_value_info(tname, type_proto)
-
-        if tid in external_in_tids:
-            graph_inputs.append(vi)
-        elif tid in external_out_tids:
-            graph_outputs.append(vi)
-        else:
-            value_infos.append(vi)
-
-    if not graph_inputs:
-        graph_inputs.append(helper.make_value_info(
-            "dummy_input",
-            helper.make_tensor_type_proto(TensorProto.FLOAT, [1])))
-    if not graph_outputs:
-        graph_outputs.append(helper.make_value_info(
-            "dummy_output",
-            helper.make_tensor_type_proto(TensorProto.FLOAT, [1])))
-
+    # ── Graph wrapper ─────────────────────────────────────────────────────
+    # Only a minimal dummy input/output is declared.  All real tensor
+    # connections are implicit via shared names — no value_info needed,
+    # no weight tensors appear as large input boxes in Netron.
+    _dummy = helper.make_tensor_type_proto(TensorProto.FLOAT, [1])
     graph = helper.make_graph(
         onnx_nodes,
         name=model_name,
-        inputs=graph_inputs,
-        outputs=graph_outputs,
-        value_info=value_infos,
+        inputs=[helper.make_value_info("graph_input",  _dummy)],
+        outputs=[helper.make_value_info("graph_output", _dummy)],
+        value_info=[],
     )
 
     model = helper.make_model(graph)
@@ -359,7 +289,6 @@ def _build_onnx_from_records(
     opset.domain = "ai.aten"
     opset.version = 1
     model.doc_string = f"Computation graph for {model_name}"
-
     return model
 
 
@@ -394,6 +323,30 @@ def _fused_op_display_name(fused_op: str, module_class: str) -> str:
     if "." in base:
         return base.rsplit(".", 1)[-1]
     return base
+
+
+def _clean_op_type(fused_op: str) -> str:
+    """Return a valid ONNX op_type identifier from a fused-op label.
+
+    Handles labels produced by the fusion engine:
+    - Semantic labels (already clean): ``rms_norm``, ``flash_attn`` → unchanged
+    - Legacy format: ``self_attn.q_a_proj (Linear)``    → ``q_a_proj``
+    - Legacy format: ``input_layernorm (LlamaRMSNorm)`` → ``rms_norm``
+      (class-based short name via the same stripping as _fused_op_display_name)
+    """
+    # If it contains " (" it's the old "path (ClassName)" format
+    if " (" in fused_op:
+        # Try to extract class-based short name
+        class_part = fused_op.split(" (", 1)[1].rstrip(")")
+        short = _fused_op_display_name(fused_op, class_part)
+        return _sanitise(short)
+    return _sanitise(fused_op)
+
+
+def _sanitise(name: str) -> str:
+    """Replace characters that are invalid in ONNX op_type with underscores."""
+    import re as _re
+    return _re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_") or "op"
 
 
 def export_onnx_from_records(
