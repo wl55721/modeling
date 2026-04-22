@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 class ExcelWriter:
     """Write operator records to a formatted Excel workbook + fusion rules JSON."""
 
-    def __init__(self, tracker: ModuleTracker):
+    def __init__(self, tracker: ModuleTracker, graph=None):
         self._tracker = tracker
-        self._fusion_engine = FusionEngine(tracker)
+        self._fusion_engine = FusionEngine(tracker, graph)
         self._header_fill = PatternFill(start_color="263238", end_color="263238", fill_type="solid")
         self._header_font_white = Font(bold=True, color="FFFFFF", size=11)
         self._header_font = Font(bold=True, size=12)
@@ -145,7 +145,7 @@ class ExcelWriter:
         fusion_specs = self._fusion_engine.extract_specs(fused)
         ws = wb.create_sheet("Fusion Rules")
         columns = [
-            ("Module Class", 30), ("Fusion Level", 12), ("Aten Op Sequence", 80),
+            ("Module Key", 30), ("Fusion Level", 12), ("Aten Op Sequence", 80),
             ("Sub-ops", 9), ("Occurrences", 12), ("Example Module Path", 55),
             ("Fused Input Shapes", 55), ("Fused Input Dtypes", 30), ("Input Sources", 65),
             ("Fused Output Shapes", 55), ("Fused Output Dtypes", 30), ("Output Sources", 65),
@@ -154,7 +154,7 @@ class ExcelWriter:
 
         for row_idx, spec in enumerate(fusion_specs, 2):
             values = [
-                spec.module_class, spec.fusion_level,
+                spec.module_key, spec.fusion_level,
                 " \u2192 ".join(spec.aten_op_sequence),
                 spec.num_sub_ops, spec.occurrences, spec.example_module_path,
                 spec.fused_input_shapes, spec.fused_input_dtypes, spec.fused_input_sources,
@@ -171,7 +171,7 @@ class ExcelWriter:
         json_path = output_path.with_name(output_path.stem + "_fusion_rules.json")
         json_data = [
             {
-                "module_class": s.module_class,
+                "module_key": s.module_key,
                 "aten_op_sequence": s.aten_op_sequence,
                 "num_sub_ops": s.num_sub_ops,
                 "fusion_level": s.fusion_level,
@@ -183,6 +183,8 @@ class ExcelWriter:
                 "fused_output_shapes": s.fused_output_shapes,
                 "fused_output_dtypes": s.fused_output_dtypes,
                 "fused_output_sources": s.fused_output_sources,
+                "input_map": s.input_map,
+                "output_map": s.output_map,
             }
             for s in specs
         ]
