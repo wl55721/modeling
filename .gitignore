@@ -1,8 +1,8 @@
-CLAUDE.md
+.claude/worktrees/
 __pycache__/
 AGENTS.md
 output
-.claude
 .venv
-.clauderules
-.claudignore
+.DS_Store
+.trae/
+.vscode/
