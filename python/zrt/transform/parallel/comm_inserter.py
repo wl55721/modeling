@@ -23,6 +23,7 @@ def _make_comm_node(node_id: str, collective: str,
         outputs=copy.deepcopy(src_node.outputs),  # all_reduce: shape unchanged
         attrs={"group_size": group_size, "collective": collective},
         scope=src_node.scope,
+        layer=src_node.layer,
         category="communication",
     )
 
@@ -150,6 +151,7 @@ class CommInserterPass(GraphPass):
                     attrs={"group_size": ep, "collective": "all_to_all",
                            "role": "dispatch"},
                     scope=first.scope,
+                    layer=first.layer,
                     category="communication",
                 )
                 dispatch.annotations["inserted_by"] = "ep_pass"
@@ -166,6 +168,7 @@ class CommInserterPass(GraphPass):
                     attrs={"group_size": ep, "collective": "all_to_all",
                            "role": "combine"},
                     scope=last.scope,
+                    layer=last.layer,
                     category="communication",
                 )
                 combine.annotations["inserted_by"] = "ep_pass"
@@ -206,11 +209,12 @@ class CommInserterPass(GraphPass):
                         attrs={"group_size": cp, "collective": "all_to_all",
                                "role": "cp_ulysses_pre"},
                         scope=node.scope,
+                        layer=node.layer,
                         category="communication",
                     )
                     pre_comm.annotations["inserted_by"] = "cp_pass"
                     _prepend_comm(g, node.id, pre_comm)
-                
+
                 if post_comm_id not in g.nodes:
                     # Post-A2A: gather-heads
                     post_comm = OpNode(
@@ -221,11 +225,12 @@ class CommInserterPass(GraphPass):
                         attrs={"group_size": cp, "collective": "all_to_all",
                                "role": "cp_ulysses_post"},
                         scope=node.scope,
+                        layer=node.layer,
                         category="communication",
                     )
                     post_comm.annotations["inserted_by"] = "cp_pass"
                     _rewire(g, node.id, post_comm)
-            
+
             elif cp_kind == "ring":
                 # Ring: N rounds of P2P, each annotated as its own comm node
                 p2p_rounds = cp_split.get("p2p_rounds", cp)
@@ -241,6 +246,7 @@ class CommInserterPass(GraphPass):
                             attrs={"group_size": cp, "collective": "send_recv",
                                    "role": "cp_ring", "round": i},
                             scope=node.scope,
+                            layer=node.layer,
                             category="communication",
                         )
                         p2p_comm.annotations["inserted_by"] = "cp_pass"
@@ -270,12 +276,12 @@ def _prepend_comm(g: "OpGraph", dst_id: str, comm_node: OpNode) -> None:
             tensor=e.tensor,
         ))
 
-    # comm → dst
-    for i, out_tensor in enumerate(comm_node.outputs):
+    # comm → dst: preserve original dst_idx so input slots are not remapped
+    for e in in_edges:
         g.edges.append(Edge(
-            src=comm_node.id, src_idx=i,
-            dst=dst_id, dst_idx=i,
-            tensor=out_tensor,
+            src=comm_node.id, src_idx=e.dst_idx,
+            dst=dst_id, dst_idx=e.dst_idx,
+            tensor=e.tensor,
         ))
 
     g._rebuild_adjacency()

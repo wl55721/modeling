@@ -22,6 +22,34 @@ from python.zrt.transform.context import TransformContext, ParallelConfig
 logger = logging.getLogger(__name__)
 
 
+def _layer_sort_key(node: OpNode) -> tuple:
+    """Primary sort key for layer-sequential Excel display.
+
+    Non-layer ops (embedding, lm_head) get key -1 so they appear before
+    layer-0 ops.  Unknown non-integer layers sort after all numbered layers.
+    """
+    layer = node.layer
+    if not layer:
+        return (-1, "")
+    try:
+        return (int(layer), "")
+    except (ValueError, TypeError):
+        return (999999, layer)
+
+
+def layer_stable_sort(nodes: list) -> list:
+    """Sort nodes by (layer_number, original_topo_index) for readable Excel output.
+
+    Preserves topological order within each layer while ensuring all ops
+    of layer N appear before any op of layer N+1.  This corrects the
+    interleaved output that Kahn's algorithm produces when target_layers
+    skips intermediate layers (e.g. [0, 3]), making those layers appear
+    as independent parallel chains.
+    """
+    topo_index = {n.id: i for i, n in enumerate(nodes)}
+    return sorted(nodes, key=lambda n: (_layer_sort_key(n), topo_index[n.id]))
+
+
 def infer_pipeline_stage(node: OpNode, layer_to_stage: Optional[Dict[str, int]] = None) -> str:
     """Infer pipeline stage from layer index.
 
@@ -143,6 +171,7 @@ class TransformedGraphExcelWriter:
             ("  EP (Expert Parallel)", ctx.parallel.ep),
             ("  PP (Pipeline Parallel)", ctx.parallel.pp),
             ("  DP (Data Parallel)", ctx.parallel.dp),
+            ("  CP (Context Parallel)", ctx.parallel.cp),
             ("  Sequence Parallel", "Yes" if ctx.parallel.sp else "No"),
             ("  Strategy Description", ctx.parallel.describe()),
             ("", ""),
@@ -215,7 +244,7 @@ class TransformedGraphExcelWriter:
             for i, layer in enumerate(sorted_layers):
                 layer_to_stage[layer] = i % ctx.parallel.pp
 
-        for row_idx, node in enumerate(graph.topo_sort(), 2):
+        for row_idx, node in enumerate(layer_stable_sort(graph.topo_sort()), 2):
             parallelism = get_parallelism_info(node, ctx.parallel)
             formulas = get_op_formulas(node)
 
@@ -643,7 +672,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         _recompute_fill = PatternFill(start_color="fce4ec", end_color="fce4ec", fill_type="solid")
 
-        for row_idx, node in enumerate(graph.topo_sort(), 2):
+        for row_idx, node in enumerate(layer_stable_sort(graph.topo_sort()), 2):
             is_recompute = (
                 node.annotations.get("recompute", False)
                 or node.attrs.get("recompute", False)
