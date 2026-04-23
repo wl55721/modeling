@@ -63,6 +63,10 @@ python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4 --phases prefill -o out
 python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4 --hw nvidia_h100_sxm
 python -m python.zrt deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sxm --tp 8
 
+# 训练建模：抓图 + 训练性能估算（--train --hw 组合）
+python -m python.zrt deepseek-ai/DeepSeek-V3 --layers 4 --train --hw nvidia_h100_sxm --tp 8 --pp 2
+python -m python.zrt hf_models/deepseek_v3 --train --hw nvidia_h100_sxm --tp 8 --pp 4 --dp 2 --global-batch 1024
+
 # 向后兼容的 --model 简写
 python -m python.zrt --model v3
 python -m python.zrt --model v3.2
@@ -210,6 +214,85 @@ print(f"反向图节点数: {raw_g.num_nodes()}")
 
 ---
 
+## 训练性能建模
+
+在 `--train` 基础上叠加 `--hw` 即可在同一入口执行**训练性能建模**（FLOPs、MFU、内存、通信量、1F1B 流水线调度），无需切换到独立的训练 CLI。
+
+### 命令行
+
+```bash
+# 基础训练建模
+python -m python.zrt deepseek-ai/DeepSeek-V3 --layers 4 \
+    --train --hw nvidia_h100_sxm --tp 8
+
+# 指定流水线并行 + 数据并行 + ZeRO + 批次配置
+python -m python.zrt hf_models/deepseek_v3 --layers 4 \
+    --train --hw nvidia_h100_sxm \
+    --tp 8 --pp 4 --dp 2 \
+    --zero-stage 1 --optimizer adam \
+    --micro-batch 1 --global-batch 1024 \
+    --total-params 671e9 --num-layers-full 61
+
+# 仅抓训练图（不加 --hw 则只做算子追踪，不做性能建模）
+python -m python.zrt hf_models/llama3_8b --train --layers 2
+```
+
+### 训练建模 CLI 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--pp` | `1` | 流水线并行度 |
+| `--ep` | `1` | 专家并行度 |
+| `--dp` | `1` | 数据并行度 |
+| `--zero-stage` | `1` | ZeRO 优化阶段（0–3）|
+| `--optimizer` | `adam` | 优化器（`adam` / `adamw` / `muon`）|
+| `--micro-batch` | `1` | 每 GPU micro-batch 大小 |
+| `--global-batch` | `32` | 全局 batch 大小 |
+| `--total-params` | — | 完整模型参数量（如 `671e9`，用于缩放）|
+| `--hidden` | `7168` | 隐藏层维度（内存估算用）|
+| `--num-layers-full` | — | 完整模型总层数（默认等于 `--layers`）|
+
+### 报告内容
+
+训练建模报告包含：
+
+- **Step time**：含 1F1B 流水线调度的完整 step 耗时
+- **MFU**：Model FLOPs Utilization
+- **FLOPs 分解**：前向 / 反向 / 总计
+- **内存（每 GPU）**：权重 / 梯度 / 优化器状态 / 激活值
+- **流水线指标**：warmup / steady / cooldown 步数、bubble 占比
+
+### Python API
+
+```python
+from python.zrt.graph import run_trace_phases
+from python.zrt.transform.analysis.modeller import estimate_training_from_graphs
+import python.zrt.hardware.registry as hw_registry
+
+# Step 1: 抓训练图（与其他 CLI 参数共享同一 run_trace_phases）
+result = run_trace_phases(
+    model_id="hf_models/deepseek_v3",
+    num_layers=4,
+    phases=("train_forward", "train_backward"),
+)
+
+# Step 2: 训练建模（复用已抓的 OpGraph，无需重抓）
+hw = hw_registry.load("nvidia_h100_sxm")
+report = estimate_training_from_graphs(
+    forward_graph=result.graphs["train_forward"][0],
+    backward_graph=result.graphs["train_backward"][0] if "train_backward" in result.graphs else None,
+    hw_spec=hw,
+    tp=8, pp=4, dp=2,
+    total_params=671e9,
+    num_layers_full=61,
+)
+print(report.summary())
+```
+
+> 也可以使用端到端 API `model_training()`，它内部自动完成抓图 + 建模。详见 `python/zrt/transform/analysis/modeller.py`。
+
+---
+
 ## 图模式（torch.compile）
 
 默认的 eager 路径通过 `TorchDispatchMode` 逐 op 拦截，产生扁平的算子列表。  
@@ -288,6 +371,17 @@ result = run_trace_phases(
 | `--target-layers` | —    | —                  | 指定追踪的层编号，逗号分隔（如 `0,3`）                                          |
 | `--auto-layers`   | —    | `True`（CLI 默认） | 自动选择第一个密集层和第一个稀疏（MoE）层                                       |
 | `--graph-mode`    | —    | `False`             | 使用 `torch.compile` 图模式捕获，替代 `TorchDispatchMode` eager 路径            |
+| `--gradient-checkpointing` | — | `False`      | 启用激活重计算（训练阶段）                                                      |
+| `--pp`            | —    | `1`                 | 流水线并行度（训练建模用）                                                      |
+| `--ep`            | —    | `1`                 | 专家并行度（训练建模用）                                                        |
+| `--dp`            | —    | `1`                 | 数据并行度（训练建模用）                                                        |
+| `--zero-stage`    | —    | `1`                 | ZeRO 优化阶段 0-3（训练建模用）                                                 |
+| `--optimizer`     | —    | `adam`              | 优化器（训练建模用，`adam`/`adamw`/`muon`）                                    |
+| `--micro-batch`   | —    | `1`                 | 每 GPU micro-batch 大小（训练建模用）                                           |
+| `--global-batch`  | —    | `32`                | 全局 batch 大小（训练建模用）                                                   |
+| `--total-params`  | —    | —                  | 完整模型参数量，如 `671e9`（用于缩放）                                          |
+| `--hidden`        | —    | `7168`              | 隐藏层维度（内存估算用）                                                        |
+| `--num-layers-full` | —  | —                  | 完整模型总层数（默认等于 `--layers`）                                           |
 | `--model`         | —    | —                  | 向后兼容简写：`v3` 或 `v3.2`                                                    |
 
 ### 关于 `--layers` 的选择
