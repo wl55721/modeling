@@ -90,6 +90,49 @@ def main() -> None:
         help="Enable activation checkpointing during training phases.",
     )
 
+    # --- Training modelling flags (used with --train --hw) ---
+    parser.add_argument(
+        "--pp", type=int, default=1,
+        help="Pipeline-parallel degree (training, default: 1).",
+    )
+    parser.add_argument(
+        "--ep", type=int, default=1,
+        help="Expert-parallel degree (training, default: 1).",
+    )
+    parser.add_argument(
+        "--dp", type=int, default=1,
+        help="Data-parallel degree (training, default: 1).",
+    )
+    parser.add_argument(
+        "--zero-stage", type=int, default=1,
+        help="ZeRO optimization stage 0-3 (training, default: 1).",
+    )
+    parser.add_argument(
+        "--optimizer", default="adam",
+        choices=["adam", "adamw", "muon"],
+        help="Optimizer for training estimation (default: adam).",
+    )
+    parser.add_argument(
+        "--micro-batch", type=int, default=1,
+        help="Micro-batch size per GPU (training, default: 1).",
+    )
+    parser.add_argument(
+        "--global-batch", type=int, default=32,
+        help="Global batch size across DP ranks (training, default: 32).",
+    )
+    parser.add_argument(
+        "--total-params", type=float, default=None,
+        help="Full model param count, e.g. 671e9 (for scaling traced layers).",
+    )
+    parser.add_argument(
+        "--hidden", type=int, default=7168,
+        help="Hidden dimension for memory estimation (default: 7168).",
+    )
+    parser.add_argument(
+        "--num-layers-full", type=int, default=None,
+        help="Total layers in full model (defaults to --layers if not set).",
+    )
+
     _layer_group = parser.add_mutually_exclusive_group()
     _layer_group.add_argument(
         "--target-layers",
@@ -151,52 +194,100 @@ def main() -> None:
     )
 
     if args.hw:
-        from python.zrt.transform import (
-            build_default_pipeline, TransformContext,
-            ParallelConfig, StreamConfig,
-        )
-        from python.zrt.executor import DAGScheduler
-        from python.zrt.simulator import SimulatorHub
-        from python.zrt.report import build_summary
-        from python.zrt.graph.excel_writer import append_perf_summary
         import python.zrt.hardware.registry as hw_registry
-
         hw = hw_registry.load(args.hw)
-        ctx = TransformContext(
+
+        if args.train:
+            _run_training_modelling(args, model_id, hw, result)
+        else:
+            _run_inference_pipeline(args, model_id, hw, result)
+
+
+def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
+    """Run the inference transform + simulate + report pipeline."""
+    from python.zrt.transform import (
+        build_default_pipeline, TransformContext,
+        ParallelConfig, StreamConfig,
+    )
+    from python.zrt.executor import DAGScheduler
+    from python.zrt.simulator import SimulatorHub
+    from python.zrt.report import build_summary
+    from python.zrt.graph.excel_writer import append_perf_summary
+
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=args.tp),
+        stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+    )
+    pipe = build_default_pipeline()
+    hub = SimulatorHub.default()
+    scheduler = DAGScheduler(hw_spec=hw)
+
+    for phase, (raw_graph, _) in result.graphs.items():
+        g = pipe.run(raw_graph, ctx)
+        tl = scheduler.schedule(g)
+        sim_results = hub.simulate_graph(g, hw)
+        summary = build_summary(
+            model=model_id,
+            hardware=args.hw,
+            phase=phase,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            graph=g,
+            sim_results=sim_results,
+            timeline=tl,
             hw_spec=hw,
-            parallel=ParallelConfig(tp=args.tp),
-            stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+            parallel_desc=f"TP{args.tp}",
         )
-        pipe = build_default_pipeline()
-        hub = SimulatorHub.default()
-        scheduler = DAGScheduler(hw_spec=hw)
+        try:
+            print(f"\n{summary}")
+        except UnicodeEncodeError:
+            logger.info("Performance summary: %s", summary)
 
-        for phase, (raw_graph, _) in result.graphs.items():
-            g = pipe.run(raw_graph, ctx)
-            tl = scheduler.schedule(g)
-            sim_results = hub.simulate_graph(g, hw)
-            summary = build_summary(
-                model=model_id,
-                hardware=args.hw,
-                phase=phase,
-                batch_size=args.batch_size,
-                seq_len=args.seq_len,
-                graph=g,
-                sim_results=sim_results,
-                timeline=tl,
-                hw_spec=hw,
-                parallel_desc=f"TP{args.tp}",
-            )
-            try:
-                print(f"\n{summary}")
-            except UnicodeEncodeError:
-                logger.info("Performance summary: %s", summary)
+        slug = _make_model_slug(model_id)
+        xlsx_path = result.output_dir / f"{slug}_{phase}_ops.xlsx"
+        if xlsx_path.exists():
+            append_perf_summary(xlsx_path, summary)
+            logger.info("Performance summary written to %s", xlsx_path)
 
-            slug = _make_model_slug(model_id)
-            xlsx_path = result.output_dir / f"{slug}_{phase}_ops.xlsx"
-            if xlsx_path.exists():
-                append_perf_summary(xlsx_path, summary)
-                logger.info("Performance summary written to %s", xlsx_path)
+
+def _run_training_modelling(args, model_id: str, hw, result) -> None:
+    """Run the training modelling pipeline on already-captured graphs."""
+    from python.zrt.transform.analysis.modeller import estimate_training_from_graphs
+
+    fwd_pair = result.graphs.get("train_forward")
+    if not fwd_pair:
+        logger.error("--train --hw requires train_forward phase but none was captured.")
+        return
+
+    fwd_graph = fwd_pair[0]  # raw OpGraph
+    bwd_pair = result.graphs.get("train_backward")
+    bwd_graph = bwd_pair[0] if bwd_pair else None
+
+    report = estimate_training_from_graphs(
+        forward_graph=fwd_graph,
+        backward_graph=bwd_graph,
+        hw_spec=hw,
+        total_params=int(args.total_params) if args.total_params else None,
+        hidden=args.hidden,
+        num_layers=args.layers,
+        num_layers_full=args.num_layers_full,
+        seq_len=args.seq_len,
+        batch_size=args.batch_size,
+        tp=args.tp,
+        pp=args.pp,
+        ep=args.ep,
+        dp=args.dp,
+        zero_stage=args.zero_stage,
+        optimizer=args.optimizer,
+        micro_batch=args.micro_batch,
+        global_batch=args.global_batch,
+    )
+
+    try:
+        print(f"\n{report.summary()}")
+    except UnicodeEncodeError:
+        logger.info("Training report: %s", report.summary())
 
 
 if __name__ == "__main__":
