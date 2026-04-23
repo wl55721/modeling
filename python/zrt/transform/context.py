@@ -14,11 +14,12 @@ class ParallelConfig:
     pp: int = 1
     ep: int = 1
     dp: int = 1
+    cp: int = 1
     sp: bool = False
 
     @property
     def total_devices(self) -> int:
-        return self.tp * self.pp * self.ep * self.dp
+        return self.tp * self.pp * self.ep * self.dp * self.cp
 
     def describe(self) -> str:
         parts = []
@@ -26,6 +27,7 @@ class ParallelConfig:
         if self.ep > 1: parts.append(f"EP{self.ep}")
         if self.pp > 1: parts.append(f"PP{self.pp}")
         if self.dp > 1: parts.append(f"DP{self.dp}")
+        if self.cp > 1: parts.append(f"CP{self.cp}")
         if self.sp:     parts.append("SP")
         return "-".join(parts) or "single"
 
