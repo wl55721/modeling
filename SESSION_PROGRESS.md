@@ -1,52 +1,30 @@
 # Session Progress
 
-## 当前阶段：P3 Anchor Integration follow-up — 已完成
+## 当前阶段：P4 HFU Metric follow-up — 已完成
 
 ## 最新变更（2026-04-25）
 
-- P0 graph-native modeller 恢复、CLI 接线、`pipeline_metrics.step_time_ms` 直读修复均已完成。
-- P1 新增 `python/zrt/training/compose/pipeline.py::ZeroBubbleComposer`，注册到 `PPSched.ZERO_BUBBLE`，schedule 名称为 `zb`。
-- `python/zrt/training/compose/stage.py::StageTime` 增加 `bwd_dx` / `bwd_dw`，`stage_time()` 使用 `OpCost.dx_flops` / `dw_flops` 分离 input-gradient 与 weight-gradient 时间，同时保留既有 `bwd` 聚合字段。
-- `python/zrt/transform/analysis/training.py::TrainingPipelinePass` 新增 graph-native `pp_schedule in {"zb", "zero_bubble"}` 分派；按 `flops_dw / (flops_dx + flops_dw)` 估算 `stage_timelines_bwd_dw`，用 dW work 缩减 ZeroBubble 暴露 bubble。
-- DP-in-bubble 逻辑现在复用当前 schedule 的 `bubble_us`，避免 ZeroBubble/VPP/DualPipe 后续退回 1F1B bubble window。
-- `python/zrt/training/compose/__init__.py` 导出 ZeroBubble 与现有 Composer 类。
-- `tests/training/test_dualpipe.py` 增加 spec-side ZeroBubble 公式回归测试。
-- `tests/training/test_graph_schedule.py` 增加 graph-native ZeroBubble dW split 回归测试。
-- 已根据 review 修正 ZB-H bubble 公式：`bubble = (pp - 1) * max(t_stage - t_w, 0)`，不再使用 `/ 2.0` 保守近似。
-- `t_w` 现在取自同一个 bottleneck stage，而不是全局最大 `bwd_dw`，避免异构 stage 下错误抵扣 bubble。
-- graph-native 路径在缺少 `flops_dw` / stage phase 信息时写 debug log，并退化为“无 dW bubble fill”，避免静默给出误导性 ZeroBubble 结果。
-- 已清理 `TrainingPipelinePass` 与 composer module 的 1F1B-only stale docstring。
-- P2 新增 `ModelSpec.attn_compression_ratio`，默认 1.0，允许 YAML 配置解析；非法值会抛出 `ValueError`。
-- spec 训练路径 `python/zrt/training/models/flops.py::_attn_cost()` 使用 `attn_compression_ratio` 缩放 attention-core forward FLOPs，并同步缩放基于 forward 的 backward dx FLOPs；per-op metadata 可覆盖 model 默认值。
-- graph-native `TrainFlopsPass` 使用 node annotation → node attrs → graph metadata 的优先级读取 `attn_compression_ratio`，缩放 captured attention FLOPs；默认 1.0 保持 dense 行为。
-- `tests/training/test_flops.py` 与 `tests/training/test_transform_integration.py` 增加 compressed attention / override 回归测试。
-- P2 follow-up：graph-native attention 维度推导不再硬编码 `head_dim = 64`；优先读取 node attrs / graph metadata / 4D Q tensor shape，再回退到 hidden/head_dim 推导。
-- `_attn_cost()` 明确注释 backward dx 是从 compressed forward 推导，因此继承 CSA/HCA ratio。
-- graph-native 非法 `attn_compression_ratio` 不再中断整图 pass；现在写出包含 node id 的 warning，并回退到 dense ratio 1.0。
-- P3 anchor harness 不再是 placeholder：`tests/training/anchors/test_anchors.py` 现在真实加载每个 anchor、运行 `estimate()`，并对 `strict_mfu_check=True` 的 anchor 执行严格 MFU gate；load/estimate 异常不再被吞掉。
-- GPT-3 175B strict anchor 已校准通过：estimated MFU 0.5075 vs target 0.5200，误差 2.40%（tolerance 10%）。
-- spec IR TP sharding 现在覆盖 `attn_core` heads / KV metadata 和 LN/RoPE/SwiGLU/add 等 memory-bound activation bytes，避免每个 TP rank 计入完整 attention/activation work。
-- PP=1 路径支持 DP gradient reduce 在 backward window 中重叠；`dp_overlap_in_bubble=False` 仍保留 fully exposed DP allreduce/reduce-scatter 行为。
-- P3 计划中的 context parallel insertion coverage 已存在于 `tests/training/test_context_parallel.py`，本轮纳入验证。
-- P3 follow-up：TP sharding of `bytes_fwd` now preserves integer type via floor integer division; regression asserts `bytes_fwd` remains `int`.
+- P0–P3 所有子项已完成（详见 SESSION_HISTORY.md）。
+- **P4 HFU metric**：新增 `hfu` 字段到 `StepResult`（spec 路径）、`PipelineStepMetrics`（graph-native 路径）、`Report`（estimator）。
+- `python/zrt/training/models/flops.py` 新增 `recompute_overhead_flops()` 和 `_op_recompute_categories()`，根据 `RecomputePolicy.per_layer` 计算 recompute 额外 FLOPs；**已修正为按 layer_kind 限定作用域**，避免 mixed dense/MoE 时错误跨层计数。
+- `python/zrt/training/compose/pipeline.py` 新增 `compute_hfu()`，HFU = (model_flops + recompute_overhead) / (peak * step_time)。
+- `python/zrt/training/compose/stage.py::_recompute_time()` **已修正**：从仅处理 `"full"` 扩展为处理 selective categories（`"attn"`, `"ffn_swiglu"`, `"ln"`），确保 selective recompute 正确增加 step time，避免 HFU 虚高。
+- graph-native `TrainingFlopsPass` 新增 `recompute_flops` 到 metadata，从 recomputed nodes 的 `flops_fwd // 2` 提取 recompute 额外 FLOPs。
+- graph-native `TrainingPipelinePass` MFU 计算修正：MFU 使用 `training_flops - recompute_flops`（不含 recompute），HFU 使用完整 `training_flops`。
+- **`python/zrt/transform/analysis/modeller.py`**：`TrainingReport` 新增 `hfu` 字段；`to_dict()` 和 `summary()` 输出 HFU；`estimate_training()` 和 `estimate_training_from_graphs()` 从 `PipelineStepMetrics` 传播 HFU。
+- **`python/zrt/training/search/report.py`**：`report_to_dict()` 和 `report_summary()` 输出 HFU。
+- `tests/training/test_flops.py` 新增 6 个 HFU 回归测试：无 recompute 时 HFU==MFU、selective recompute 时 HFU>MFU、默认无额外 FLOPs、full recompute 覆盖所有 compute-bound ops、selective recompute 增加 step time、layer_kind 限定 recompute 作用域。
 
 ## 本轮验证
 
 ```
-python -m py_compile python/zrt/training/ir/shard.py python/zrt/training/compose/pipeline.py tests/training/test_1f1b.py tests/training/test_ir_dense.py
-PYTHONPATH=python pytest tests/training/anchors/test_anchors.py -q -s
-PYTHONPATH=python pytest tests/training/test_1f1b.py tests/training/test_ir_dense.py tests/training/test_context_parallel.py tests/training/test_search.py -q
-python -m py_compile python/zrt/training/ir/shard.py tests/training/test_ir_dense.py
-PYTHONPATH=python pytest tests/training/test_ir_dense.py tests/training/anchors/test_anchors.py -q
-PYTHONPATH=python pytest tests/training -q
+python -m py_compile python/zrt/training/models/flops.py python/zrt/training/compose/stage.py python/zrt/training/compose/pipeline.py python/zrt/transform/analysis/training.py python/zrt/transform/analysis/modeller.py python/zrt/training/search/report.py python/zrt/training/search/estimator.py
+PYTHONPATH=python pytest tests/training/test_flops.py -v
+PYTHONPATH=python pytest tests/training/ -q
 git diff --check
 ```
 
-结果：anchor suite 13 passed；1F1B/IR/context/search focused regression 24 passed；bytes_fwd focused regression 19 passed；full training suite 196 passed；`git diff --check` passed。
-
-已知剩余风险：DeepSeek-V3 与 LLaMA-3 anchors 仍为 calibration-mode，当前 MFU 偏差分别约 92.69% 与 41.77%；未启用 strict gate。P3 未处理 P4 HFU metric。
-
-参考计划：`.omc/plans/proud-wishing-puzzle.md`
+结果：flops 15 passed；full training suite 202 passed（含 6 个新增 HFU 测试）；`git diff --check` passed。
 
 ## 所有子项完成状态
 
@@ -56,15 +34,18 @@ git diff --check
 | P1 ZeroBubble Composer | ✅ 完成 | `ZeroBubbleComposer` + graph-native `zb` dispatch |
 | P2 compressed attention | ✅ 完成 | `attn_compression_ratio` 接入 spec 与 graph-native attention FLOPs |
 | P3 anchor integration/calibration | ✅ 完成 | GPT-3 strict MFU gate 通过；其他 anchors 保持 calibration-mode |
-| P4 HFU metric | ⏳ 待办 | MFU/HFU 区分尚未实现 |
+| P4 HFU metric | ✅ 完成 | MFU/HFU 区分已实现；spec + graph-native 双路径；6 个回归测试 |
 
 ## 本轮修改文件
 
-- `python/zrt/training/ir/shard.py`
+- `python/zrt/training/models/flops.py`
 - `python/zrt/training/compose/pipeline.py`
-- `tests/training/anchors/test_anchors.py`
-- `tests/training/test_1f1b.py`
-- `tests/training/test_ir_dense.py`
+- `python/zrt/training/compose/stage.py`
+- `python/zrt/training/search/estimator.py`
+- `python/zrt/training/search/report.py`
+- `python/zrt/transform/analysis/training.py`
+- `python/zrt/transform/analysis/modeller.py`
+- `tests/training/test_flops.py`
 - `SESSION_HISTORY.md`
 - `SESSION_PROGRESS.md`
 
@@ -78,3 +59,4 @@ git diff --check
 - P1 follow-up：ZeroBubble Composer 已接入 spec 与 graph-native training pipeline。
 - P2 follow-up：Compressed attention FLOPs ratio 已接入 spec 与 graph-native attention cost。
 - P3 follow-up：Anchor estimate integration 已启用 strict gate，GPT-3 175B strict anchor 通过。
+- P4 follow-up：HFU metric 已实现，recompute overhead 从 RecomputePolicy 按 layer_kind 推导；selective recompute 正确影响 step time；modeller/report 输出管线完整。

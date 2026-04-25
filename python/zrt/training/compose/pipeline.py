@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from zrt.training.compose.stage import StageTime, stage_time
 from zrt.training.ir.graph import Graph
 from zrt.training.models.comm import total_comm_time
+from zrt.training.models.flops import recompute_overhead_flops
 from zrt.training.models.memory import MemBreakdown, memory_breakdown
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import PPSched, Strategy
@@ -28,6 +29,7 @@ class StepResult:
     dp_ar_exposed: float = 0.0
     memory: MemBreakdown | None = None
     mfu: float = 0.0
+    hfu: float = 0.0
     schedule_name: str = "1f1b"    # Pipeline schedule identifier
 
 
@@ -380,6 +382,9 @@ def pipeline_step_time(
     # MFU
     step.mfu = compute_mfu(model, strategy, system, step.step_time)
 
+    # HFU
+    step.hfu = compute_hfu(model, strategy, system, step.step_time, graph)
+
     return step
 
 
@@ -435,3 +440,25 @@ def compute_mfu(
 
     mfu = model_flops / (peak * step_time)
     return min(mfu, 1.0)  # cap at 100%
+
+
+def compute_hfu(
+    model: ModelSpec, strategy: Strategy,
+    system: SystemSpec, step_time: float,
+    graph: Graph,
+) -> float:
+    """Hardware FLOPs Utilization — accounts for recomputed activations.
+
+    HFU = (model_flops + recompute_overhead) / (peak * step_time)
+    """
+    if step_time <= 0:
+        return 0.0
+
+    P = model.effective_params_for_flops()
+    tokens = strategy.global_batch * model.seq_len if strategy.global_batch > 0 else strategy.micro_batch * strategy.dp * model.seq_len
+    model_flops = 6.0 * P * tokens
+    rc_overhead = recompute_overhead_flops(graph, model, strategy)
+    peak = system.gpu.flops_bf16 * 1e12 * system.world_size
+
+    hfu = (model_flops + rc_overhead) / (peak * step_time)
+    return min(hfu, 1.0)

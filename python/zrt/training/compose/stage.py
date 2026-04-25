@@ -157,14 +157,34 @@ def _recompute_time(
         if op.layer_id < 0:
             continue
         lk = model.layers[op.layer_id].value if op.layer_id < len(model.layers) else ""
-        tiers = policy.get(lk, set())
-        if not tiers:
+        cats = policy.get(lk, set())
+        if not cats:
             continue
-        if "full" in tiers:
+
+        op_cats = _op_recompute_categories(op)
+        if "full" in cats or (op_cats & cats):
             cost = op_cost(op, model)
             t += op_to_time(cost.fwd_flops, cost.fwd_bytes, cost.bound, system, gpu_name)
 
     return t
+
+
+def _op_recompute_categories(op: Op) -> set[str]:
+    """Map an op to its recompute category set."""
+    if op.kind == "attn_core":
+        return {"attn"}
+    if op.kind == "matmul":
+        name = op.name.lower()
+        if "qkv" in name or "o_proj" in name:
+            return {"attn"}
+        if "up_proj" in name or "gate_proj" in name or "down_proj" in name:
+            return {"ffn_swiglu"}
+        return set()
+    if op.kind == "swiglu":
+        return {"ffn_swiglu"}
+    if op.kind == "ln":
+        return {"ln"}
+    return set()
 
 
 def _group_size(group: str, strategy: Strategy) -> int:

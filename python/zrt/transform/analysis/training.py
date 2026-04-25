@@ -78,6 +78,17 @@ class TrainingFlopsPass(GraphPass):
         g.metadata["total_params"] = total_params
         g.metadata["layer_scale"] = layer_scale
 
+        # Recompute overhead: for nodes with recompute annotation, flops_fwd
+        # already includes 2x multiplier (flops_train.py:37), so base fwd = flops_fwd / 2
+        recompute_flops = sum(
+            n.annotations.get("flops_fwd", 0) // 2
+            for n in g.nodes.values()
+            if n.annotations.get("recompute")
+        )
+        if layer_scale != 1.0:
+            recompute_flops = int(recompute_flops * layer_scale)
+        g.metadata["recompute_flops"] = recompute_flops
+
         return g
 
 
@@ -273,6 +284,7 @@ class PipelineStepMetrics:
     steady_steps: int = 0
     bubble_fraction: float = 0.0
     mfu: float = 0.0  # Model FLOPs Utilization
+    hfu: float = 0.0  # Hardware FLOPs Utilization (includes recompute overhead)
 
     def to_dict(self) -> dict[str, float]:
         return {
@@ -283,6 +295,7 @@ class PipelineStepMetrics:
             "steady_steps": self.steady_steps,
             "bubble_fraction": self.bubble_fraction,
             "mfu": self.mfu,
+            "hfu": self.hfu,
         }
 
 
@@ -540,9 +553,15 @@ class TrainingPipelinePass(GraphPass):
         peak_flops_per_gpu = hw.peak_flops(DType.BF16)
 
         step_time_sec = step_time_us / 1e6
-        achieved_flops = training_flops / step_time_sec if step_time_sec > 0 else 0.0
         peak_flops_total = world_size * peak_flops_per_gpu
-        mfu = achieved_flops / peak_flops_total if peak_flops_total > 0 else 0.0
+
+        # MFU: model FLOPs only (excludes recompute overhead)
+        recompute_flops = float(g.metadata.get("recompute_flops", 0))
+        model_flops = training_flops - recompute_flops
+        mfu = (model_flops / step_time_sec / peak_flops_total) if (step_time_sec > 0 and peak_flops_total > 0) else 0.0
+
+        # HFU: all executed FLOPs including recompute
+        hfu = (training_flops / step_time_sec / peak_flops_total) if (step_time_sec > 0 and peak_flops_total > 0) else 0.0
 
         metrics = PipelineStepMetrics(
             step_time_ms=step_time_ms,
@@ -551,7 +570,8 @@ class TrainingPipelinePass(GraphPass):
             cooldown_steps=cooldown_steps,
             steady_steps=steady_steps,
             bubble_fraction=bubble_fraction,
-            mfu=mfu,
+            mfu=min(mfu, 1.0),
+            hfu=min(hfu, 1.0),
         )
 
         g.metadata["pipeline_metrics"] = metrics
