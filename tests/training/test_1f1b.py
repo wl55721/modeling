@@ -49,14 +49,14 @@ def test_pp2_bubble_ratio():
     graph = build_graph(model, strategy)
 
     result = pipeline_step_time(graph, model, system, strategy)
-    # Bubble = warmup + cooldown, roughly (pp-1)/M fraction
-    # For pp=2, M=4: expected bubble ≈ warmup+cooldown / step_time
-    assert result.bubble_fraction > 0  # there should be some bubble
-    assert result.bubble_fraction < 0.5  # but not too much
+    # Bubble = warmup + cooldown, roughly (pp-1)/(pp-1+M) fraction
+    # For pp=2, M=4: expected bubble ≈ 1/(1+4) = 0.2
+    expected_bubble = (strategy.pp - 1) / (strategy.pp - 1 + M)
+    assert result.bubble_fraction == pytest.approx(expected_bubble, rel=0.05)
 
 
 def test_step_time_increases_with_pp():
-    """More PP stages → larger bubble → longer step time (for same M)."""
+    """More PP stages → larger bubble fraction (for same M, same dp)."""
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
         head_dim=128, vocab=32000, seq_len=2048,
@@ -69,8 +69,9 @@ def test_step_time_increases_with_pp():
         nodes=2, gpus_per_node=8,
     )
 
-    s1 = Strategy(tp=1, pp=1, dp=8, micro_batch=1, global_batch=8)
-    s2 = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=8)
+    # Keep dp constant to isolate the effect of PP
+    s1 = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=1)
+    s2 = Strategy(tp=1, pp=2, dp=1, micro_batch=1, global_batch=1)
 
     g1 = build_graph(model, s1)
     g2 = build_graph(model, s2)
@@ -78,10 +79,10 @@ def test_step_time_increases_with_pp():
     r1 = pipeline_step_time(g1, model, system, s1)
     r2 = pipeline_step_time(g2, model, system, s2)
 
-    # With pipeline, the step should be longer due to bubbles
-    # (per-stage time is similar, but we pay the pipeline tax)
-    assert r2.step_time > 0
-    assert r1.step_time > 0
+    # With pipeline, bubble fraction increases (more idle time)
+    # while step time may stay similar due to microbatch pipelining
+    assert r2.bubble_fraction > r1.bubble_fraction
+    assert r1.bubble_fraction == 0.0  # PP=1 has no bubble
 
 
 def test_mfu_positive_and_bounded():

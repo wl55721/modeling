@@ -60,13 +60,19 @@ def test_zero_2_divides_grads_and_opt():
     """ZeRO-2: optimizer state + grads divided by DP."""
     model = _make_model()
     system = _make_system()
-    strategy = Strategy(tp=1, pp=1, dp=4, micro_batch=1, zero_stage=2)
-    graph = build_graph(model, strategy)
-    mem = memory_breakdown(graph, model, system, strategy)
+    strategy_z0 = Strategy(tp=1, pp=1, dp=4, micro_batch=1, zero_stage=0)
+    strategy_z2 = Strategy(tp=1, pp=1, dp=4, micro_batch=1, zero_stage=2)
 
-    assert mem.opt_state > 0
-    assert mem.grads > 0
-    assert mem.weights > 0
+    graph_z0 = build_graph(model, strategy_z0)
+    mem_z0 = memory_breakdown(graph_z0, model, system, strategy_z0)
+    graph_z2 = build_graph(model, strategy_z2)
+    mem_z2 = memory_breakdown(graph_z2, model, system, strategy_z2)
+
+    # ZeRO-2 should reduce opt_state and grads by ~4x
+    opt_ratio = mem_z2.opt_state / mem_z0.opt_state if mem_z0.opt_state > 0 else 0
+    grad_ratio = mem_z2.grads / mem_z0.grads if mem_z0.grads > 0 else 0
+    assert opt_ratio == pytest.approx(0.25, abs=0.01), f"ZeRO-2 opt_state ratio: {opt_ratio}"
+    assert grad_ratio == pytest.approx(0.25, abs=0.01), f"ZeRO-2 grads ratio: {grad_ratio}"
 
 
 def test_tp_reduces_weights():

@@ -767,7 +767,7 @@ def test_pp_heterogeneous_1f1b_formula():
 
 # ── Phase 2 end-to-end: stitched pp>1 ─────────────────────────────────────────
 
-def test_pp_routing_end_to_end():
+def test_pp_routing_basic():
     """End-to-end: stitch fwd+bwd → pipeline with pp=2 → per-stage timelines + P2P + 1F1B."""
     from zrt.ir.adapter import stitch_fwd_bwd
     from zrt.transform.pipeline import build_training_pipeline

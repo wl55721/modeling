@@ -76,11 +76,10 @@ def test_6p_rule():
     P = model.total_params()
     expected_6p = 6 * P * tokens
 
-    # Allow 50% tolerance because the 6P rule is approximate
-    # (it doesn't account for embedding/lm_head exactly, and we have
-    # memory-bound ops that don't contribute FLOPs)
+    # Allow 15% tolerance for embedding/lm_head and memory-bound ops
+    # (the 6P rule is approximate but should be reasonably close)
     ratio = total / expected_6p
-    assert 0.5 < ratio < 1.5, f"6P ratio: {ratio:.2f}, total={total:.2e}, 6P={expected_6p:.2e}"
+    assert 0.85 < ratio < 1.15, f"6P ratio: {ratio:.2f}, total={total:.2e}, 6P={expected_6p:.2e}"
 
 
 def test_unknown_op_zero_cost():
