@@ -252,7 +252,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
     from python.zrt.executor import DAGScheduler
     from python.zrt.simulator import SimulatorHub
     from python.zrt.report import build_summary, export_html_report, export_chrome_trace
-    from python.zrt.graph.excel_writer import append_perf_summary
+    from python.zrt.report.excel_writer import append_perf_summary
 
     ctx = TransformContext(
         hw_spec=hw,
