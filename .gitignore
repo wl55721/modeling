@@ -12,3 +12,5 @@ CLAUDE_TASK.MD
 SESSION_HISTORY.md
 SESSION_PROGRESS.md
 .omx/
+/.omc/
+.codex
