@@ -113,6 +113,8 @@ def estimate_training_from_graphs(
             recompute_policy=recompute_policy,
             pp_schedule=pp_schedule,
             vpp_chunks=vpp_chunks,
+            seq_len=seq_len,
+            hidden=hidden,
             cp_kind=cp_kind,
         ),
         fusion=fusion_config or FusionConfig(),
