@@ -119,20 +119,15 @@ def memory_breakdown(
     # ── Parameters on this rank ──────────────────────────────────────────
     P = _params_on_rank(model, strategy)
 
-    # FP4 routed expert weights: 0.5 B/elem + per-block BF16 scale
-    use_fp4 = getattr(model, "routed_expert_dtype", "bf16") == "fp4"
-    if use_fp4:
-        P_expert = _routed_expert_params_on_rank(model, strategy)
-        P_other = P - P_expert
-        FP4_BYTES_PER_ELEM = 0.5
-        FP4_BLOCK_SIZE = 32
-        expert_weight_bytes = int(
-            P_expert * FP4_BYTES_PER_ELEM
-            + (P_expert / FP4_BLOCK_SIZE) * 2  # BF16 scale per block
-        )
-        weights = expert_weight_bytes + P_other * model.param_dtype.bytes
-    else:
-        weights = P * model.param_dtype.bytes
+    # Per-component weight bytes: routed-expert weights use
+    # routed_expert_weight_dtype (FP4 stored-size includes per-block BF16 scale);
+    # everything else uses param_dtype.
+    P_expert = _routed_expert_params_on_rank(model, strategy)
+    P_other = P - P_expert
+    weights = int(
+        P_expert * model.routed_expert_weight_dtype.stored_bytes
+        + P_other * model.param_dtype.stored_bytes
+    )
 
     grads = P * model.grad_dtype.bytes
     opt_state = _optimizer_state_bytes(P, model, strategy)
