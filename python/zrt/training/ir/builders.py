@@ -665,7 +665,6 @@ def dense_block(
         outputs=[_tensor("gate", (seq, ffn), act_dtype)],
         meta={"m": seq, "n": ffn, "k": h},
         layer_id=layer_id, layer_kind=LayerKind.DENSE,
-        component="routed_expert",
     ))
     ops.append(Op(
         name=f"{prefix}.swiglu", kind="swiglu",
