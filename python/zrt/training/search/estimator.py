@@ -80,6 +80,7 @@ def estimate(
         pipeline_time_ms=s.pipeline_time * 1000,
         mfu=s.mfu,
         hfu=s.hfu,
+        mfu_native=s.mfu_native,
         memory=s.memory,
         per_stage=s.per_stage,
         total_flops=total_flops,
@@ -157,8 +158,8 @@ def grid_search(
         try:
             report = estimate(model, system, strategy)
             if report.memory is not None:
-                total_gb = report.memory.total / 1e9
-                if total_gb > space.max_memory_gb:
+                peak_gb = report.memory.peak_overall / 1e9
+                if peak_gb > space.max_memory_gb:
                     continue
             reports.append(report)
         except Exception:
