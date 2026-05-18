@@ -1,13 +1,15 @@
 """Integration test: verify how DataParallel (DP) affects TrainingReport fields.
 
-This test runs the training modelling CLI twice (dp=1 and dp=4), loads the
-generated `deepseek_v4_training_report.json` files and asserts expected
+This test runs the training modelling CLI for dp=1, dp=4, dp=8, loads the
+generated ``deepseek_v4_training_report.json`` files and asserts expected
 relationships:
 
-- optimizer state (opt_state) per-GPU ≈ 1/dp
-- total per-GPU memory drops when dp increases
-- step_time decreases and tokens/sec increases when dp increases
+- optimizer state (opt_state) per-GPU ≈ 1/dp  (ZeRO-1)
+- total per-GPU memory drops monotonically as dp increases
+- step_time decreases and tokens/sec increases monotonically as dp increases
 - dp_hidden_ms and dp_exposed_ms are zero for dp=1, non-zero for dp>1
+- dp_comm_total (dp_hidden + dp_exposed) increases monotonically with dp
+- optimizer state scales approximately as 1/dp across dp=4 and dp=8
 
 This is a long-running integration test that captures real reports. To avoid
 running it by default in fast CI, it is skipped unless the environment
@@ -70,68 +72,84 @@ def _run_cli_and_load_report(repo_root: Path, outdir: Path, dp: int, timeout: in
 
 @pytest.fixture(scope="session")
 def dp_reports(tmp_path_factory):
-    """Session-scoped fixture: run CLI for dp=1 and dp=4 once, return both reports."""
+    """Session-scoped fixture: run CLI for dp=1, dp=4, dp=8, return all reports."""
     if os.environ.get("RUN_DP_TEST") != "1":
         pytest.skip("Set RUN_DP_TEST=1 to run this long integration test")
 
     repo_root = Path(__file__).resolve().parents[3]
     tmp_path = tmp_path_factory.mktemp("dp_effects")
 
-    out_dp1 = tmp_path / "out_dp1"
-    out_dp4 = tmp_path / "out_dp4"
+    reports = {}
+    for dp in (1, 4, 8):
+        out_dir = tmp_path / f"out_dp{dp}"
+        reports[dp] = _run_cli_and_load_report(repo_root, out_dir, dp=dp)
 
-    rep1 = _run_cli_and_load_report(repo_root, out_dp1, dp=1)
-    rep4 = _run_cli_and_load_report(repo_root, out_dp4, dp=4)
+    return reports
 
-    return rep1, rep4
 
+# ── ZeRO-1 optimizer state scaling ─────────────────────────────────────────
 
 def test_dp_optimizer_state_scales_inverse(dp_reports):
     """Optimizer state per-GPU should roughly scale ~1/dp (ZeRO-1 behaviour)."""
-    rep1, rep4 = dp_reports
+    opt = {}
+    for dp in (1, 4, 8):
+        mb = dp_reports[dp].get("memory_breakdown_gb")
+        assert mb, f"memory_breakdown_gb missing for dp={dp}"
+        opt[dp] = mb.get("opt_state")
+        assert opt[dp] is not None, f"opt_state missing for dp={dp}"
 
-    assert rep1.get("memory_breakdown_gb") and rep4.get("memory_breakdown_gb")
+    # Approximate 1/dp scaling: opt(dp) ≈ opt(1) / dp
+    for dp in (4, 8):
+        expected = opt[1] / dp
+        assert opt[dp] == pytest.approx(expected, rel=0.25), (
+            f"opt_state did not scale near 1/dp: dp=1 → {opt[1]}, dp={dp} → {opt[dp]}, "
+            f"expected ≈ {expected}"
+        )
 
-    opt1 = rep1["memory_breakdown_gb"].get("opt_state")
-    opt4 = rep4["memory_breakdown_gb"].get("opt_state")
-    assert opt1 is not None and opt4 is not None
-
-    expected_opt4 = opt1 / 4.0
-    assert opt4 == pytest.approx(expected_opt4, rel=0.25), (
-        f"opt_state did not scale near 1/dp: {opt1} -> {opt4}"
+    # Monotonic decrease
+    assert opt[1] > opt[4] > opt[8], (
+        f"opt_state should decrease monotonically: dp1={opt[1]}, dp4={opt[4]}, dp8={opt[8]}"
     )
 
+
+# ── Total memory monotonicity ──────────────────────────────────────────────
 
 def test_dp_total_memory_decreases(dp_reports):
-    """Total per-GPU memory should decrease when dp increases."""
-    rep1, rep4 = dp_reports
+    """Total per-GPU memory should decrease monotonically as dp increases."""
+    total = {}
+    for dp in (1, 4, 8):
+        mb = dp_reports[dp]["memory_breakdown_gb"]
+        total[dp] = mb["total"]
+        assert total[dp] is not None
 
-    total1 = rep1["memory_breakdown_gb"].get("total")
-    total4 = rep4["memory_breakdown_gb"].get("total")
-    assert total1 is not None and total4 is not None
-    assert total4 < total1, (
-        f"expected total memory per-GPU to decrease with DP: {total1} -> {total4}"
+    assert total[1] > total[4] > total[8], (
+        f"total memory should decrease monotonically: "
+        f"dp1={total[1]}, dp4={total[4]}, dp8={total[8]}"
     )
 
 
+# ── Throughput monotonicity ────────────────────────────────────────────────
+
 def test_dp_throughput_improves(dp_reports):
-    """Step time should decrease and tokens/sec should increase when DP increases."""
-    rep1, rep4 = dp_reports
+    """Step time should decrease and tokens/sec should increase monotonically."""
+    step_time = {dp: dp_reports[dp]["step_time_ms"] for dp in (1, 4, 8)}
+    tps = {dp: dp_reports[dp]["tokens_per_sec"] for dp in (1, 4, 8)}
 
-    st1 = rep1.get("step_time_ms")
-    st4 = rep4.get("step_time_ms")
-    tps1 = rep1.get("tokens_per_sec")
-    tps4 = rep4.get("tokens_per_sec")
+    assert step_time[1] > step_time[4] > step_time[8], (
+        f"step_time should decrease monotonically: "
+        f"dp1={step_time[1]}, dp4={step_time[4]}, dp8={step_time[8]}"
+    )
+    assert tps[1] < tps[4] < tps[8], (
+        f"tokens/sec should increase monotonically: "
+        f"dp1={tps[1]}, dp4={tps[4]}, dp8={tps[8]}"
+    )
 
-    assert st1 is not None and st4 is not None
-    assert tps1 is not None and tps4 is not None
-    assert st4 < st1, f"expected step_time to decrease when DP increases: {st1} -> {st4}"
-    assert tps4 > tps1, f"expected tokens/sec to increase when DP increases: {tps1} -> {tps4}"
 
+# ── DP communication accounting ────────────────────────────────────────────
 
 def test_dp_communication_zero_for_dp1(dp_reports):
     """dp_hidden_ms and dp_exposed_ms should be 0 for dp=1 (no DP communication)."""
-    rep1, _ = dp_reports
+    rep1 = dp_reports[1]
 
     dp_hidden1 = rep1.get("dp_hidden_ms")
     dp_exposed1 = rep1.get("dp_exposed_ms")
@@ -141,20 +159,39 @@ def test_dp_communication_zero_for_dp1(dp_reports):
     assert dp_exposed1 == 0.0, f"dp_exposed should be 0 for dp=1, got {dp_exposed1}"
 
 
-def test_dp_communication_nonzero_for_dp4(dp_reports):
-    """dp_hidden + dp_exposed should be >0 for dp=4 (DP AR/RS communication exists).
+def test_dp_communication_nonzero_for_dp_gt1(dp_reports):
+    """dp_hidden + dp_exposed should be >0 for dp>1 (DP AR/RS communication exists).
 
     dp_hidden may be 0 (e.g. no bubble to absorb AR) or dp_exposed may be 0
     (e.g. AR fully hidden in bubble), but their sum must reflect the total
     DP communication volume.
     """
-    _, rep4 = dp_reports
+    for dp in (4, 8):
+        rep = dp_reports[dp]
+        dp_hidden = rep.get("dp_hidden_ms")
+        dp_exposed = rep.get("dp_exposed_ms")
+        assert dp_hidden is not None, f"dp_hidden_ms missing for dp={dp}"
+        assert dp_exposed is not None, f"dp_exposed_ms missing for dp={dp}"
+        assert (dp_hidden + dp_exposed) > 0, (
+            f"dp_hidden + dp_exposed should be >0 for dp={dp}, "
+            f"got hidden={dp_hidden}, exposed={dp_exposed}"
+        )
 
-    dp_hidden4 = rep4.get("dp_hidden_ms")
-    dp_exposed4 = rep4.get("dp_exposed_ms")
-    assert dp_hidden4 is not None
-    assert dp_exposed4 is not None
-    assert (dp_hidden4 + dp_exposed4) > 0, (
-        f"dp_hidden + dp_exposed should be >0 for dp=4, "
-        f"got hidden={dp_hidden4}, exposed={dp_exposed4}"
+
+def test_dp_comm_volume_monotonic(dp_reports):
+    """Total DP communication volume (dp_hidden + dp_exposed) should increase with dp.
+
+    Larger DP group means more gradient data to reduce, so the total DP
+    communication time (exposed + hidden) should grow monotonically.
+    Note: on full-mesh topologies the per-step time may not scale linearly
+    due to the (N-1)/N ring factor, but the trend should be increasing.
+    """
+    dp_comm = {}
+    for dp in (4, 8):
+        rep = dp_reports[dp]
+        dp_comm[dp] = rep.get("dp_hidden_ms", 0.0) + rep.get("dp_exposed_ms", 0.0)
+
+    assert dp_comm[8] > dp_comm[4], (
+        f"DP comm volume should increase with dp: "
+        f"dp4={dp_comm[4]:.2f}ms, dp8={dp_comm[8]:.2f}ms"
     )
