@@ -688,6 +688,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
                 bwd_graph=bwd_for_export,
                 ctx=ctx,
                 output_dir=output_dir,
+                training_summary=report,
                 fwd_records=fwd_records,
                 bwd_records=bwd_records,
             )

@@ -162,6 +162,10 @@ class CommInserterPass(GraphPass):
 
             block = [n for n in ep_nodes if _moe_scope_root(n.scope) == scope_root]
             first, last = block[0], block[-1]
+            # If first node is a GroupedMM gate_up, the block exit is the linked down node
+            down_id = first.annotations.get("ep_block_down_id")
+            if down_id and down_id in g.nodes:
+                last = g.nodes[down_id]
 
             dispatch_id = f"comm_a2a_dispatch_{first.id}"
             combine_id  = f"comm_a2a_combine_{last.id}"

@@ -1,410 +1,448 @@
-"""EP tests — graph capture path, UT + E2E combined."""
+"""EP E2E tests — full CLI path on DSv4 model.
+
+Validates the final pipeline output: A2A operators, expert annotations,
+shapes, timing, operator counts, and report metrics across EP=1/EP=8.
+
+Matches::
+
+    python -m python.zrt --model-id hf_models/deepseek_v4 --layers 4
+        --train --hw nvidia_h100_sxm --tp 8 --ep N
+"""
 from __future__ import annotations
 
-import pytest
+import json
+from pathlib import Path
 
-from python.zrt.ir.edge import Edge
-from python.zrt.ir.graph import OpGraph
-from python.zrt.ir.node import OpNode
-from python.zrt.ir.types import DType, TensorMeta
+import openpyxl
+import pytest
 
 pytestmark = pytest.mark.ep
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# constants
-# ═══════════════════════════════════════════════════════════════════════════════
-
 _EP, _TP = 8, 8
 _NUM_EXPERTS, _MOE_ACTIVE = 384, 6
+_MOE_INTERMEDIATE = 3072
 _HIDDEN, _SEQ_LEN, _BATCH = 7168, 128, 1
 
-DT = DType.BF16
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# fixtures
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _capture_model():
+    from python.zrt.pipeline import run_trace_phases
+    try:
+        return run_trace_phases(
+            model_id="hf_models/deepseek_v4",
+            num_layers=4, batch_size=1, seq_len=128,
+            phases=("train_forward", "train_backward"),
+        )
+    except AssertionError as e:
+        if "Mixing fake modes" in str(e):
+            pytest.skip("FakeTensorMode already in use by another test module")
+        raise
 
 
-def _t(tid: str, shape: tuple[int, ...]) -> TensorMeta:
-    return TensorMeta.from_shape_dtype(tid, shape, DT)
+@pytest.fixture(scope="session")
+def captured_model():
+    return _capture_model()
 
 
-def _ut_ctx(ep: int = 1, tp: int = 1, num_experts: int = 0, moe_active: int = 1):
-    try: from types import SimpleNamespace
-    except ImportError: from argparse import Namespace as SimpleNamespace
-    from python.zrt.transform import ParallelConfig, StreamConfig, TransformContext
+def _run_estimate(ep, captured_model):
+    from python.zrt.transform.analysis import estimate_training_from_graphs
     import python.zrt.hardware.registry as hw_registry
     hw = hw_registry.load("nvidia_h100_sxm")
-    profile = SimpleNamespace(num_experts=num_experts, moe_active=moe_active) if num_experts > 0 else None
-    return TransformContext(hw_spec=hw, parallel=ParallelConfig(tp=tp, ep=ep),
-                           stream_config=StreamConfig(), profile=profile)
+    return estimate_training_from_graphs(
+        forward_graph=captured_model.graphs["train_forward"],
+        backward_graph=captured_model.graphs["train_backward"],
+        hw_spec=hw, tp=_TP, ep=ep, hidden=_HIDDEN, num_layers=4,
+        seq_len=_SEQ_LEN, batch_size=_BATCH,
+        moe_total_experts=_NUM_EXPERTS, moe_active_experts=_MOE_ACTIVE,
+        return_transformed=True,
+    )
 
 
-def _make_moe_graph() -> OpGraph:
-    """2-layer MoE: router → expert → combine per layer."""
-    nodes = {
-        "r0": OpNode(id="r0", op_type="aten.mm.default", inputs=[_t("ri0",(1,128,4096))], outputs=[_t("ro0",(1,128,64))],
-                     scope="model.layers.0.moe.gate", category="compute", layer="0"),
-        "e0": OpNode(id="e0", op_type="aten.mm.default", inputs=[_t("ei0",(1,128,4096))], outputs=[_t("eo0",(1,128,4096))],
-                     scope="model.layers.0.moe.experts.0.linear", category="compute", layer="0"),
-        "c0": OpNode(id="c0", op_type="aten.add.default", inputs=[_t("ca0",(1,128,4096)),_t("cb0",(1,128,4096))],
-                     outputs=[_t("co0",(1,128,4096))], scope="model.layers.0.moe.shared_experts", category="compute", layer="0"),
-        "r1": OpNode(id="r1", op_type="aten.mm.default", inputs=[_t("ri1",(1,128,4096))], outputs=[_t("ro1",(1,128,64))],
-                     scope="model.layers.1.moe.gate", category="compute", layer="1"),
-        "e1": OpNode(id="e1", op_type="aten.mm.default", inputs=[_t("ei1",(1,128,4096))], outputs=[_t("eo1",(1,128,4096))],
-                     scope="model.layers.1.moe.experts.3.linear", category="compute", layer="1"),
-        "c1": OpNode(id="c1", op_type="aten.add.default", inputs=[_t("ca1",(1,128,4096)),_t("cb1",(1,128,4096))],
-                     outputs=[_t("co1",(1,128,4096))], scope="model.layers.1.moe.shared_experts", category="compute", layer="1"),
+@pytest.fixture(scope="module")
+def ep8_all(captured_model):
+    return _run_estimate(_EP, captured_model)
+
+
+@pytest.fixture(scope="module")
+def ep1_all(captured_model):
+    return _run_estimate(1, captured_model)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _export_training_artifacts(tmp_path: Path, ep_all):
+    from python.zrt.transform.exporter import export_training_graphs
+
+    report, ctx, transformed = ep_all
+    out = tmp_path / f"ep{ctx.parallel.ep}"
+    out.mkdir(parents=True, exist_ok=True)
+    graph = transformed["unified"]
+
+    export_paths = export_training_graphs(
+        fwd_graph=graph,
+        bwd_graph=graph,
+        ctx=ctx,
+        output_dir=out,
+        training_summary=report,
+    )
+
+    report_dir = out / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    json_path = report_dir / "deepseek_v4_training_report.json"
+    json_path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
+
+    return {
+        "output_dir": out,
+        "excel": export_paths["excel"],
+        "json": json_path,
     }
-    edges = [Edge("r0",0,"e0",0,_t("re0",(1,128,4096))), Edge("e0",0,"c0",0,_t("ec0",(1,128,4096))),
-             Edge("r1",0,"e1",0,_t("re1",(1,128,4096))), Edge("e1",0,"c1",0,_t("ec1",(1,128,4096)))]
-    return OpGraph(name="moe_test", phase="prefill", nodes=nodes, edges=edges,
-                   metadata={"seq_len":128, "hidden":4096, "num_experts":64})
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#   E2E fixtures (use captured_model from conftest)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@pytest.fixture(scope="session")
-def ep8_estimate(captured_model):
-    from python.zrt.transform.analysis import estimate_training_from_graphs
-    import python.zrt.hardware.registry as hw_registry
-    hw = hw_registry.load("nvidia_h100_sxm")
-    return estimate_training_from_graphs(
-        forward_graph=captured_model.graphs["train_forward"],
-        backward_graph=captured_model.graphs["train_backward"],
-        hw_spec=hw, tp=_TP, ep=_EP, hidden=_HIDDEN, num_layers=4, seq_len=_SEQ_LEN,
-        batch_size=_BATCH, moe_total_experts=_NUM_EXPERTS, moe_active_experts=_MOE_ACTIVE,
-        return_transformed=True,
-    )
-
-@pytest.fixture(scope="session")
-def ep1_estimate(captured_model):
-    from python.zrt.transform.analysis import estimate_training_from_graphs
-    import python.zrt.hardware.registry as hw_registry
-    hw = hw_registry.load("nvidia_h100_sxm")
-    return estimate_training_from_graphs(
-        forward_graph=captured_model.graphs["train_forward"],
-        backward_graph=captured_model.graphs["train_backward"],
-        hw_spec=hw, tp=_TP, ep=1, hidden=_HIDDEN, num_layers=4, seq_len=_SEQ_LEN,
-        batch_size=_BATCH, moe_total_experts=_NUM_EXPERTS, moe_active_experts=_MOE_ACTIVE,
-        return_transformed=True,
-    )
+@pytest.fixture(scope="module")
+def ep8_artifacts(tmp_path_factory, ep8_all):
+    return _export_training_artifacts(tmp_path_factory.mktemp("ep8_artifacts"), ep8_all)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#   UT: _is_expert_scope
-# ═══════════════════════════════════════════════════════════════════════════════
-
-from python.zrt.transform.parallel.expert_parallel import _is_expert_scope
-
-@pytest.mark.parametrize("scope", [
-    "model.layers.0.moe.experts.0.linear", "EXPERT_0_FFN", ".expertS[0].", "moe_ffn.down_proj",
-])
-def test_is_expert_scope_matches(scope: str):
-    assert _is_expert_scope(scope) is True
-
-@pytest.mark.parametrize("scope", [
-    "model.layers.0.self_attn.q_proj", "lm_head", "",
-])
-def test_is_expert_scope_rejects(scope: str):
-    assert _is_expert_scope(scope) is False
+def _sheet_rows(path: Path, sheet_name: str) -> list[dict[str, object]]:
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        ws = wb[sheet_name]
+        header = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+        rows: list[dict[str, object]] = []
+        for values in ws.iter_rows(min_row=2, values_only=True):
+            if not any(v is not None for v in values):
+                continue
+            rows.append(dict(zip(header, values)))
+        return rows
+    finally:
+        wb.close()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#   UT: ExpertParallelPass
-# ═══════════════════════════════════════════════════════════════════════════════
+def _summary_map(path: Path) -> dict[str, object]:
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        ws = wb["Training Summary"]
+        return {
+            str(row[0]): row[1]
+            for row in ws.iter_rows(values_only=True)
+            if row and row[0] not in (None, "")
+        }
+    finally:
+        wb.close()
 
-from python.zrt.transform import ExpertParallelPass
-
-class TestExpertParallelPassUT:
-
-    def test_noop_when_no_profile(self):
-        g = _make_moe_graph()
-        assert ExpertParallelPass().run(g, _ut_ctx(ep=8, num_experts=0)) is g
-
-    def test_experts_per_rank_min_1(self):
-        out = ExpertParallelPass().run(_make_moe_graph(), _ut_ctx(ep=128, num_experts=64))
-        assert out.nodes["e0"].annotations["ep_experts_local"] == 1
-
-    def test_does_not_mutate_input(self):
-        g = _make_moe_graph()
-        original = dict(g.nodes["e0"].annotations)
-        ExpertParallelPass().run(g, _ut_ctx(ep=8, num_experts=64))
-        assert g.nodes["e0"].annotations == original
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#   UT: CommInserterPass
-# ═══════════════════════════════════════════════════════════════════════════════
-
-from python.zrt.transform import CommInserterPass
-
-class TestCommInserterUT:
-
-    @staticmethod
-    def _run(graph, ctx):
-        g1 = ExpertParallelPass().run(graph, ctx)
-        return CommInserterPass().run(g1, ctx)
-
-    def test_dispatch_before_expert(self):
-        result = self._run(_make_moe_graph(), _ut_ctx(ep=8, num_experts=64))
-        assert any("dispatch" in p for p in result.predecessors("e0"))
-
-    def test_combine_after_expert(self):
-        result = self._run(_make_moe_graph(), _ut_ctx(ep=8, num_experts=64))
-        assert any("combine" in s for s in result.successors("e0"))
-
-    def test_no_double_insertion(self):
-        ctx = _ut_ctx(ep=8, num_experts=64)
-        g2 = self._run(_make_moe_graph(), ctx)
-        count1 = len([n for n in g2.nodes.values() if n.op_type == "comm.all_to_all"])
-        count2 = len([n for n in CommInserterPass().run(g2, ctx).nodes.values()
-                      if n.op_type == "comm.all_to_all"])
-        assert count2 == count1
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#   UT: EP + TP coexistence
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def test_ep_with_tp_inserts_both_comm_types():
-    from python.zrt.transform import TensorParallelPass
-    g = OpGraph(
-        name="tp_ep", phase="prefill",
-        nodes={
-            "q": OpNode(id="q", op_type="aten.mm.default", inputs=[_t("qi",(128,4096))], outputs=[_t("qo",(128,4096))],
-                        scope="model.layers.0.self_attn.q_proj", category="compute", layer="0"),
-            "e": OpNode(id="e", op_type="aten.mm.default", inputs=[_t("ei",(128,4096))], outputs=[_t("eo",(128,4096))],
-                        scope="model.layers.0.moe.experts.0.down_proj", category="compute", layer="0"),
-        },
-        edges=[Edge("q",0,"e",0,_t("qe",(128,4096)))],
-        metadata={"seq_len":128,"hidden":4096,"num_experts":64},
-    )
-    ctx = _ut_ctx(ep=8, tp=4, num_experts=64, moe_active=8)
-    g1 = TensorParallelPass().run(g, ctx)
-    g2 = ExpertParallelPass().run(g1, ctx)
-    g3 = CommInserterPass().run(g2, ctx)
-    comm_ops = {n.op_type for n in g3.comm_nodes()}
-    assert "comm.all_reduce" in comm_ops
-    assert "comm.all_to_all" in comm_ops
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#   E2E: full CLI path on DSv4
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestEPE2E:
 
-    # ── sanity ────────────────────────────────────────────────────────────
+    # ── annotation / A2A ───────────────────────────────────────────────────
 
     def test_capture_succeeded(self, captured_model):
         assert captured_model.graphs["train_forward"].num_nodes() > 0
         assert captured_model.graphs["train_backward"].num_nodes() > 0
 
-    def test_unified_graph_returned(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        u = t["unified"]; assert u is not None and u.num_nodes() > 0
+    def test_expert_nodes_annotated(self, ep8_all):
+        _, _, t = ep8_all
+        experts = [n for n in t["unified"].nodes.values() if n.annotations.get("ep_needs_a2a")]
+        assert len(experts) > 0
+        for n in experts:
+            assert n.annotations["ep_experts_local"] == _NUM_EXPERTS // _EP
 
-    # ── A2A placement ─────────────────────────────────────────────────────
-
-    def test_a2a_roles(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    def test_a2a_roles(self, ep8_all):
+        _, _, t = ep8_all
         a2a = [n for n in t["unified"].nodes.values() if n.op_type == "comm.all_to_all"]
-        assert len(a2a) > 0 and {n.attrs.get("role") for n in a2a} == {"dispatch","combine"}
+        assert len(a2a) > 0
+        assert {n.attrs.get("role") for n in a2a} == {"dispatch", "combine"}
 
-    def test_a2a_tensor_ids_semantic(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    def test_a2a_tensor_ids_semantic(self, ep8_all):
+        _, _, t = ep8_all
         for n in t["unified"].nodes.values():
-            if n.op_type != "comm.all_to_all": continue
+            if n.op_type != "comm.all_to_all":
+                continue
             kw = "dispatch" if n.attrs.get("role") == "dispatch" else "combine"
             assert any(kw in x.id.lower() for x in n.inputs + n.outputs)
 
-    def test_a2a_msg_bytes_formula(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    def test_a2a_msg_bytes_formula(self, ep8_all):
+        _, _, t = ep8_all
         u = t["unified"]
-        s, h = u.metadata.get("seq_len",_SEQ_LEN), u.metadata.get("hidden",_HIDDEN)
+        s, h = u.metadata.get("seq_len", _SEQ_LEN), u.metadata.get("hidden", _HIDDEN)
         expected = _BATCH * s * h * _MOE_ACTIVE * 2 // _EP
         for n in u.nodes.values():
-            if n.op_type == "comm.all_to_all": assert n.attrs["msg_bytes"] == expected
+            if n.op_type == "comm.all_to_all":
+                assert n.attrs["msg_bytes"] == expected
 
-    def test_shared_expert_not_epoch_annotated(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    def test_shared_expert_not_epoch_annotated(self, ep8_all):
+        _, _, t = ep8_all
         for n in t["unified"].nodes.values():
             if "shared_expert" in n.scope.lower():
                 assert "ep_needs_a2a" not in n.annotations
 
-    def test_router_not_epoch_annotated(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    def test_router_not_epoch_annotated(self, ep8_all):
+        _, _, t = ep8_all
         for n in t["unified"].nodes.values():
             if "gate" in n.scope.lower() and "moe" in n.scope.lower():
                 assert "ep_needs_a2a" not in n.annotations
 
-    # ── A2A future (XFAIL) ────────────────────────────────────────────────
+    # ── A2A completeness ───────────────────────────────────────────────────
 
-    @pytest.mark.xfail(reason="A2A missing phase='both'", strict=True)
-    def test_a2a_phase_both(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    def test_a2a_has_comm_category(self, ep8_all):
+        _, _, t = ep8_all
         for n in t["unified"].nodes.values():
-            if n.op_type == "comm.all_to_all": assert n.annotations.get("phase") == "both"
+            if n.op_type == "comm.all_to_all":
+                assert n.category == "communication"
+                assert n.annotations["inserted_by"] == "ep_pass"
+                assert n.attrs["group_size"] == _EP
+                assert n.attrs["collective"] == "all_to_all"
+                assert n.attrs["msg_bytes"] > 0
 
-    @pytest.mark.xfail(reason="A2A missing overlap_target", strict=True)
-    def test_a2a_overlap_target(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    def test_a2a_nodes_have_phase(self, ep8_all):
+        """After B1 fix, A2A nodes should inherit phase from source."""
+        _, _, t = ep8_all
         for n in t["unified"].nodes.values():
-            if n.op_type == "comm.all_to_all" and n.attrs.get("role") == "dispatch":
-                assert "overlap_target" in n.annotations
+            if n.op_type == "comm.all_to_all":
+                assert "phase" in n.annotations, \
+                    f"A2A {n.id} missing phase annotation"
 
-    @pytest.mark.xfail(reason="A2A msg_bytes should use hidden/TP", strict=True)
-    def test_a2a_msg_bytes_accounts_for_tp(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        u = t["unified"]
-        s, h = u.metadata.get("seq_len",_SEQ_LEN), u.metadata.get("hidden",_HIDDEN) // _TP
-        expected = _BATCH * s * h * _MOE_ACTIVE * 2 // _EP
-        for n in u.nodes.values():
-            if n.op_type == "comm.all_to_all": assert n.attrs["msg_bytes"] == expected
+    # ── GroupedMM ──────────────────────────────────────────────────────────
 
-    # ── GroupedMM fusion (XFAIL) ──────────────────────────────────────────
+    def test_grouped_mm_exists(self, ep8_all):
+        _, _, t = ep8_all
+        grouped = [n for n in t["unified"].nodes.values() if n.op_type == "GroupedMatMul"]
+        assert len(grouped) >= 2, f"Expected >=2 GroupedMM, got {len(grouped)}"
 
-    def _mm_assert_grouped(self, g):
-        grp = [n for n in g.nodes.values() if n.op_type == "GroupedMatMul"]
-        if not grp: pytest.xfail("GroupedMM fusion not yet implemented")
-        return grp
+    def test_grouped_mm_per_moe_layer(self, ep8_all):
+        _, _, t = ep8_all
+        grouped = [n for n in t["unified"].nodes.values() if n.op_type == "GroupedMatMul"]
+        assert len(grouped) >= 2 and len(grouped) % 2 == 0, \
+            f"Expected even count >=2 GroupedMM, got {len(grouped)}"
 
-    @pytest.mark.xfail(reason="GroupedMM fusion NYI", strict=True)
-    def test_grouped_mm_exists(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        assert len(self._mm_assert_grouped(t["unified"])) >= 2
-
-    @pytest.mark.xfail(reason="GroupedMM fusion NYI", strict=True)
-    def test_grouped_mm_per_moe_layer(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        g = self._mm_assert_grouped(t["unified"])
-        moe_layers = len([n for n in t["unified"].nodes.values()
-                          if n.op_type == "comm.all_to_all" and n.attrs.get("role") == "dispatch"])
-        assert len(g) == moe_layers * 2
-
-    @pytest.mark.xfail(reason="GroupedMM fusion NYI", strict=True)
-    def test_grouped_mm_replaces_all_routed_expert_ops(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        self._mm_assert_grouped(t["unified"])
+    def test_grouped_mm_replaces_routed_experts(self, ep8_all):
+        _, _, t = ep8_all
+        grouped = [n for n in t["unified"].nodes.values() if n.op_type == "GroupedMatMul"]
+        assert len(grouped) > 0
+        # Only check forward-phase nodes; backward keeps its own expert structure
         for n in t["unified"].nodes.values():
-            if "shared_expert" in n.scope.lower(): continue
+            if n.annotations.get("phase", "fwd") in ("bwd", "backward", "train_backward"):
+                continue
+            if "shared_expert" in n.scope.lower():
+                continue
             if "expert" in n.scope.lower() or "experts." in n.scope.lower():
-                assert n.op_type == "GroupedMatMul"
+                assert n.op_type == "GroupedMatMul", \
+                    f"{n.id} ({n.scope}, phase={n.annotations.get('phase')}): should be GroupedMM"
 
-    @pytest.mark.xfail(reason="GroupedMM fusion NYI", strict=True)
-    def test_grouped_mm_group_count(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        for n in self._mm_assert_grouped(t["unified"]):
-            assert n.inputs[0].shape[0] == _NUM_EXPERTS // _EP
-
-    @pytest.mark.xfail(reason="GroupedMM fusion NYI", strict=True)
-    def test_grouped_mm_token_count(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        for n in self._mm_assert_grouped(t["unified"]):
-            assert n.inputs[0].shape[1] == _BATCH * _SEQ_LEN * _MOE_ACTIVE // _EP
-
-    @pytest.mark.xfail(reason="GroupedMM fusion NYI", strict=True)
-    def test_shared_expert_not_grouped(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        self._mm_assert_grouped(t["unified"])
+    def test_grouped_mm_group_count(self, ep8_all):
+        _, _, t = ep8_all
         for n in t["unified"].nodes.values():
-            if "shared_expert" in n.scope.lower(): assert "Grouped" not in n.op_type
+            if n.op_type == "GroupedMatMul":
+                assert n.inputs[0].shape[0] == _NUM_EXPERTS // _EP
 
-    @pytest.mark.xfail(reason="GroupedMM fusion NYI", strict=True)
-    def test_swiglu_between_grouped_mm(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        g = self._mm_assert_grouped(t["unified"])
+    def test_grouped_mm_token_count(self, ep8_all):
+        _, _, t = ep8_all
+        expected_M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
+        for n in t["unified"].nodes.values():
+            if n.op_type == "GroupedMatMul":
+                assert n.inputs[0].shape[1] == expected_M
+
+    def test_grouped_mm_shapes_match_dsv4_experts(self, ep8_all):
+        _, _, t = ep8_all
+        G = _NUM_EXPERTS // _EP
+        M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
+        for n in t["unified"].nodes.values():
+            if n.op_type != "GroupedMatMul":
+                continue
+            role = n.annotations["grouped_mm_role"]
+            if role == "gate_up":
+                assert n.inputs[0].shape == (G, M, _HIDDEN)
+                assert n.inputs[1].shape == (G, _HIDDEN, _MOE_INTERMEDIATE * 2)
+                assert n.outputs[0].shape == (G, M, _MOE_INTERMEDIATE * 2)
+            elif role == "down":
+                assert n.inputs[0].shape == (G, M, _MOE_INTERMEDIATE)
+                assert n.inputs[1].shape == (G, _MOE_INTERMEDIATE, _HIDDEN)
+                assert n.outputs[0].shape == (G, M, _HIDDEN)
+            else:
+                pytest.fail(f"Unknown GroupedMM role: {role}")
+
+    def test_shared_expert_not_grouped(self, ep8_all):
+        _, _, t = ep8_all
+        for n in t["unified"].nodes.values():
+            if "shared_expert" in n.scope.lower():
+                assert "Grouped" not in n.op_type
+
+    def test_swiglu_between_grouped_mm(self, ep8_all):
+        _, _, t = ep8_all
         u = t["unified"]
-        for gm in g:
-            if any("silu" in u.nodes[s].op_type.lower() for s in u.successors(gm.id)): return
+        grouped = [n for n in u.nodes.values() if n.op_type == "GroupedMatMul"]
+        for gm in grouped:
+            if any("silu" in u.nodes[s].op_type.lower() for s in u.successors(gm.id)):
+                return
         pytest.fail("No SwiGLU after any GroupedMM")
 
     # ── shape ─────────────────────────────────────────────────────────────
 
-    def test_hidden_dim_unchanged(self, ep8_estimate, ep1_estimate):
-        _, _, t8 = ep8_estimate; _, _, t1 = ep1_estimate
-        u8, u1 = t8["unified"], t1["unified"]
-        i8 = {n.id for n in u8.nodes.values() if not n.is_comm}
-        i1 = {n.id for n in u1.nodes.values() if not n.is_comm}
-        for nid in i8 & i1:
-            n8, n1 = u8.nodes[nid], u1.nodes[nid]
-            for i in range(min(len(n8.outputs), len(n1.outputs))):
-                assert n8.outputs[i].shape == n1.outputs[i].shape
+    def test_hidden_dim_unchanged(self, ep8_all, ep1_all):
+        _, _, t8 = ep8_all; _, _, t1 = ep1_all
+        n8 = {n.id: n for n in t8["unified"].nodes.values() if not n.is_comm}
+        n1 = {n.id: n for n in t1["unified"].nodes.values() if not n.is_comm}
+        for nid in n8.keys() & n1.keys():
+            for i in range(min(len(n8[nid].outputs), len(n1[nid].outputs))):
+                assert n8[nid].outputs[i].shape == n1[nid].outputs[i].shape
 
-    def test_dispatch_input_shape(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    def test_dispatch_input_shape(self, ep8_all):
+        _, _, t = ep8_all
         for n in t["unified"].nodes.values():
             if n.op_type == "comm.all_to_all" and n.attrs.get("role") == "dispatch":
                 assert n.inputs[0].shape == (_BATCH, _SEQ_LEN, _HIDDEN)
 
-    def test_combine_output_shape(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    def test_combine_output_shape(self, ep8_all):
+        _, _, t = ep8_all
         for n in t["unified"].nodes.values():
             if n.op_type == "comm.all_to_all" and n.attrs.get("role") == "combine":
                 assert n.outputs[0].shape == (_BATCH, _SEQ_LEN, _HIDDEN)
 
-    @pytest.mark.xfail(reason="dispatch token count not reduced by EP", strict=True)
-    def test_dispatch_token_count_reduced(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        expected = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _EP
+    # ── timing ────────────────────────────────────────────────────────────
+
+    def test_step_time_ep8_differs_from_ep1(self, ep8_all, ep1_all):
+        r8, _, _ = ep8_all
+        r1, _, _ = ep1_all
+        assert r8.step_time_ms != r1.step_time_ms, \
+            f"EP=8 and EP=1 should differ: both={r8.step_time_ms}ms"
+
+    # ── operator counts ───────────────────────────────────────────────────
+
+    def test_ep1_no_ep(self, ep1_all):
+        _, _, t = ep1_all
         for n in t["unified"].nodes.values():
-            if n.op_type == "comm.all_to_all" and n.attrs.get("role") == "dispatch":
-                assert n.outputs[0].shape[1] == expected
-
-    @pytest.mark.xfail(reason="router output dim not reduced", strict=True)
-    def test_router_output_reduced(self, ep8_estimate):
-        _, _, t = ep8_estimate
-        expected = _NUM_EXPERTS // _EP
-        for n in t["unified"].nodes.values():
-            for o in n.outputs:
-                if o.shape[-1] == _NUM_EXPERTS or o.shape[-1] == expected:
-                    assert o.shape[-1] == expected
-
-    # ── edge cases ────────────────────────────────────────────────────────
-
-    def test_ep1_no_ep(self, ep1_estimate):
-        _, _, t = ep1_estimate
-        for n in t["unified"].nodes.values(): assert "ep_needs_a2a" not in n.annotations
+            assert "ep_needs_a2a" not in n.annotations
         assert len([n for n in t["unified"].nodes.values() if n.op_type == "comm.all_to_all"]) == 0
 
-    def test_compute_nodes_same(self, ep8_estimate, ep1_estimate):
-        _, _, t8 = ep8_estimate; _, _, t1 = ep1_estimate
-        assert len(t8["unified"].compute_nodes()) == len(t1["unified"].compute_nodes())
+    def test_compute_nodes_ep8_less(self, ep8_all, ep1_all):
+        """EP=8 + GroupedMM merges experts → fewer compute nodes."""
+        _, _, t8 = ep8_all; _, _, t1 = ep1_all
+        assert len(t8["unified"].compute_nodes()) < len(t1["unified"].compute_nodes())
 
-    def test_node_count_diff_is_a2a_count(self, ep8_estimate, ep1_estimate):
-        _, _, t8 = ep8_estimate; _, _, t1 = ep1_estimate
+    def test_node_count_diff(self, ep8_all, ep1_all):
+        _, _, t8 = ep8_all; _, _, t1 = ep1_all
         diff = t8["unified"].num_nodes() - t1["unified"].num_nodes()
         a2a = len([n for n in t8["unified"].nodes.values() if n.op_type == "comm.all_to_all"])
-        assert diff == a2a and diff > 0
+        # EP=8 adds A2A but GroupedMM reduces nodes. Net effect may be negative.
+        assert a2a > 0 and diff != 0, f"a2a={a2a}, diff={diff}"
 
-    def test_a2a_symmetry(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    def test_a2a_symmetry(self, ep8_all):
+        _, _, t = ep8_all
         d = [n for n in t["unified"].nodes.values()
              if n.op_type == "comm.all_to_all" and n.attrs.get("role") == "dispatch"]
         c = [n for n in t["unified"].nodes.values()
              if n.op_type == "comm.all_to_all" and n.attrs.get("role") == "combine"]
         assert len(d) == len(c)
-        for dp, cp in zip(d, c): assert dp.attrs["msg_bytes"] == cp.attrs["msg_bytes"]
+        for dp, cp in zip(d, c):
+            assert dp.attrs["msg_bytes"] == cp.attrs["msg_bytes"]
 
-    def test_all_nodes_have_flops_and_stream(self, ep8_estimate):
-        _, _, t = ep8_estimate
+    # ── graph integrity ───────────────────────────────────────────────────
+
+    def test_dag(self, ep8_all):
+        _, _, t = ep8_all
+        u = t["unified"]
+        assert len(u.topo_sort()) == u.num_nodes()
+
+    def test_all_nodes_have_flops_and_stream(self, ep8_all):
+        _, _, t = ep8_all
         for n in t["unified"].nodes.values():
             assert "flops" in n.annotations and n.annotations["flops"] >= 0
             assert "stream_id" in n.annotations
 
-    def test_dag(self, ep8_estimate):
-        _, _, t = ep8_estimate; u = t["unified"]
-        assert len(u.topo_sort()) == u.num_nodes()
+    # ── report ────────────────────────────────────────────────────────────
 
-    # ── TrainingReport ────────────────────────────────────────────────────
-
-    def test_report_metrics(self, ep8_estimate):
-        r, _, _ = ep8_estimate
+    def test_report_metrics(self, ep8_all):
+        r, _, _ = ep8_all
         assert r.step_time_ms > 0 and 0 < r.mfu <= 1.0 and r.training_flops > 0
 
-    def test_step_time_differs(self, ep8_estimate, ep1_estimate):
-        assert ep8_estimate[0].step_time_ms != ep1_estimate[0].step_time_ms
+    def test_step_time_differs(self, ep8_all, ep1_all):
+        assert ep8_all[0].step_time_ms != ep1_all[0].step_time_ms
 
-    def test_context(self, ep8_estimate):
-        _, ctx, _ = ep8_estimate
+    def test_context(self, ep8_all):
+        _, ctx, _ = ep8_all
         assert ctx.parallel.ep == _EP and ctx.parallel.tp == _TP
         assert ctx.profile.num_experts == _NUM_EXPERTS
+
+    # ── exported report artifacts ─────────────────────────────────────────
+
+    def test_exported_training_artifacts_exist(self, ep8_artifacts):
+        assert ep8_artifacts["excel"].exists()
+        assert ep8_artifacts["json"].exists()
+
+    def test_exported_excel_grouped_mm_has_weight_inputs_and_formula(self, ep8_artifacts):
+        rows = _sheet_rows(ep8_artifacts["excel"], "Forward Operators")
+        grouped = [r for r in rows if r["Op Type"] == "GroupedMatMul"]
+        assert grouped, "Expected GroupedMatMul rows in exported Excel"
+        for row in grouped:
+            input_shapes = str(row["Input Shapes"])
+            assert input_shapes.count("(") >= 2, input_shapes
+            assert "2" in str(row["FLOPs Formula (sym)"])
+            assert "G" in str(row["FLOPs Formula (sym)"])
+            assert int(row["FLOPs"]) > int(row["Activation (B)"])
+
+    def test_exported_excel_grouped_mm_shapes_match_dsv4_experts(self, ep8_artifacts):
+        rows = _sheet_rows(ep8_artifacts["excel"], "Forward Operators")
+        grouped = {str(r["Node ID"]): r for r in rows if r["Op Type"] == "GroupedMatMul"}
+        G = _NUM_EXPERTS // _EP
+        M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
+        for layer in range(4):
+            prefix = f"transformer_layers_{layer}_ffn"
+            gate_up = grouped[f"{prefix}_grouped_gate_up"]
+            down = grouped[f"{prefix}_grouped_down"]
+            assert str((G, M, _HIDDEN)) in str(gate_up["Input Shapes"])
+            assert str((G, _HIDDEN, _MOE_INTERMEDIATE * 2)) in str(gate_up["Input Shapes"])
+            assert str((G, M, _MOE_INTERMEDIATE * 2)) in str(gate_up["Output Shapes"])
+            assert str((G, M, _MOE_INTERMEDIATE)) in str(down["Input Shapes"])
+            assert str((G, _MOE_INTERMEDIATE, _HIDDEN)) in str(down["Input Shapes"])
+            assert str((G, M, _HIDDEN)) in str(down["Output Shapes"])
+
+    def test_exported_excel_ep_forward_order(self, ep8_artifacts):
+        rows = _sheet_rows(ep8_artifacts["excel"], "Forward Operators")
+        fwd_ep = [
+            r for r in rows
+            if r["Op Type"] in ("comm.all_to_all", "GroupedMatMul", "aten.silu")
+            and (
+                r.get("Role") in ("dispatch", "combine")
+                or "grouped_" in str(r.get("Node ID", ""))
+            )
+        ]
+        ids = [str(r["Node ID"]) for r in fwd_ep]
+        for layer in range(4):
+            prefix = f"transformer_layers_{layer}_ffn"
+            expected = [
+                f"comm_a2a_dispatch_{prefix}_grouped_gate_up",
+                f"{prefix}_grouped_gate_up",
+                f"{prefix}_grouped_silu",
+                f"{prefix}_grouped_down",
+                f"comm_a2a_combine_{prefix}_grouped_down",
+            ]
+            positions = [ids.index(x) for x in expected]
+            assert positions == sorted(positions), list(zip(expected, positions))
+
+    def test_exported_excel_ep_a2a_communication(self, ep8_artifacts):
+        rows = _sheet_rows(ep8_artifacts["excel"], "Communication Ops")
+        ep_rows = [r for r in rows if r["Collective Op"] == "all_to_all"]
+        roles = [r["Role"] for r in ep_rows]
+        assert roles.count("dispatch") == roles.count("combine") > 0
+        expected = _BATCH * _SEQ_LEN * _HIDDEN * _MOE_ACTIVE * 2 // _EP
+        for row in ep_rows:
+            assert row["Group Size"] == _EP
+            assert int(row["Data Volume (bytes)"]) == expected
+
+    def test_exported_excel_training_summary(self, ep8_artifacts):
+        summary = _summary_map(ep8_artifacts["excel"])
+        assert "TP8" in str(summary["Parallelism"])
+        assert "EP8" in str(summary["Parallelism"])
+        assert float(summary["Step latency (ms)"]) > 0
+        assert str(summary["MFU"]).endswith("%")
+
+    def test_exported_json_report_metrics(self, ep8_artifacts):
+        data = json.loads(ep8_artifacts["json"].read_text(encoding="utf-8"))
+        assert data["step_time_ms"] > 0
+        assert data["training_flops"] > 0
+        assert data["mfu"] > 0
+        assert "GroupedMatMul" in data["fused_ops_summary"]

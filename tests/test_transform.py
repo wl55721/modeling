@@ -96,6 +96,45 @@ def test_tp_pass_does_not_mutate_original():
     assert g.nodes["q"].outputs[0].shape == original_shape
 
 
+def test_tp_pass_skips_routed_experts_but_keeps_shared_experts():
+    routed_gate = _linear_node(
+        "routed_gate",
+        "transformer.layers.0.ffn.experts.0.w1",
+        (128, 7168),
+        (128, 3072),
+    )
+    routed_down = _linear_node(
+        "routed_down",
+        "transformer.layers.0.ffn.experts.0.w2",
+        (128, 3072),
+        (128, 7168),
+    )
+    shared_gate = _linear_node(
+        "shared_gate",
+        "transformer.layers.0.ffn.shared_experts.w1",
+        (128, 7168),
+        (128, 3072),
+    )
+    g = OpGraph(
+        name="tp_expert_scope",
+        phase="prefill",
+        nodes={
+            "routed_gate": routed_gate,
+            "routed_down": routed_down,
+            "shared_gate": shared_gate,
+        },
+        edges=[],
+    )
+    out = TensorParallelPass().run(g, _ctx(tp=8))
+
+    assert "tp_split" not in out.nodes["routed_gate"].annotations
+    assert out.nodes["routed_gate"].outputs[0].shape == (128, 3072)
+    assert "tp_split" not in out.nodes["routed_down"].annotations
+    assert out.nodes["routed_down"].inputs[0].shape == (128, 3072)
+    assert out.nodes["shared_gate"].annotations["tp_split"]["tp"] == 8
+    assert out.nodes["shared_gate"].outputs[0].shape == (128, 384)
+
+
 # ── CommInserterPass ──────────────────────────────────────────────────────────
 
 def test_comm_inserter_adds_allreduce():

@@ -368,8 +368,15 @@ class TransformedGraphExcelWriter:
             input_dtypes = ", ".join(str(t.dtype) for t in node.inputs)
             output_dtypes = ", ".join(str(t.dtype) for t in node.outputs)
 
-            # Comm volume for comm nodes
-            comm_vol = sum(t.mem_bytes for t in node.outputs) if node.is_comm else ""
+            # Comm volume for comm nodes. EP A2A carries semantic msg_bytes
+            # which may differ from the placeholder tensor shape size.
+            comm_vol = ""
+            if node.is_comm:
+                comm_vol = node.attrs.get("msg_bytes")
+                if comm_vol is None:
+                    comm_vol = node.attrs.get("bytes")
+                if comm_vol is None:
+                    comm_vol = sum(t.mem_bytes for t in node.outputs)
 
             # Build annotations string (exclude columns that have dedicated cells)
             annotations_list = []
@@ -470,8 +477,12 @@ class TransformedGraphExcelWriter:
             group_size = node.attrs.get("group_size", "")
             role = node.attrs.get("role", "")
 
-            # Estimate data volume: sum of output tensor sizes
-            data_volume = sum(t.mem_bytes for t in node.outputs)
+            # Estimate data volume. Prefer explicit semantic volume when present.
+            data_volume = node.attrs.get("msg_bytes")
+            if data_volume is None:
+                data_volume = node.attrs.get("bytes")
+            if data_volume is None:
+                data_volume = sum(t.mem_bytes for t in node.outputs)
 
             input_shapes = ", ".join(str(t.shape) for t in node.inputs)
             output_shapes = ", ".join(str(t.shape) for t in node.outputs)
@@ -1376,6 +1387,10 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
     def _write_training_summary_sheet(self, wb: openpyxl.Workbook, ts) -> None:
         """Write TrainingSummary metrics as a key-value sheet."""
+        if hasattr(ts, "step_time_ms"):
+            self._write_training_report_sheet(wb, ts)
+            return
+
         ws = wb.create_sheet("Training Summary")
 
         ws.append(["Training Step Summary"])
@@ -1448,6 +1463,62 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             rows += [("", ""), ("=== Top Bottleneck Ops ===", "")]
             for op_desc, lat_us in ts.top_bottleneck_ops:
                 rows.append((op_desc, f"{lat_us:.1f} µs"))
+
+        for key, val in rows:
+            ws.append([key, val])
+            if str(key).startswith("==="):
+                row_num = ws.max_row
+                ws.cell(row=row_num, column=1).font = Font(bold=True)
+
+        ws.column_dimensions["A"].width = 32
+        ws.column_dimensions["B"].width = 28
+
+    def _write_training_report_sheet(self, wb: openpyxl.Workbook, report) -> None:
+        """Write graph-native TrainingReport metrics as a key-value sheet."""
+        ws = wb.create_sheet("Training Summary")
+        ws.append(["Training Step Summary"])
+        ws["A1"].font = Font(bold=True, size=13)
+
+        rows = [
+            ("Model", ""),
+            ("Hardware", ""),
+            ("Parallelism", report.config_summary),
+            ("Batch size", ""),
+            ("Sequence length", ""),
+            ("", ""),
+            ("=== Step Timing ===", ""),
+            ("Step latency (ms)", round(report.step_time_ms, 3)),
+            ("Pipeline time (ms)", round(report.pipeline_time_ms, 3)),
+            ("Compute time (ms)", round(report.compute_time_ms, 3)),
+            ("Exposed comm (ms)", round(report.exposed_comm_ms, 3)),
+            ("", ""),
+            ("=== HW Efficiency ===", ""),
+            ("MFU", f"{report.mfu:.2%}"),
+            ("HFU", f"{report.hfu:.2%}"),
+            ("Total FLOPs (T)", round(report.training_flops / 1e12, 3)),
+            ("Forward FLOPs (T)", round(report.forward_flops / 1e12, 3)),
+            ("Backward FLOPs (T)", round(report.backward_flops / 1e12, 3)),
+            ("", ""),
+            ("=== Communication ===", ""),
+            ("TP exposed (ms)", round(report.tp_exposed_ms, 3)),
+            ("CP exposed (ms)", round(report.cp_exposed_ms, 3)),
+            ("EP exposed (ms)", round(report.ep_exposed_ms, 3)),
+            ("EP hidden (ms)", round(report.ep_hidden_ms, 3)),
+            ("Total comm volume (ms)", round(report.total_comm_volume_ms, 3)),
+        ]
+
+        memory = report.memory_breakdown or {}
+        if memory:
+            rows += [
+                ("", ""),
+                ("=== Memory (per GPU) ===", ""),
+                ("Weights (GB)", round(memory.get("weights", 0) / 1e9, 3)),
+                ("Gradients (GB)", round(memory.get("grads", 0) / 1e9, 3)),
+                ("Opt states (GB)", round(memory.get("opt_state", 0) / 1e9, 3)),
+                ("Activations (GB)", round(memory.get("activations", 0) / 1e9, 3)),
+                ("Comm buffers (GB)", round(memory.get("comm_buffers", 0) / 1e9, 3)),
+                ("Total (GB)", round(memory.get("total", 0) / 1e9, 3)),
+            ]
 
         for key, val in rows:
             ws.append([key, val])
