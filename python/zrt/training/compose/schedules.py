@@ -343,13 +343,15 @@ class DualPipeComposer(PipelineComposer):
         if pp <= 1:
             return OneF1BComposer().compose(stage_times, M, pp, dp_ar_time, strategy)
 
-        t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0
+        t_fwd_max = max((st.fwd for st in stage_times), default=0.0)
+        t_bwd_max = max((st.bwd for st in stage_times), default=0.0)
+        t_stage_max = t_fwd_max + t_bwd_max
 
         bubble = (pp - 1) / 2.0 * t_stage_max
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
-        steady_bwd_total = M * t_stage_max / 2
+        steady_bwd_total = M * t_bwd_max
         hidden = _dp_hidden(dp_ar_time, cooldown, steady_bwd_total, strategy)
         dp_exposed = dp_ar_time - hidden
 
@@ -368,12 +370,12 @@ class DualPipeComposer(PipelineComposer):
             cooldown_steps=max(1, -(-(pp - 1) // 2)),
             warmup_fwd=warmup,
             warmup_bwd=0.0,
-            steady_fwd=M * t_stage_max / 2,
-            steady_bwd=M * t_stage_max / 2,
+            steady_fwd=M * t_fwd_max,
+            steady_bwd=M * t_bwd_max,
             cooldown_fwd=0.0,
             cooldown_bwd=cooldown,
-            steady_fwd_per_mb=t_stage_max / 2,
-            steady_bwd_per_mb=t_stage_max / 2,
+            steady_fwd_per_mb=t_fwd_max,
+            steady_bwd_per_mb=t_bwd_max,
             steady_per_mb=t_stage_max,
         )
 
@@ -399,13 +401,15 @@ class DualPipeVComposer(PipelineComposer):
         if pp <= 1:
             return OneF1BComposer().compose(stage_times, M, pp, dp_ar_time, strategy)
 
-        t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0
+        t_fwd_max = max((st.fwd for st in stage_times), default=0.0)
+        t_bwd_max = max((st.bwd for st in stage_times), default=0.0)
+        t_stage_max = t_fwd_max + t_bwd_max
 
         bubble = (pp - 1) / (2.0 * V) * t_stage_max
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
-        steady_bwd_total = M * t_stage_max / 2
+        steady_bwd_total = M * t_bwd_max
         hidden = _dp_hidden(dp_ar_time, cooldown, steady_bwd_total, strategy)
         dp_exposed = dp_ar_time - hidden
 
@@ -424,12 +428,12 @@ class DualPipeVComposer(PipelineComposer):
             cooldown_steps=max(1, -(-(pp - 1) // (2 * V))),
             warmup_fwd=warmup,
             warmup_bwd=0.0,
-            steady_fwd=M * t_stage_max / 2,
-            steady_bwd=M * t_stage_max / 2,
+            steady_fwd=M * t_fwd_max,
+            steady_bwd=M * t_bwd_max,
             cooldown_fwd=0.0,
             cooldown_bwd=cooldown,
-            steady_fwd_per_mb=t_stage_max / 2,
-            steady_bwd_per_mb=t_stage_max / 2,
+            steady_fwd_per_mb=t_fwd_max,
+            steady_bwd_per_mb=t_bwd_max,
             steady_per_mb=t_stage_max,
         )
 
@@ -460,6 +464,8 @@ class ZeroBubbleComposer(PipelineComposer):
 
         bottleneck = max(stage_times, key=lambda st: st.fwd + st.bwd) if stage_times else StageTime()
         t_stage = bottleneck.fwd + bottleneck.bwd
+        t_fwd = bottleneck.fwd
+        t_bwd = bottleneck.bwd
         t_w = bottleneck.bwd_dw
 
         # ZB-1P/ZB-V keep a residual per-transition bubble even when t_w ≈ t_stage.
@@ -474,7 +480,7 @@ class ZeroBubbleComposer(PipelineComposer):
         steady = M * t_stage
         cooldown = bubble / 2.0
 
-        steady_bwd_total = M * (t_stage / 2)
+        steady_bwd_total = M * t_bwd
         hidden = _dp_hidden(dp_ar_time, cooldown, steady_bwd_total, strategy)
         dp_exposed = dp_ar_time - hidden
 
@@ -493,12 +499,12 @@ class ZeroBubbleComposer(PipelineComposer):
             cooldown_steps=pp - 1,
             warmup_fwd=warmup,
             warmup_bwd=0.0,
-            steady_fwd=M * t_stage / 2,
-            steady_bwd=M * t_stage / 2,
+            steady_fwd=M * t_fwd,
+            steady_bwd=M * t_bwd,
             cooldown_fwd=0.0,
             cooldown_bwd=cooldown,
-            steady_fwd_per_mb=t_stage / 2,
-            steady_bwd_per_mb=t_stage / 2,
+            steady_fwd_per_mb=t_fwd,
+            steady_bwd_per_mb=t_bwd,
             steady_per_mb=t_stage,
         )
 
@@ -572,6 +578,9 @@ def pipeline_step_time(
                 comm_bwd=st.comm_bwd + pp_p2p,
                 ep_hidden=st.ep_hidden,
                 tp_hidden=st.tp_hidden,
+                tp_exposed=st.tp_exposed,
+                ep_exposed=st.ep_exposed,
+                cp_exposed=st.cp_exposed,
             )
             for st in stage_times
         ]
@@ -651,14 +660,28 @@ def pipeline_step_time(
 
     s_bot = max(stage_times, key=lambda st: st.fwd + st.bwd)
     bot_total = s_bot.fwd + s_bot.bwd
-    bot_comm = s_bot.comm_fwd + s_bot.comm_bwd  # exposed comm per stage per microbatch
 
     # pipeline_time excludes the exposed DP AR tail (which sits after cooldown)
     _pipeline_time = step.step_time - step.dp_exposed
-    comm_frac = (bot_comm / bot_total) if bot_total > 0 else 0.0
 
-    # ── Exposed comm ──────────────────────────────────────────────────────
-    exposed_comm_excl_dp = _pipeline_time * comm_frac
+    # ── Exposed comm: bottom-up from per-type fields ─────────────────────
+    # Scale each comm type's exposed time directly from bottleneck stage.
+    # No remain, no ratio splits, no conservation caps.
+    # Invariant: tp + ep + cp + pp + dp = exposed_comm (by construction)
+    if bot_total > 0:
+        scale = _pipeline_time / bot_total
+        step.tp_exposed = scale * s_bot.tp_exposed
+        step.ep_exposed = scale * s_bot.ep_exposed
+        step.cp_exposed = scale * s_bot.cp_exposed
+        step.pp_exposed = scale * 2.0 * pp_p2p
+        step.tp_hidden = scale * s_bot.tp_hidden
+        step.ep_hidden = scale * s_bot.ep_hidden
+    else:
+        step.tp_exposed = step.ep_exposed = step.cp_exposed = step.pp_exposed = 0.0
+        step.tp_hidden = step.ep_hidden = 0.0
+
+    exposed_comm_excl_dp = (step.tp_exposed + step.ep_exposed
+                          + step.cp_exposed + step.pp_exposed)
     step.exposed_comm = exposed_comm_excl_dp + step.dp_exposed
     # compute_time exact: compute_time + exposed_comm == _pipeline_time + dp_exposed == step_time(pre-opt)
     step.compute_time = step.step_time - step.exposed_comm
@@ -678,58 +701,9 @@ def pipeline_step_time(
         step.fwd_compute = step.compute_time
         step.bwd_compute = 0.0
 
-    # PP P2P: pp_p2p already baked into bot_comm; scale to critical path via same ratio
-    pp_p2p_exposed = (_pipeline_time * (2.0 * pp_p2p) / bot_total) if bot_total > 0 else 0.0
-
-    # TP exposed / hidden: use StageTime.tp_hidden (GEMM-bound, set by
-    # compose/stage.py). Scale to critical path the same way as ep_hidden.
-    raw_tp = sum(comm_times.get(c.name, 0.0) for c in graph.collectives if c.group == "TP")
-    raw_cp = sum(comm_times.get(c.name, 0.0) for c in graph.collectives if c.group == "CP")
-    raw_ep = sum(comm_times.get(c.name, 0.0) for c in graph.collectives if c.group == "EP")
-
-    # tp_hidden scaled to critical path (matches the ep_hidden treatment below)
-    if bot_total > 0 and s_bot.tp_hidden > 0:
-        step.tp_hidden = _pipeline_time * s_bot.tp_hidden / bot_total
-    else:
-        step.tp_hidden = 0.0
-
-    # tp_exposed = raw TP volume (per stage, scaled to critical path) − tp_hidden
-    raw_tp_critical = (_pipeline_time * (raw_tp / max(pp, 1)) / bot_total) \
-                      if bot_total > 0 else 0.0
-    # Conservation fix: cap tp_exposed_volume so the per-group exposed
-    # times sum to exposed_comm_excl_dp exactly. Without this cap,
-    # raw_tp_critical (computed from un-overlapped raw_tp / pp) can exceed
-    # the exposed-comm budget that was already reduced by stage-level
-    # overlap, breaking the documented invariant
-    #     exposed_comm = tp + cp + ep + pp + dp_exposed
-    tp_exposed_volume = max(0.0, raw_tp_critical - step.tp_hidden)
-    tp_exposed_volume = min(tp_exposed_volume,
-                            max(0.0, exposed_comm_excl_dp - pp_p2p_exposed))
-
-    # CP / EP exposed: proportional split of the remaining exposed-comm budget
-    # after PP P2P and TP exposed have been subtracted.
-    eff_total = raw_cp + raw_ep  # TP no longer participates in proportional split
-    remain = max(0.0, exposed_comm_excl_dp - pp_p2p_exposed - tp_exposed_volume)
-    if eff_total > 0 and remain > 0:
-        step.tp_exposed = tp_exposed_volume
-        step.cp_exposed = remain * raw_cp / eff_total
-        step.ep_exposed = remain * raw_ep / eff_total
-    else:
-        step.tp_exposed = tp_exposed_volume
-        step.cp_exposed = 0.0
-        step.ep_exposed = 0.0
-    step.pp_exposed = pp_p2p_exposed
-    # step.dp_exposed already set by composer / dual-batch
-
     # ── Hidden comm ───────────────────────────────────────────────────────
     # DP AR hidden in pipeline bubble — independent, exact.
     step.dp_hidden = max(0.0, dp_ar_time - step.dp_exposed)
-
-    # EP hidden by wave-overlap — from StageTime.ep_hidden, scaled to critical path.
-    if bot_total > 0 and s_bot.ep_hidden > 0:
-        step.ep_hidden = _pipeline_time * s_bot.ep_hidden / bot_total
-    else:
-        step.ep_hidden = 0.0
 
     step.hidden_comm = step.dp_hidden + step.tp_hidden + step.ep_hidden
     step.total_comm_volume = step.exposed_comm + step.hidden_comm
