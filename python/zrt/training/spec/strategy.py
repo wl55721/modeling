@@ -136,6 +136,11 @@ class Strategy:
     # overlap
     tp_overlap: TPOverlap = TPOverlap.NONE
     ep_overlap: bool = False
+    # Spec-path fused MoE operator. When enabled, MoE routed experts are built
+    # as one mega_moe op that includes dispatch, expert FFN, and combine.
+    mega_moe: bool = False
+    # 0 means resolve from hardware ep_overlap_waves or a conservative default.
+    mega_moe_waves: int = 0
     dualbatch: bool = False
     dp_overlap_in_bubble: bool = True
     # Fraction of steady-state backward compute that DP grad-reduce can overlap
