@@ -13,6 +13,34 @@
 | ② Patch coverage | `ci.yml` · `patch-coverage` | 本次 PR 新增/修改的行 | **≥ 80%** | 防止"全局达标但新增代码不带测试"搭便车 |
 | ③ 无回退 | `coverage-gate.yml` · `coverage-regression` | 整体覆盖率 vs `main` | PR ≥ base | 防止覆盖率被慢性蚕食 |
 
+```mermaid
+flowchart TD
+    PR([PR 提交]) --> L & R
+
+    subgraph ci [ci.yml]
+        L["⓪ Lint<br/>PR 改动行 ruff 检查"]
+        L -->|pass| T
+        L -->|fail| LF["❌ 风格违规"]
+
+        T["① Test / 全局覆盖率<br/>pytest --cov-fail-under=65"]
+        T -->|pass| P
+        T -->|fail| TF["❌ 测试失败 / 覆盖率 &lt; 65%"]
+
+        P["② Patch Coverage<br/>diff-cover --fail-under=80"]
+        P -->|pass| OK1["✅ ci.yml 通过"]
+        P -->|diff 无源码行| OK1
+        P -->|fail| PF["❌ 新增代码覆盖率 &lt; 80%"]
+    end
+
+    subgraph gate [coverage-gate.yml]
+        R["③ 无回退<br/>PR 覆盖率 ≥ main 覆盖率"]
+        R -->|pass| OK2["✅ 无回退"]
+        R -->|fail| RF["❌ 覆盖率低于 main"]
+    end
+
+    OK1 & OK2 --> MERGE(["🎉 允许合入 main"])
+```
+
 > **65% 是过渡基线**：当前历史代码遗留部分覆盖空白，先以 65% 为绝对下限；后续待历史欠账还清后逐步上调，目标恢复至 80%。新增代码不享受此宽限，必须 ≥ 80%。
 
 ---
