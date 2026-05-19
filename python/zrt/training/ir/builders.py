@@ -510,8 +510,10 @@ def _build_moe_ffn_ops(model: ModelSpec, layer_id: int, seq: int,
             layer_id=layer_id, layer_kind=layer_kind, component="shared_expert"))
 
     # Routed expert FFN (single op with fwd_multiplier)
+    routed_ffn_out_dtype = act_dtype
     if strategy.mega_moe:
         moe_act_dtype = model.effective_moe_act_dtype()
+        routed_ffn_out_dtype = moe_act_dtype
         ops.append(Op(name=f"{prefix}.mega_moe", kind="mega_moe",
             inputs=[_tensor("x_ln2", (seq, h), moe_act_dtype)],
             outputs=[_tensor("routed_ffn_out", (seq, h), moe_act_dtype)],
@@ -543,15 +545,19 @@ def _build_moe_ffn_ops(model: ModelSpec, layer_id: int, seq: int,
     if model.n_shared_experts > 0:
         ops.append(Op(name=f"{prefix}.expert_agg", kind="add",
             inputs=[_tensor("shared_ffn_out", (seq, h), act_dtype),
-                    _tensor("routed_ffn_out", (seq, h), act_dtype)],
+                    _tensor("routed_ffn_out", (seq, h), routed_ffn_out_dtype)],
             outputs=[_tensor("ffn_out", (seq, h), act_dtype)],
-            meta={"bytes_fwd": seq * h * act_dtype.bytes * 3},
+            meta={"bytes_fwd": seq * h * (
+                act_dtype.bytes + routed_ffn_out_dtype.bytes + act_dtype.bytes
+            )},
             layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
     else:
         ops.append(Op(name=f"{prefix}.expert_agg", kind="add",
-            inputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
+            inputs=[_tensor("routed_ffn_out", (seq, h), routed_ffn_out_dtype)],
             outputs=[_tensor("ffn_out", (seq, h), act_dtype)],
-            meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
+            meta={"bytes_fwd": seq * h * (
+                routed_ffn_out_dtype.bytes + act_dtype.bytes
+            )},
             layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
 
     return ops

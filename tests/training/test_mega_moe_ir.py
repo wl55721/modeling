@@ -95,3 +95,45 @@ def test_mega_moe_quant_variant_w4a8_for_fp4_weights_and_fp8_moe_acts():
     assert mega_moe.outputs[0].dtype == model.effective_moe_act_dtype()
     assert mega_moe.meta["act_bytes"] == mega_moe.inputs[0].dtype.bytes
     assert mega_moe.meta["out_bytes"] == mega_moe.outputs[0].dtype.bytes
+
+
+def test_mega_moe_w4a8_shared_expert_agg_consumes_routed_output_dtype():
+    model = _moe_model(
+        routed_expert_compute_dtype=Dtype.FP8_E4M3,
+        routed_expert_weight_dtype=Dtype.FP4,
+        moe_act_dtype=Dtype.FP8_E4M3,
+        n_shared_experts=1,
+    )
+    graph = build_graph(model, Strategy(mega_moe=True))
+
+    layer_ops = _ops_for_layer(graph, 0)
+    mega_moe = [op for op in layer_ops if op.kind == "mega_moe"][0]
+    expert_agg = [op for op in layer_ops if op.name == "L0.expert_agg"][0]
+
+    assert mega_moe.outputs[0].name == "routed_ffn_out"
+    assert expert_agg.inputs[1].name == "routed_ffn_out"
+    assert mega_moe.outputs[0].shape_logical == (model.seq_len, model.hidden)
+    assert expert_agg.inputs[1].shape_logical == (model.seq_len, model.hidden)
+    assert mega_moe.outputs[0].dtype == expert_agg.inputs[1].dtype
+    assert mega_moe.meta["out_bytes"] == expert_agg.inputs[1].dtype.bytes
+
+
+def test_mega_moe_w4a8_no_shared_expert_agg_consumes_routed_output_dtype():
+    model = _moe_model(
+        routed_expert_compute_dtype=Dtype.FP8_E4M3,
+        routed_expert_weight_dtype=Dtype.FP4,
+        moe_act_dtype=Dtype.FP8_E4M3,
+        n_shared_experts=0,
+    )
+    graph = build_graph(model, Strategy(mega_moe=True))
+
+    layer_ops = _ops_for_layer(graph, 0)
+    mega_moe = [op for op in layer_ops if op.kind == "mega_moe"][0]
+    expert_agg = [op for op in layer_ops if op.name == "L0.expert_agg"][0]
+
+    assert mega_moe.outputs[0].name == "routed_ffn_out"
+    assert expert_agg.inputs[0].name == "routed_ffn_out"
+    assert mega_moe.outputs[0].shape_logical == (model.seq_len, model.hidden)
+    assert expert_agg.inputs[0].shape_logical == (model.seq_len, model.hidden)
+    assert mega_moe.outputs[0].dtype == expert_agg.inputs[0].dtype
+    assert mega_moe.meta["out_bytes"] == expert_agg.inputs[0].dtype.bytes
