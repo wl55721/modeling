@@ -91,3 +91,7 @@ def test_mega_moe_quant_variant_w4a8_for_fp4_weights_and_fp8_moe_acts():
     mega_moe = [op for op in graph.ops if op.kind == "mega_moe"][0]
 
     assert mega_moe.meta["quant_variant"] == "w4a8"
+    assert mega_moe.inputs[0].dtype == model.effective_moe_act_dtype()
+    assert mega_moe.outputs[0].dtype == model.effective_moe_act_dtype()
+    assert mega_moe.meta["act_bytes"] == mega_moe.inputs[0].dtype.bytes
+    assert mega_moe.meta["out_bytes"] == mega_moe.outputs[0].dtype.bytes

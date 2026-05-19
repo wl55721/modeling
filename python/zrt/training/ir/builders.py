@@ -511,16 +511,17 @@ def _build_moe_ffn_ops(model: ModelSpec, layer_id: int, seq: int,
 
     # Routed expert FFN (single op with fwd_multiplier)
     if strategy.mega_moe:
+        moe_act_dtype = model.effective_moe_act_dtype()
         ops.append(Op(name=f"{prefix}.mega_moe", kind="mega_moe",
-            inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
-            outputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
+            inputs=[_tensor("x_ln2", (seq, h), moe_act_dtype)],
+            outputs=[_tensor("routed_ffn_out", (seq, h), moe_act_dtype)],
             meta={"m": seq, "n": h, "k": model.moe_ffn,
                   "micro_batch": strategy.micro_batch,
                   "num_experts": model.num_experts,
                   "top_k": model.top_k,
                   "requested_waves": strategy.mega_moe_waves,
-                  "act_bytes": model.effective_moe_act_dtype().bytes,
-                  "out_bytes": act_dtype.bytes,
+                  "act_bytes": moe_act_dtype.bytes,
+                  "out_bytes": moe_act_dtype.bytes,
                   "weight_bytes": model.routed_expert_compute_dtype.bytes,
                   "weight_stored_bytes": model.routed_expert_weight_dtype.stored_bytes,
                   "quant_variant": infer_quant_variant(model),
