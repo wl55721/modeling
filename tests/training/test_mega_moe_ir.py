@@ -69,8 +69,10 @@ def test_mega_moe_switch_on_emits_single_mega_moe_op_for_layer():
         "num_experts": model.num_experts,
         "top_k": model.top_k,
         "requested_waves": 4,
-        "act_bytes": model.effective_moe_act_dtype().bytes,
+        "act_bytes": model.act_dtype.bytes,
         "out_bytes": model.act_dtype.bytes,
+        "moe_act_bytes": model.effective_moe_act_dtype().bytes,
+        "moe_act_dtype": model.effective_moe_act_dtype(),
         "weight_bytes": model.routed_expert_compute_dtype.bytes,
         "weight_stored_bytes": model.routed_expert_weight_dtype.stored_bytes,
         "quant_variant": "standard",
@@ -88,13 +90,18 @@ def test_mega_moe_quant_variant_w4a8_for_fp4_weights_and_fp8_moe_acts():
     )
     graph = build_graph(model, Strategy(mega_moe=True))
 
+    layer_ops = _ops_for_layer(graph, 0)
+    ln2 = [op for op in layer_ops if op.name == "L0.ln2"][0]
     mega_moe = [op for op in graph.ops if op.kind == "mega_moe"][0]
 
     assert mega_moe.meta["quant_variant"] == "w4a8"
-    assert mega_moe.inputs[0].dtype == model.effective_moe_act_dtype()
-    assert mega_moe.outputs[0].dtype == model.effective_moe_act_dtype()
+    assert mega_moe.inputs[0].name == ln2.outputs[0].name == "x_ln2"
+    assert mega_moe.inputs[0].dtype == ln2.outputs[0].dtype
+    assert mega_moe.outputs[0].dtype == model.act_dtype
     assert mega_moe.meta["act_bytes"] == mega_moe.inputs[0].dtype.bytes
     assert mega_moe.meta["out_bytes"] == mega_moe.outputs[0].dtype.bytes
+    assert mega_moe.meta["moe_act_dtype"] == Dtype.FP8_E4M3
+    assert mega_moe.meta["moe_act_bytes"] == Dtype.FP8_E4M3.bytes
 
 
 def test_mega_moe_w4a8_shared_expert_agg_consumes_routed_output_dtype():
@@ -115,6 +122,7 @@ def test_mega_moe_w4a8_shared_expert_agg_consumes_routed_output_dtype():
     assert mega_moe.outputs[0].shape_logical == (model.seq_len, model.hidden)
     assert expert_agg.inputs[1].shape_logical == (model.seq_len, model.hidden)
     assert mega_moe.outputs[0].dtype == expert_agg.inputs[1].dtype
+    assert mega_moe.outputs[0].dtype == model.act_dtype
     assert mega_moe.meta["out_bytes"] == expert_agg.inputs[1].dtype.bytes
 
 
@@ -130,10 +138,14 @@ def test_mega_moe_w4a8_no_shared_expert_agg_consumes_routed_output_dtype():
     layer_ops = _ops_for_layer(graph, 0)
     mega_moe = [op for op in layer_ops if op.kind == "mega_moe"][0]
     expert_agg = [op for op in layer_ops if op.name == "L0.expert_agg"][0]
+    residual2 = [op for op in layer_ops if op.name == "L0.residual2"][0]
 
     assert mega_moe.outputs[0].name == "routed_ffn_out"
     assert expert_agg.inputs[0].name == "routed_ffn_out"
     assert mega_moe.outputs[0].shape_logical == (model.seq_len, model.hidden)
     assert expert_agg.inputs[0].shape_logical == (model.seq_len, model.hidden)
     assert mega_moe.outputs[0].dtype == expert_agg.inputs[0].dtype
+    assert expert_agg.outputs[0].name == residual2.inputs[0].name == "ffn_out"
+    assert expert_agg.outputs[0].dtype == residual2.inputs[0].dtype
+    assert mega_moe.outputs[0].dtype == model.act_dtype
     assert mega_moe.meta["out_bytes"] == expert_agg.inputs[0].dtype.bytes
