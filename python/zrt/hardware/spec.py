@@ -260,7 +260,19 @@ class InterconnectSpec:
         return self.tiers == other.tiers
 
     def __hash__(self) -> int:  # type: ignore[override]
-        return hash(tuple((t.name, id(t.link)) for t in self.tiers))
+        return hash(tuple(
+            (
+                t.name,
+                t.link.type,
+                t.link.bandwidth_gbps,
+                t.link.latency_us,
+                t.link.topology,
+                t.link.num_devices,
+                t.link.kb_efficiency,
+                t.link.oversubscription,
+            )
+            for t in self.tiers
+        ))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

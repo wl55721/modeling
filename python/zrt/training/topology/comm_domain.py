@@ -34,6 +34,7 @@ All read-only after construction.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
     from zrt.training.topology.process_groups import ParallelGroups
 
 
+logger = logging.getLogger(__name__)
 _VALID_KINDS = ("TP", "CP", "EP", "DP", "PP", "EXPERT_DP")
 
 
@@ -221,6 +223,10 @@ class CommDomain:
                 return 0.0
             # Otherwise (rare: degenerate ParallelGroups but non-trivial
             # strategy degree) fall through to legacy size-only.
+            logger.debug(
+                "CommDomain: multi-tier skipped for %s (degenerate groups), using legacy",
+                c.group,
+            )
 
         # Legacy 2-tier (or fallback) path.
         size = self.group_size(c.group)
