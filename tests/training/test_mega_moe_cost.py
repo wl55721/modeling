@@ -9,6 +9,7 @@ from zrt.training.models.mega_moe import (
     _mega_moe_dispatch_bytes,
     infer_quant_variant,
     mega_moe_cost_terms,
+    mega_moe_cost_terms_from_meta,
     resolve_mega_moe_waves,
     simulate_wave_pipeline,
 )
@@ -114,6 +115,47 @@ def test_mega_moe_flops_scale_with_tokens_topk_dimensions_and_multiplier():
 
     assert terms.tokens == 55
     assert terms.fwd_flops == 2 * 55 * 4 * 17 * 13 * 7
+
+
+def test_mega_moe_cost_terms_matches_mapping_helper_for_equivalent_meta():
+    op = _mega_moe_op(
+        m=11,
+        micro_batch=5,
+        top_k=4,
+        n=13,
+        k=17,
+        fwd_multiplier=7,
+        experts_per_rank=3,
+    )
+
+    assert mega_moe_cost_terms(op) == mega_moe_cost_terms_from_meta(op.meta)
+
+
+def test_mega_moe_cost_terms_from_meta_does_not_mutate_input_mapping():
+    meta = dict(
+        _mega_moe_op(
+            m=8,
+            micro_batch=2,
+            top_k=3,
+            n=16,
+            k=32,
+            fwd_multiplier=9,
+        ).meta
+    )
+    before = dict(meta)
+
+    mega_moe_cost_terms_from_meta(meta)
+
+    assert meta == before
+
+
+def test_mega_moe_cost_terms_from_meta_preserves_legacy_multiplier_normalization():
+    terms = mega_moe_cost_terms_from_meta(
+        _mega_moe_op(m=8, micro_batch=2, top_k=3, n=16, k=32, fwd_multiplier=9).meta
+    )
+
+    assert terms.fwd_multiplier == 3
+    assert terms.fwd_flops == 2 * 16 * 3 * 32 * 16 * 3
 
 
 def test_mega_moe_cost_preserves_legacy_builder_multiplier_intent():

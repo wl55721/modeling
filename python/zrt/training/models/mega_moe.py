@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from zrt.training.ir.training_graph import Collective, Op
 from zrt.training.models.comm import collective_time, tier_for_group
@@ -81,7 +83,10 @@ def infer_quant_variant(model: ModelSpec) -> str:
 
 
 def mega_moe_cost_terms(op: Op) -> MegaMoECostTerms:
-    meta = op.meta
+    return mega_moe_cost_terms_from_meta(op.meta)
+
+
+def mega_moe_cost_terms_from_meta(meta: Mapping[str, Any]) -> MegaMoECostTerms:
     m = int(meta["m"])
     micro_batch = int(meta.get("micro_batch", 1))
     tokens = micro_batch * m
