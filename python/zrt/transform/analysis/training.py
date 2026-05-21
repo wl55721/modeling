@@ -725,97 +725,54 @@ class TrainingPipelinePass(GraphPass):
             g.metadata["optimizer_ag_us"] = ag_time_us
             g.metadata["optimizer_rs_us"] = rs_time_us
 
-            # Get optimizer_step node for rotation check
             opt_node = g.nodes.get("optimizer_step")
             ns_rotation = opt_node.attrs.get("ns_rotation", True) if opt_node else True
 
-            # Set latency annotations on communication nodes
             muon_ag = g.nodes.get("muon_ag")
+            muon_rs = g.nodes.get("muon_rs")
+
+            rotation_active = ns_rotation and (ag_time_us > 0 or rs_time_us > 0)
+
+            fwd_window_us = 0.0
+            if rotation_active and step_result:
+                fwd_window_s = max(step_result.warmup_fwd, step_result.steady_fwd_per_mb)
+                fwd_window_us = fwd_window_s * 1e6
+
+            from python.zrt.training.models.optimizer import moonshot_optimizer_hiding
+            opt_comm_exposed_us, opt_comm_hidden_us = moonshot_optimizer_hiding(
+                compute_us=opt_compute_us,
+                ag_us=ag_time_us,
+                rs_us=rs_time_us,
+                fwd_window_us=fwd_window_us,
+                rotation=rotation_active,
+            )
+
+            ag_hidden_us = min(ag_time_us, opt_compute_us + max(0.0, fwd_window_us - min(rs_time_us, fwd_window_us))) if rotation_active else 0.0
+            ag_exposed_us = ag_time_us - ag_hidden_us
+            rs_hidden_us = min(rs_time_us, fwd_window_us) if rotation_active else 0.0
+            rs_exposed_us = rs_time_us - rs_hidden_us
+
+            metrics.hidden_comm_ms += opt_comm_hidden_us / 1000.0
+
             if muon_ag and ag_time_us > 0:
                 muon_ag.annotations["latency_us"] = ag_time_us
                 muon_ag.annotations["comm_time_us"] = ag_time_us
                 muon_ag.annotations["compute_us"] = 0.0
                 muon_ag.annotations["memory_us"] = 0.0
                 muon_ag.annotations["bound"] = "comm"
-                # Moonshot rotation: AG can overlap with NS compute
-                if ns_rotation:
-                    muon_ag.annotations["overlap_type"] = "moonshot_ag"
-                    muon_ag.annotations["overlap_target"] = f"compute:optimizer_step"
-                    muon_ag.annotations["overlap_exposed_us"] = max(0.0, ag_time_us - opt_compute_us)
-
-            muon_rs = g.nodes.get("muon_rs")
-            if muon_rs and rs_time_us > 0:
-                muon_rs.annotations["latency_us"] = rs_time_us
-                muon_rs.annotations["comm_time_us"] = rs_time_us
-                muon_rs.annotations["compute_us"] = 0.0
-                muon_rs.annotations["memory_us"] = 0.0
-                muon_rs.annotations["bound"] = "comm"
-                muon_rs.annotations["overlap_type"] = "none"
-
-            # Update optimizer_step node with compute latency
-            if opt_node and opt_compute_us > 0:
-                opt_node.annotations["latency_us"] = opt_compute_us
-                opt_node.annotations["compute_us"] = opt_compute_us
-                opt_node.annotations["memory_us"] = 0.0
-                opt_node.annotations["bound"] = "compute"
-
-            # Moonshot rotation: 2-layer overlap (AG→NS+fwd_window, RS→fwd_window)
-            # Reference: schedules.py:774-786, 791-801 (spec-based path)
-            #
-            # Hide windows:
-            #   1. AG: opt_time (NS) + remaining_fwd_window (after RS consumes its share)
-            #   2. RS: fwd_window (priority - RS starts immediately after NS)
-            #
-            # NS itself is NOT hidden - it's exposed compute time.
-            # AG and RS compete for fwd_window; RS books first, AG uses remainder.
-            ag_exposed_us = ag_time_us
-            ag_hidden_us = 0.0
-            rs_exposed_us = rs_time_us
-            rs_hidden_us = 0.0
-
-            rotation_active = ns_rotation and (ag_time_us > 0 or rs_time_us > 0)
-
-            if rotation_active:
-                # Get fwd_window from pipeline schedule (in seconds → microseconds)
-                fwd_window_s = max(step_result.warmup_fwd, step_result.steady_fwd_per_mb)
-                fwd_window_us = fwd_window_s * 1e6
-
-                # Layer 1: RS hidden in fwd_window (priority)
-                rs_hidden_us = min(rs_time_us, fwd_window_us)
-                rs_exposed_us = rs_time_us - rs_hidden_us
-                remaining_fwd_us = max(0.0, fwd_window_us - rs_hidden_us)
-
-                # Layer 2: AG hidden in NS compute + remaining_fwd_window
-                # AG and NS are chunk-pipelined: AG hide_window = opt_time + remaining_fwd
-                ag_hide_window_us = opt_compute_us + remaining_fwd_us
-                ag_hidden_us = min(ag_time_us, ag_hide_window_us)
-                ag_exposed_us = ag_time_us - ag_hidden_us
-
-                metrics.hidden_comm_ms += (ag_hidden_us + rs_hidden_us) / 1000.0
-
-            # Total exposed = AG exposed + RS exposed
-            opt_comm_exposed_us = ag_exposed_us + rs_exposed_us
-            opt_comm_hidden_us = ag_hidden_us + rs_hidden_us
-
-            metrics.optimizer_comm_ms = opt_comm_exposed_us / 1000.0
-            metrics.optimizer_time_ms = opt_compute_us / 1000.0
-
-            # Add optimizer time: NS (always exposed) + exposed comm
-            step_time_us += opt_compute_us + opt_comm_exposed_us
-            metrics.step_time_ms = step_time_us / 1000.0
-
-            # Update annotations for nodes
-            if muon_ag and ag_time_us > 0:
-                # Update overlap_type if rotation active (might have changed)
-                if rotation_active:
-                    muon_ag.annotations["overlap_type"] = "moonshot_ag"
-                    muon_ag.annotations["overlap_target"] = "compute:optimizer_step+fwd_window"
+                muon_ag.annotations["overlap_type"] = "moonshot_ag" if rotation_active else "none"
+                muon_ag.annotations["overlap_target"] = "compute:optimizer_step+fwd_window" if rotation_active else ""
                 muon_ag.annotations["overlap_exposed_us"] = ag_exposed_us
                 muon_ag.annotations["overlap_hidden_us"] = ag_hidden_us
                 if rotation_active:
                     muon_ag.annotations["overlap_hide_window_us"] = opt_compute_us + max(0.0, fwd_window_us - rs_hidden_us)
 
             if muon_rs and rs_time_us > 0:
+                muon_rs.annotations["latency_us"] = rs_time_us
+                muon_rs.annotations["comm_time_us"] = rs_time_us
+                muon_rs.annotations["compute_us"] = 0.0
+                muon_rs.annotations["memory_us"] = 0.0
+                muon_rs.annotations["bound"] = "comm"
                 muon_rs.annotations["overlap_type"] = "moonshot_rs" if rotation_active else "none"
                 muon_rs.annotations["overlap_target"] = "fwd_window" if rotation_active else ""
                 muon_rs.annotations["overlap_exposed_us"] = rs_exposed_us
@@ -824,16 +781,27 @@ class TrainingPipelinePass(GraphPass):
                     muon_rs.annotations["overlap_hide_window_us"] = fwd_window_us
 
             if opt_node and opt_compute_us > 0:
+                opt_node.annotations["latency_us"] = opt_compute_us
+                opt_node.annotations["compute_us"] = opt_compute_us
+                opt_node.annotations["memory_us"] = 0.0
+                opt_node.annotations["bound"] = "compute"
                 opt_node.annotations["overlap_exposed_us"] = opt_compute_us
 
-            # Metadata for debugging
             g.metadata["optimizer_ag_exposed_us"] = ag_exposed_us
+
+            metrics.optimizer_comm_ms = opt_comm_exposed_us / 1000.0
+            metrics.optimizer_time_ms = opt_compute_us / 1000.0
+
+            step_time_us += opt_compute_us + opt_comm_exposed_us
+            metrics.step_time_ms = step_time_us / 1000.0
+
             g.metadata["optimizer_ag_hidden_us"] = ag_hidden_us
             g.metadata["optimizer_rs_exposed_us"] = rs_exposed_us
             g.metadata["optimizer_rs_hidden_us"] = rs_hidden_us
             g.metadata["optimizer_comm_exposed_us"] = opt_comm_exposed_us
             g.metadata["optimizer_comm_hidden_us"] = opt_comm_hidden_us
-            g.metadata["optimizer_fwd_window_us"] = max(step_result.warmup_fwd, step_result.steady_fwd_per_mb) * 1e6
+            if step_result:
+                g.metadata["optimizer_fwd_window_us"] = max(step_result.warmup_fwd, step_result.steady_fwd_per_mb) * 1e6
 
         return g
 
