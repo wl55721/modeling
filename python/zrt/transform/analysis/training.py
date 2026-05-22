@@ -472,6 +472,7 @@ class TrainingPipelinePass(GraphPass):
         stage_fwd: dict[int, float] = {}
         stage_bwd: dict[int, float] = {}
         stage_bwd_dw: dict[int, float] = {}
+        stage_timelines: dict[int, "Timeline"] = {}  # per-stage DAGScheduler output
 
         if pp > 1 and any("stage_id" in n.annotations for n in g.nodes.values()):
             # Per-stage scheduling: schedule each stage's subgraph independently
@@ -491,6 +492,7 @@ class TrainingPipelinePass(GraphPass):
                     continue
                 sub = g.subgraph(node_ids)
                 tl = sched.schedule(sub)
+                stage_timelines[s_id] = tl
                 fwd = tl.phase_latency("fwd")
                 bwd = tl.phase_latency("bwd")
                 # If no phase annotations, fall back to total latency as fwd
@@ -556,6 +558,7 @@ class TrainingPipelinePass(GraphPass):
             for s_id in range(pp):
                 stage_bwd_dw.setdefault(s_id, 0.0)
             g.metadata["stage_timelines_bwd_dw"] = dict(stage_bwd_dw)
+            g.metadata["pp_per_stage_timelines"] = stage_timelines
 
         else:
             # pp=1 or no stage_id: schedule whole graph as single unit.
@@ -587,10 +590,10 @@ class TrainingPipelinePass(GraphPass):
                 stage_bwd[s] = per_stage_bwd
                 stage_bwd_dw[s] = 0.0
 
-        # ── Delegate to PipelineComposer ──────────────────────────────────
-        from python.zrt.training.compose.stage import StageTime
+        # ── PP grid scheduling via PPStitcher ───────────────────────────────
+        from python.zrt.executor.pp_stitcher import PPStitcher
         from python.zrt.training.compose.schedules import (
-            PP_SCHED_BY_NAME, COMPOSER_BY_SCHED,
+            PP_SCHED_BY_NAME, _dp_hidden, StepResult,
         )
         from python.zrt.training.spec.strategy import (
             Strategy, OptKind,
@@ -599,18 +602,7 @@ class TrainingPipelinePass(GraphPass):
 
         pp_schedule = ctx.training.pp_schedule if ctx.training else "1f1b"
         opt_str = ctx.training.optimizer if ctx.training else "adam"
-
-        stage_times_list = [
-            StageTime(
-                fwd=stage_fwd.get(s, 0.0) / 1e6,
-                bwd=stage_bwd.get(s, 0.0) / 1e6,
-                bwd_dx=(stage_bwd.get(s, 0.0) - stage_bwd_dw.get(s, 0.0)) / 1e6,
-                bwd_dw=stage_bwd_dw.get(s, 0.0) / 1e6,
-            )
-            for s in range(pp)
-        ]
-
-        dp_ar_time_s = self._compute_dp_ar_time(g, hw, ctx) / 1e6
+        vpp_chunks = max(1, ctx.training.vpp_chunks if ctx.training else 1)
 
         strategy_proxy = Strategy(
             tp=ctx.parallel.tp if ctx.parallel else 1,
@@ -621,29 +613,74 @@ class TrainingPipelinePass(GraphPass):
             micro_batch=ctx.training.micro_batch if ctx.training else 1,
             global_batch=ctx.training.global_batch if ctx.training else 32,
             pp_schedule=PP_SCHED_BY_NAME.get(pp_schedule, PP_SCHED_BY_NAME["1f1b"]),
-            vpp_chunks=max(1, ctx.training.vpp_chunks if ctx.training else 1),
+            vpp_chunks=vpp_chunks,
             zero_stage=ctx.training.zero_stage if ctx.training else 0,
             optimizer=OPT_MAP.get(opt_str, OptKind.ADAM),
             dp_overlap_in_bubble=ctx.training.dp_overlap_in_bubble if ctx.training else True,
         )
-        # Derive per-device microbatch count from the Strategy (includes DP)
-
         M = strategy_proxy.num_microbatches()
 
-        composer_cls = COMPOSER_BY_SCHED.get(strategy_proxy.pp_schedule)
-        if composer_cls is None:
-            composer_cls = COMPOSER_BY_SCHED[PP_SCHED_BY_NAME["1f1b"]]
-        step_result = composer_cls().compose(
-            stage_times_list, M, pp, dp_ar_time_s, strategy_proxy
+        stitcher = PPStitcher(
+            stage_fwd_us=stage_fwd,
+            stage_bwd_us=stage_bwd,
+            stage_bwd_dw_us=stage_bwd_dw,
+            pp=pp,
+            M=M,
+            p2p_latency_us=0.0,
+            schedule=pp_schedule,
+            vpp_chunks=vpp_chunks,
         )
+        pp_timeline = stitcher.stitch()
+        g.metadata["pp_stitched_timeline"] = pp_timeline
 
-        step_time_us = step_result.step_time * 1e6
-        per_stage_us = max(
-            (st.fwd + st.bwd) * 1e6 for st in stage_times_list
-        ) if stage_times_list else 0.0
+        # ── DP overlap (grid-derived cooldown) ──────────────────────────────
+        dp_ar_time_s = self._compute_dp_ar_time(g, hw, ctx) / 1e6
+        t_fwd_max = max(stage_fwd.values()) / 1e6 if stage_fwd else 0.0
+        t_bwd_max = max(stage_bwd.values()) / 1e6 if stage_bwd else 0.0
+        steady_bwd_total = M * t_bwd_max
 
+        hidden_s = _dp_hidden(
+            dp_ar_time_s, pp_timeline.cooldown_us / 1e6, steady_bwd_total, strategy_proxy,
+        )
+        dp_exposed_s = dp_ar_time_s - hidden_s
+
+        step_time_us = pp_timeline.step_time_us + dp_exposed_s * 1e6
         step_time_ms = step_time_us / 1000.0
+        per_stage_us = pp_timeline.per_stage_us()
         per_stage_ms = per_stage_us / 1000.0
+
+        # Build StepResult for downstream compatibility
+        if pp_schedule in ("interleaved", "i1f1b") and vpp_chunks > 1:
+            ws = max(1, -(-(pp - 1) // vpp_chunks))
+        elif pp_schedule == "dualpipe":
+            ws = max(0, pp // 2 - 1)
+        elif pp_schedule == "dualpipev" and vpp_chunks > 1:
+            ws = max(0, (pp // 2 - 1 + vpp_chunks - 1) // vpp_chunks)
+        else:
+            ws = pp - 1
+
+        step_result = StepResult(
+            step_time=step_time_us / 1e6,
+            pipeline_time=pp_timeline.step_time_us / 1e6,
+            bubble_fraction=pp_timeline.bubble_fraction,
+            warmup=pp_timeline.warmup_us / 1e6,
+            steady=pp_timeline.steady_us / 1e6,
+            cooldown=pp_timeline.cooldown_us / 1e6,
+            dp_exposed=dp_exposed_s,
+            dp_hidden=hidden_s,
+            schedule_name=pp_timeline.schedule_name,
+            warmup_steps=ws,
+            cooldown_steps=ws,
+            warmup_fwd=pp_timeline.warmup_us / 1e6,
+            warmup_bwd=0.0,
+            steady_fwd=M * t_fwd_max,
+            steady_bwd=M * t_bwd_max,
+            cooldown_fwd=0.0,
+            cooldown_bwd=pp_timeline.cooldown_us / 1e6,
+            steady_fwd_per_mb=t_fwd_max,
+            steady_bwd_per_mb=t_bwd_max,
+            steady_per_mb=t_fwd_max + t_bwd_max,
+        )
 
         # Overlap-aware comm time: reduce step_time by hidden comm
         overlap_nodes = [

@@ -259,6 +259,17 @@ def main() -> None:
         help="Total layers in full model (defaults to --layers if not set).",
     )
 
+    # ── Pipeline-parallel scheduling ─────────────────────────────────────────
+    parser.add_argument(
+        "--pp-schedule", default="1f1b",
+        choices=["1f1b", "interleaved", "dualpipe", "dualpipev", "zb"],
+        help="Pipeline parallel schedule (default: 1f1b).",
+    )
+    parser.add_argument(
+        "--vpp-chunks", type=int, default=1,
+        help="Virtual pipeline chunks for interleaved/dualpipev schedules.",
+    )
+
     args = parser.parse_args()
 
     # ── --list-fusion-rules: print and exit ──────────────────────────────────
@@ -657,6 +668,8 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
             args.recompute_policy
             or ("full" if args.gradient_checkpointing else "none")
         ),
+        pp_schedule=args.pp_schedule,
+        vpp_chunks=args.vpp_chunks,
         return_transformed=True,
         quant=args.quant,
         moe_total_experts=_moe_total,

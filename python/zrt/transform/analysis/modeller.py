@@ -11,6 +11,7 @@ Usage::
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
 
 # Import shared TrainingReport type (canonical import path)
 from zrt.training.spec.report import TrainingReport
+
+logger = logging.getLogger(__name__)
 
 
 def estimate_training_from_graphs(
@@ -177,6 +180,36 @@ def estimate_training_from_graphs(
         for tag, g in results.items():
             dot_path = export_dot(g, out / f"{model_name}_{tag}.dot")
             _maybe_render(g, dot_path)
+
+        # ── PP Chrome Trace export ──────────────────────────────────────────
+        for tag, g in results.items():
+            pp_timeline = g.metadata.get("pp_stitched_timeline")
+            stage_timelines = g.metadata.get("pp_per_stage_timelines")
+            if pp_timeline is not None and stage_timelines is not None:
+                from python.zrt.executor.chrome_trace import ChromeTraceExporter
+                trace_dir = out / "pp_trace"
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                exporter = ChromeTraceExporter()
+                M = pp_timeline.M
+
+                exporter.export_stitched(pp_timeline, str(trace_dir / "pp_stitched.json"))
+
+                tl_list = [
+                    stage_timelines[s] for s in range(pp_timeline.pp)
+                    if s in stage_timelines and stage_timelines[s] is not None
+                ]
+                if tl_list:
+                    exporter.export_per_stage(
+                        tl_list,
+                        str(trace_dir / "pp_per_stage.json"),
+                        M=M,
+                        pp_stitched=pp_timeline,
+                    )
+                    exporter.export_combined(
+                        pp_timeline, tl_list,
+                        str(trace_dir / "pp_combined.json"),
+                    )
+                logger.info("PP Chrome Trace exported to %s", trace_dir)
 
     if "unified" in results:
         g = results["unified"]
