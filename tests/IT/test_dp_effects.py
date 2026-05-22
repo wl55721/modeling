@@ -37,12 +37,22 @@ try:
 except ImportError:
     HAS_OPENPYXL = False
 
-# Module-level cache: output dirs set during CLI runs, consumed by Excel fixtures.
-_dp_output_dirs: dict[int, Path] = {}
+class _DPResult:
+    """Report dict + output directory, with dict-like access for backward compat."""
+
+    def __init__(self, report: dict, out_dir: Path):
+        self._report = report
+        self.out_dir = out_dir
+
+    def __getitem__(self, key):
+        return self._report[key]
+
+    def get(self, key, default=None):
+        return self._report.get(key, default)
 
 
-def _run_cli_and_load_report(repo_root: Path, outdir: Path, dp: int, timeout: int = 900) -> dict:
-    """Run `python -m python.zrt` with given dp and return parsed report JSON.
+def _run_cli_and_load_report(repo_root: Path, outdir: Path, dp: int, timeout: int = 900) -> _DPResult:
+    """Run `python -m python.zrt` with given dp and return report + out_dir.
 
     Raises subprocess.CalledProcessError on failure.
     """
@@ -76,8 +86,7 @@ def _run_cli_and_load_report(repo_root: Path, outdir: Path, dp: int, timeout: in
 
     report_path = outdir / "reports" / "deepseek_v4_training_report.json"
     assert report_path.exists(), f"Report not found at {report_path}"
-    _dp_output_dirs[dp] = outdir
-    return json.loads(report_path.read_text())
+    return _DPResult(json.loads(report_path.read_text()), outdir)
 
 
 @pytest.fixture(scope="session")
@@ -139,8 +148,7 @@ def dp_excel_data(dp_reports):
 
     data = {}
     for dp in (1, 4):
-        out_dir = _dp_output_dirs.get(dp)
-        assert out_dir is not None, f"output dir not cached for dp={dp}"
+        out_dir = dp_reports[dp].out_dir
         xlsx_path = out_dir / "deepseek_v4_training.xlsx"
         assert xlsx_path.exists(), f"Excel not found at {xlsx_path}"
         data[dp] = _load_xlsx_sheets(xlsx_path)
