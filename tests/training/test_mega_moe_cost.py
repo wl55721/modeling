@@ -212,7 +212,7 @@ def test_mega_moe_dispatch_uses_internal_moe_activation_bytes_not_boundary_bytes
 
     assert terms.activation_input_bytes == 16 * 2 * 32 * 2
     assert terms.moe_activation_input_bytes == 16 * 2 * 32 * 1
-    assert _mega_moe_dispatch_bytes(terms, ep=4) == 16 * 2 * 32 * 1
+    assert _mega_moe_dispatch_bytes(terms, ep=4) == 16 * 2 * 32 * 1 * 4
 
 
 def test_mega_moe_cost_uses_local_k_and_local_experts_when_sharded():
@@ -254,7 +254,7 @@ def test_mega_moe_cost_uses_local_hidden_for_activations_not_compute_when_tp_sha
     assert terms.activation_input_bytes == 128 * 256 * 2
     assert terms.activation_output_bytes == 128 * 256 * 2
     assert terms.moe_activation_input_bytes == 128 * 256 * 1
-    assert _mega_moe_dispatch_bytes(terms, ep=4) == 128 * 256 * 1 * 2 / 4
+    assert _mega_moe_dispatch_bytes(terms, ep=4) == 128 * 256 * 1 * 2
 
 
 def test_mega_moe_tp_compute_matches_legacy_routed_expert_compute():
@@ -281,7 +281,6 @@ def test_mega_moe_tp_compute_matches_legacy_routed_expert_compute():
         * (model.hidden // strategy.tp)
         * model.top_k
         * model.effective_moe_act_dtype().bytes
-        / strategy.ep
     )
 
 

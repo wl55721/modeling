@@ -119,7 +119,6 @@ def test_routed_expert_with_ep_uses_main_tp_for_routed_path_and_a2a_bytes():
         * (model.hidden // strategy.tp)
         * model.top_k
         * model.effective_moe_act_dtype().bytes
-        // strategy.ep
     )
     assert [c.bytes_ for c in ep_a2a] == [expected_bytes, expected_bytes]
 

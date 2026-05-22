@@ -192,7 +192,12 @@ def test_ep_a2a_phase_both():
 
 
 def test_ep_a2a_bytes_with_tp():
-    """EP A2A bytes should use the TP-sharded hidden size."""
+    """EP A2A bytes = per-rank send buffer = mb * seq * (h/tp) * topk * act_bytes.
+
+    No /ep divisor — collective_time() applies (N-1)/N to extract the
+    cross-rank portion. See shard.py:_insert_ep_collectives docstring for
+    the bus-bw convention.
+    """
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
         head_dim=128, vocab=32000, seq_len=2048,
@@ -203,12 +208,8 @@ def test_ep_a2a_bytes_with_tp():
     graph = build_graph(model, strategy)
 
     expected_bytes = (
-        strategy.micro_batch
-        * model.seq_len
-        * (model.hidden // strategy.tp)
-        * model.top_k
-        * model.effective_moe_act_dtype().bytes
-        // strategy.ep
+        strategy.micro_batch * model.seq_len
+        * (model.hidden // 4) * model.top_k * model.act_dtype.bytes
     )
 
     for c in graph.collectives:
@@ -219,7 +220,7 @@ def test_ep_a2a_bytes_with_tp():
 
 
 def test_cp_ep_a2a_bytes_considers_cp():
-    """EP A2A bytes should consider CP sharding (seq/cp)."""
+    """EP A2A bytes scales with seq/cp (CP shards sequence)."""
     from zrt.training.spec.strategy import CPKind
 
     model = ModelSpec(
@@ -232,7 +233,10 @@ def test_cp_ep_a2a_bytes_considers_cp():
     graph = build_graph(model, strategy)
 
     expected_seq = model.seq_len // 4
-    expected_bytes = expected_seq * model.hidden * model.act_dtype.bytes
+    expected_bytes = (
+        strategy.micro_batch * expected_seq
+        * model.hidden * model.top_k * model.act_dtype.bytes
+    )
 
     for c in graph.collectives:
         if c.group == "EP" and c.kind == "A2A":

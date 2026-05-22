@@ -192,11 +192,11 @@ def mega_moe_stage_time(
 
 
 def _mega_moe_dispatch_bytes(terms: MegaMoECostTerms, ep: int) -> float:
-    return terms.moe_activation_input_bytes * terms.top_k / max(1, ep)
+    return terms.moe_activation_input_bytes * terms.top_k
 
 
 def _mega_moe_combine_bytes(terms: MegaMoECostTerms, ep: int) -> float:
-    return terms.activation_output_bytes * terms.top_k / max(1, ep)
+    return terms.activation_output_bytes * terms.top_k
 
 
 def _mega_moe_a2a_time(

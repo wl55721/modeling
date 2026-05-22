@@ -182,6 +182,13 @@ class Strategy:
     mega_moe: bool = False
     # 0 means resolve from hardware ep_overlap_waves or a conservative default.
     mega_moe_waves: int = 0
+    # PP P2P (activation send between adjacent stages) hide-in-bwd_dw, only
+    # meaningful for dual-stream schedules (DualPipe / DualPipeV). Default
+    # OFF: even with DualPipe(V), PP P2P stays on the critical path unless
+    # the user explicitly opts in. Modeling rationale: dual-stream PP overlap
+    # requires the kernel/runtime to actually schedule the P2P on the comm
+    # stream parallel to bwd_dw — not a free property of the schedule.
+    pp_overlap: bool = False
     dualbatch: bool = False
     dp_overlap_in_bubble: bool = True
     # Fraction of steady-state backward compute that DP grad-reduce can overlap
