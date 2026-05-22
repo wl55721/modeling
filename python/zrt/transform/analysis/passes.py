@@ -190,7 +190,10 @@ def _effective_compute_dtype(node: "OpNode") -> "DType":
 
 
 def _mega_moe_internal_comm_us(node, ctx, base_latency_us: float) -> tuple[float, dict]:
-    if node.op_type != "mega_moe" or ctx.training is None:
+    if (
+        node.op_type != "mega_moe"
+        and not node.annotations.get("mega_moe_internal_comm")
+    ) or ctx.training is None:
         return 0.0, {}
 
     meta = node.annotations.get("mega_moe_meta") or node.attrs.get("mega_moe_meta")

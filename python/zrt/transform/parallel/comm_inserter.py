@@ -140,11 +140,12 @@ class CommInserterPass(GraphPass):
         micro_batch = ctx.training.micro_batch if ctx.training else 1
         topk = ctx.profile.moe_active if ctx.profile else 8
 
-        # Per A2A direction on this EP rank. Dispatch and combine each carry
-        # one BF16 hidden activation stream for the routed top-k tokens. Use
-        # the same ceil token partitioning as ExpertGroupedMMPass.
-        routed_tokens_per_ep_rank = max(1, (micro_batch * seq_len * topk + ep - 1) // ep)
-        ep_msg_bytes = routed_tokens_per_ep_rank * hidden * dtype_bytes
+        # Per-rank participating buffer for one A2A direction. Each rank
+        # starts with its local micro-batch tokens and top-k routes; the
+        # collective latency model applies the group-size factor, so do not
+        # pre-divide this payload by EP.
+        routed_tokens = micro_batch * seq_len * topk
+        ep_msg_bytes = routed_tokens * hidden * dtype_bytes
 
         dispatch_tensor = TensorMeta.from_shape_dtype(
             "ep_dispatch_hidden",

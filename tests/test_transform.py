@@ -279,7 +279,7 @@ def test_comm_inserter_inserts_ep_a2a_per_phase():
         assert out.nodes[node_id].attrs["dtype_bytes"] == 2
 
 
-def test_comm_inserter_ep_msg_bytes_uses_ceil_routed_tokens():
+def test_comm_inserter_ep_msg_bytes_uses_per_rank_participating_buffer():
     node = _linear_node("layer0_grouped_gate_up", "layer.0.ffn.moe", (2, 8), (2, 16))
     node.annotations.update({
         "phase": "fwd",
@@ -298,7 +298,7 @@ def test_comm_inserter_ep_msg_bytes_uses_ceil_routed_tokens():
     out = CommInserterPass().run(graph, ctx)
 
     dispatch = out.nodes["comm_a2a_dispatch_layer0_grouped_gate_up"]
-    assert dispatch.attrs["msg_bytes"] == 4 * 8 * 2
+    assert dispatch.attrs["msg_bytes"] == 5 * 3 * 8 * 2
 
 
 def test_expert_grouped_mm_backward_preserves_external_outputs_and_gate_up_width():
@@ -505,6 +505,35 @@ def test_graph_capture_mega_moe_uses_shared_cost_model_and_formula():
     assert "weight" in formulas["read_sym"]
 
 
+def test_graph_capture_mega_moe_meta_uses_logical_tokens_not_routed_tokens():
+    from zrt.training.models.mega_moe import (
+        _mega_moe_dispatch_bytes,
+        mega_moe_cost_terms_from_meta,
+    )
+
+    graph = routed_moe_graph()
+    ctx = _ctx(ep=4)
+    ctx.training = TrainingConfig(micro_batch=3, mega_moe=True)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = build_default_pipeline().run(graph, ctx)
+
+    mega = [n for n in out.nodes.values() if n.op_type == "mega_moe"][0]
+    meta = mega.annotations["mega_moe_meta"]
+    terms = mega_moe_cost_terms_from_meta(meta)
+
+    assert mega.annotations["ep_tokens_per_rank"] == 12
+    assert meta["m"] == graph.metadata["seq_len"]
+    assert terms.tokens == ctx.training.micro_batch * graph.metadata["seq_len"]
+    assert _mega_moe_dispatch_bytes(terms, ep=ctx.parallel.ep) == (
+        ctx.training.micro_batch
+        * graph.metadata["seq_len"]
+        * meta["n"]
+        * meta["moe_act_bytes"]
+        * meta["top_k"]
+    )
+
+
 def test_graph_capture_mega_moe_latency_includes_internal_ep_comm():
     graph = routed_moe_graph()
     ctx = _ctx(ep=2)
@@ -519,6 +548,58 @@ def test_graph_capture_mega_moe_latency_includes_internal_ep_comm():
     assert mega.annotations["mega_moe_exposed_comm_us"] > 0
     assert mega.annotations["mega_moe_hidden_comm_us"] >= 0
     assert mega.annotations["latency_us"] >= mega.annotations["base_latency_us"]
+
+
+def test_graph_capture_mega_moe_backward_does_not_keep_external_a2a():
+    src = _linear_node("src", "input", (2, 8), (2, 8))
+    down = _linear_node(
+        "down_bwd",
+        "transformer.layers.0.ffn.experts.0.w2",
+        (2, 8),
+        (2, 4),
+    )
+    gate = _linear_node(
+        "gate_bwd",
+        "transformer.layers.0.ffn.experts.0.w1",
+        (2, 4),
+        (2, 4),
+    )
+    up = _linear_node(
+        "up_bwd",
+        "transformer.layers.0.ffn.experts.0.w3",
+        (2, 4),
+        (2, 4),
+    )
+    sink = _linear_node("sink", "post.gate", (2, 8), (2, 8))
+    for n in (down, gate, up):
+        n.annotations.update({"phase": "bwd", "ep_needs_a2a": True})
+
+    graph = OpGraph(
+        name="bwd_mega_moe",
+        phase="train_backward",
+        nodes={n.id: n for n in (src, down, gate, up, sink)},
+        edges=[
+            Edge("src", 0, "down_bwd", 0, src.outputs[0]),
+            Edge("down_bwd", 0, "gate_bwd", 0, down.outputs[0]),
+            Edge("down_bwd", 0, "up_bwd", 0, down.outputs[0]),
+            Edge("gate_bwd", 0, "sink", 0, gate.outputs[0]),
+            Edge("up_bwd", 0, "sink", 0, up.outputs[0]),
+        ],
+        metadata={"seq_len": 4, "hidden": 8},
+    )
+    ctx = _ctx(ep=2)
+    ctx.training = TrainingConfig(micro_batch=1, mega_moe=True, mega_moe_waves=2)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = build_default_pipeline().run(graph, ctx)
+
+    assert [n for n in out.nodes.values() if n.op_type == "comm.all_to_all"] == []
+    grouped = [n for n in out.nodes.values() if n.op_type == "GroupedMatMul"]
+    assert {n.annotations.get("grouped_mm_role") for n in grouped} == {
+        "down_bwd",
+        "gate_up_bwd",
+    }
+    assert any(n.annotations.get("mega_moe_internal_comm_us", 0) > 0 for n in grouped)
 
 
 def test_expert_weight_name_matches_path_segments_only():

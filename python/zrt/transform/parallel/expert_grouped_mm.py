@@ -197,7 +197,8 @@ class ExpertGroupedMMPass(GraphPass):
         for (layer_key, phase), nodes in layers.items():
             if phase == "bwd":
                 self._fuse_backward_layer(
-                    g, layer_key, nodes, G, M, tokens_per_ep_rank, hidden)
+                    g, layer_key, nodes, G, M, tokens_per_ep_rank, hidden,
+                    num_experts, ep, topk, ctx)
                 continue
 
             if phase not in ("fwd", "forward", "train_forward"):
@@ -358,8 +359,9 @@ class ExpertGroupedMMPass(GraphPass):
             if getattr(ctx, "quant", None) is not None
             else _dtype_bytes(gate.inputs[0] if gate.inputs else None)
         )
+        logical_tokens = int(g.metadata.get("seq_len", tokens_per_rank))
         meta = {
-            "m": tokens_per_rank,
+            "m": logical_tokens,
             "micro_batch": ctx.training.micro_batch if ctx.training else 1,
             "n": H_out,
             "k": ffn,
@@ -402,7 +404,8 @@ class ExpertGroupedMMPass(GraphPass):
 
     def _fuse_backward_layer(self, g: "OpGraph", layer_key: str, nodes: list[OpNode],
                              G: int, M: int, tokens_per_rank: int,
-                             hidden: int) -> None:
+                             hidden: int, num_experts: int, ep: int,
+                             topk: int, ctx: "TransformContext") -> None:
         gates, ups, downs = [], [], []
         for n in nodes:
             if not _is_expert_matmul(n):
@@ -509,7 +512,42 @@ class ExpertGroupedMMPass(GraphPass):
         g.nodes[down_id] = down
         g.nodes[gate_up_id] = gate_up
 
-        down.annotations["ep_block_down_id"] = gate_up_id
+        if ctx.training and ctx.training.mega_moe:
+            weight_bytes = (
+                float(ctx.quant.weight_bytes)
+                if getattr(ctx, "quant", None) is not None
+                else _dtype_bytes(down.inputs[0] if down.inputs else None)
+            )
+            logical_tokens = int(g.metadata.get("seq_len", tokens_per_rank))
+            meta = {
+                "m": logical_tokens,
+                "micro_batch": ctx.training.micro_batch,
+                "n": H_out,
+                "k": ffn,
+                "top_k": topk,
+                "num_experts": num_experts,
+                "experts_per_rank": G,
+                "ep": ep,
+                "requested_waves": ctx.training.mega_moe_waves,
+                "act_bytes": _dtype_bytes(down.inputs[0] if down.inputs else None),
+                "moe_act_bytes": _dtype_bytes(down.inputs[0] if down.inputs else None),
+                "out_bytes": _dtype_bytes(gate_up.outputs[0] if gate_up.outputs else None),
+                "weight_bytes": weight_bytes,
+                "weight_stored_bytes": weight_bytes,
+                "fwd_multiplier": 3 * topk,
+                "quant_variant": _quant_variant(ctx),
+                "fused_dispatch_compute_combine": True,
+            }
+            down.annotations.pop("ep_needs_a2a", None)
+            down.annotations.pop("ep_experts_local", None)
+            down.annotations.pop("ep_a2a_inserted", None)
+            down.annotations["mega_moe_internal_comm"] = True
+            down.annotations["fused_dispatch_compute_combine"] = True
+            down.annotations["mega_moe_waves"] = ctx.training.mega_moe_waves
+            down.annotations["mega_moe_meta"] = dict(meta)
+            down.attrs["mega_moe_meta"] = dict(meta)
+        else:
+            down.annotations["ep_block_down_id"] = gate_up_id
 
         seen_src = set()
         for e in in_edges:
