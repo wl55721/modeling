@@ -156,13 +156,6 @@ def mega_moe_stage_time(
         return MegaMoEStageTime(fwd=empty_fwd, bwd=empty_bwd)
 
     gpu = gpu_name_or_gpu if isinstance(gpu_name_or_gpu, GPU) else system.gpu
-    requested = int(strategy.mega_moe_waves or op.meta.get("requested_waves", 0))
-    waves = resolve_mega_moe_waves(
-        requested=requested,
-        hardware_waves=gpu.ep_overlap_waves,
-        experts_per_rank=experts_per_rank,
-    )
-
     dispatch_s = _mega_moe_a2a_time(
         name=f"{op.name}.dispatch",
         bytes_=_mega_moe_dispatch_bytes(terms, ep),
@@ -176,6 +169,23 @@ def mega_moe_stage_time(
         system=system,
     )
 
+    requested = int(strategy.mega_moe_waves or op.meta.get("requested_waves", 0))
+    bwd_compute_s = dx_compute_s + dw_compute_s
+    if requested > 0:
+        waves = resolve_mega_moe_waves(
+            requested=requested,
+            hardware_waves=gpu.ep_overlap_waves,
+            experts_per_rank=experts_per_rank,
+        )
+    else:
+        waves = select_mega_moe_waves_by_pipeline(
+            experts_per_rank=experts_per_rank,
+            fwd_compute_s=fwd_compute_s,
+            bwd_compute_s=bwd_compute_s,
+            dispatch_s=dispatch_s,
+            combine_s=combine_s,
+        )
+
     fwd = _phase_time(
         waves=waves,
         compute_s=fwd_compute_s,
@@ -184,7 +194,7 @@ def mega_moe_stage_time(
     )
     bwd = _phase_time(
         waves=waves,
-        compute_s=dx_compute_s + dw_compute_s,
+        compute_s=bwd_compute_s,
         dispatch_s=dispatch_s,
         combine_s=combine_s,
     )
@@ -254,6 +264,71 @@ def resolve_mega_moe_waves(
     divisors = [d for d in range(1, experts_per_rank + 1) if experts_per_rank % d == 0]
     valid = [d for d in divisors if d <= target]
     return max(valid) if valid else 1
+
+
+def select_mega_moe_waves_by_pipeline(
+    *,
+    experts_per_rank: int,
+    fwd_compute_s: float,
+    bwd_compute_s: float,
+    dispatch_s: float,
+    combine_s: float,
+) -> int:
+    """Pick the wave count with the best modeled dispatch/compute/combine pipeline.
+
+    This auto mode deliberately uses only quantities already known to the
+    performance model. It does not require NVIDIA SM counts or Ascend AI/Cube
+    core counts, which are not always available for the target hardware.
+    """
+    if experts_per_rank <= 1:
+        return 1
+
+    best_waves = 1
+    best_key: tuple[float, float, int] | None = None
+    for waves in _wave_divisors(experts_per_rank):
+        if waves <= 1:
+            fwd = simulate_wave_pipeline(
+                waves=1,
+                dispatch_s=dispatch_s,
+                compute_s=fwd_compute_s,
+                combine_s=combine_s,
+            )
+            bwd = simulate_wave_pipeline(
+                waves=1,
+                dispatch_s=dispatch_s,
+                compute_s=bwd_compute_s,
+                combine_s=combine_s,
+            )
+        else:
+            fwd = simulate_wave_pipeline(
+                waves=waves,
+                dispatch_s=dispatch_s / waves,
+                compute_s=fwd_compute_s / waves,
+                combine_s=combine_s / waves,
+            )
+            bwd = simulate_wave_pipeline(
+                waves=waves,
+                dispatch_s=dispatch_s / waves,
+                compute_s=bwd_compute_s / waves,
+                combine_s=combine_s / waves,
+            )
+        key = (
+            fwd.total_s + bwd.total_s,
+            fwd.exposed_comm_s + bwd.exposed_comm_s,
+            waves,
+        )
+        if best_key is None or key < best_key:
+            best_key = key
+            best_waves = waves
+    return best_waves
+
+
+def _wave_divisors(experts_per_rank: int) -> list[int]:
+    return [
+        d
+        for d in range(1, experts_per_rank + 1)
+        if experts_per_rank % d == 0
+    ]
 
 
 def simulate_wave_pipeline(

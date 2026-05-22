@@ -11,6 +11,7 @@ from zrt.training.models.mega_moe import (
     mega_moe_cost_terms,
     mega_moe_cost_terms_from_meta,
     resolve_mega_moe_waves,
+    select_mega_moe_waves_by_pipeline,
     simulate_wave_pipeline,
 )
 from zrt.training.spec.dtype import Dtype
@@ -95,6 +96,18 @@ def test_wave_pipeline_more_waves_hide_comm_when_compute_dominates():
 
     assert four.total_s < one.total_s
     assert four.hidden_comm_s > 0.0
+
+
+def test_auto_wave_selector_chooses_best_pipeline_divisor():
+    waves = select_mega_moe_waves_by_pipeline(
+        experts_per_rank=8,
+        fwd_compute_s=8.0,
+        bwd_compute_s=16.0,
+        dispatch_s=4.0,
+        combine_s=4.0,
+    )
+
+    assert waves == 8
 
 
 def test_op_cost_returns_nonzero_flops_and_bytes_for_mega_moe():

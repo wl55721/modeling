@@ -550,6 +550,19 @@ def test_graph_capture_mega_moe_latency_includes_internal_ep_comm():
     assert mega.annotations["latency_us"] >= mega.annotations["base_latency_us"]
 
 
+def test_graph_capture_unset_mega_moe_waves_auto_selects_pipeline_divisor():
+    graph = routed_moe_graph()
+    ctx = _ctx(ep=2)
+    ctx.hw_spec.compute.ep_overlap_waves = 1
+    ctx.training = TrainingConfig(micro_batch=1, mega_moe=True, mega_moe_waves=0)
+    ctx.profile = SimpleNamespace(num_experts=8, moe_active=2)
+
+    out = build_default_pipeline().run(graph, ctx)
+
+    mega = [n for n in out.nodes.values() if n.op_type == "mega_moe"][0]
+    assert mega.annotations["mega_moe_effective_waves"] == 4
+
+
 def test_graph_capture_mega_moe_backward_does_not_keep_external_a2a():
     src = _linear_node("src", "input", (2, 8), (2, 8))
     down = _linear_node(

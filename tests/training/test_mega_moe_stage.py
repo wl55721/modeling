@@ -99,6 +99,21 @@ def test_more_mega_moe_waves_reduce_exposed_fused_ep_comm():
     assert st_four.ep_hidden > st_one.ep_hidden
 
 
+def test_unset_mega_moe_waves_auto_selects_best_pipeline_divisor():
+    model = _moe_model(seq_len=1024)
+    system = _system(ep_overlap_waves=1)
+    auto = Strategy(ep=4, dp=4, mega_moe=True, mega_moe_waves=0, micro_batch=2)
+    four_waves = Strategy(ep=4, dp=4, mega_moe=True, mega_moe_waves=4, micro_batch=2)
+    graph_auto = build_graph(model, auto)
+    graph_four = build_graph(model, four_waves)
+
+    st_auto = stage_time(graph_auto.ops, graph_auto.collectives, model, system, auto)
+    st_four = stage_time(graph_four.ops, graph_four.collectives, model, system, four_waves)
+
+    assert st_auto.ep_exposed == pytest.approx(st_four.ep_exposed)
+    assert st_auto.ep_hidden == pytest.approx(st_four.ep_hidden)
+
+
 def test_ep_gemm_time_counts_mega_moe_as_routed_expert_compute():
     model = _moe_model()
     system = _system()

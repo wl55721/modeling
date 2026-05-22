@@ -205,6 +205,7 @@ def _mega_moe_internal_comm_us(node, ctx, base_latency_us: float) -> tuple[float
         _mega_moe_dispatch_bytes,
         mega_moe_cost_terms_from_meta,
         resolve_mega_moe_waves,
+        select_mega_moe_waves_by_pipeline,
         simulate_wave_pipeline,
     )
     from python.zrt.transform.analysis.comm_latency import _estimate_comm_latency
@@ -231,11 +232,22 @@ def _mega_moe_internal_comm_us(node, ctx, base_latency_us: float) -> tuple[float
         "all_to_all", ep, combine_bytes, bandwidth_bps, link.latency_us,
     )
 
-    waves = resolve_mega_moe_waves(
-        requested=int(meta.get("requested_waves", ctx.training.mega_moe_waves)),
-        hardware_waves=int(getattr(hw.compute, "ep_overlap_waves", 0)),
-        experts_per_rank=int(meta.get("experts_per_rank", terms.local_experts)),
-    )
+    requested = int(meta.get("requested_waves", ctx.training.mega_moe_waves))
+    experts_per_rank = int(meta.get("experts_per_rank", terms.local_experts))
+    if requested > 0:
+        waves = resolve_mega_moe_waves(
+            requested=requested,
+            hardware_waves=int(getattr(hw.compute, "ep_overlap_waves", 0)),
+            experts_per_rank=experts_per_rank,
+        )
+    else:
+        waves = select_mega_moe_waves_by_pipeline(
+            experts_per_rank=experts_per_rank,
+            fwd_compute_s=base_latency_us / 1e6,
+            bwd_compute_s=base_latency_us / 1e6,
+            dispatch_s=dispatch_us / 1e6,
+            combine_s=combine_us / 1e6,
+        )
     if waves <= 1:
         pipeline = simulate_wave_pipeline(
             waves=1,
