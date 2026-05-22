@@ -562,11 +562,16 @@ def records_pair_to_opgraphs(
 
 # Scope suffixes that carry trainable weight parameters.
 _PARAM_SCOPE_SUFFIXES = (
+    # Llama / Qwen naming
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
     "embed_tokens", "lm_head",
     "q_a_proj", "kv_a_proj", "q_b_proj", "kv_b_proj",
     "shared_expert.gate_proj", "shared_expert.up_proj", "shared_expert.down_proj",
+    # DeepSeek-V3/V4 naming (Linear / ColumnParallelLinear / RowParallelLinear)
+    "wq_a", "wkv", "wq_b", "wo_b",          # attention projections
+    "w1", "w2", "w3",                        # MLP / MoE expert projections
+    "weights_proj",                          # MoE expert weights projection
 )
 
 # Op types that represent weight/parameter reads (as opposed to data-path ops).
