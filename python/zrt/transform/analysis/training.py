@@ -414,6 +414,10 @@ class PipelineStepMetrics:
     dp_hidden_ms: float = 0.0
     optimizer_time_ms: float = 0.0
     optimizer_comm_ms: float = 0.0
+    pipeline_time_ms: float = 0.0
+    warmup_ms: float = 0.0
+    steady_ms: float = 0.0
+    cooldown_ms: float = 0.0
 
     def to_dict(self) -> dict[str, float]:
         # The graph metadata value is the authoritative source used by reports;
@@ -439,6 +443,10 @@ class PipelineStepMetrics:
             "dp_hidden_ms": self.dp_hidden_ms,
             "optimizer_time_ms": self.optimizer_time_ms,
             "optimizer_comm_ms": self.optimizer_comm_ms,
+            "pipeline_time_ms": self.pipeline_time_ms,
+            "warmup_ms": self.warmup_ms,
+            "steady_ms": self.steady_ms,
+            "cooldown_ms": self.cooldown_ms,
         }
 
 
@@ -458,8 +466,55 @@ class TrainingPipelinePass(GraphPass):
 
     name = "training_pipeline"
 
+    @staticmethod
+    def _validate_graph_connectivity(g: "OpGraph") -> None:
+        """Check that the graph has no disconnected compute nodes.
+
+        Disconnected forward/backward nodes would indicate incorrect
+        parallel pass transformations (e.g., TP splits without successors,
+        P2P nodes losing cross-stage edges).
+        """
+        if not g.nodes or not g.edges:
+            return
+
+        # Collect in-degree and out-degree for all nodes
+        indeg: dict[str, int] = {nid: 0 for nid in g.nodes}
+        outdeg: dict[str, int] = {nid: 0 for nid in g.nodes}
+        for e in g.edges:
+            indeg[e.dst] = indeg.get(e.dst, 0) + 1
+            outdeg[e.src] = outdeg.get(e.src, 0) + 1
+
+        # Collect orphan compute nodes (ignoring communication nodes which
+        # may legitimately have no predecessors in per-stage subgraphs)
+        orphan_fwd: list[str] = []
+        orphan_bwd: list[str] = []
+        for nid, node in g.nodes.items():
+            if node.category == "communication":
+                continue
+            phase = node.annotations.get("phase", "") if node.annotations else ""
+            if indeg.get(nid, 0) == 0 and outdeg.get(nid, 0) == 0:
+                if "bwd" in phase.lower():
+                    orphan_bwd.append(nid)
+                else:
+                    orphan_fwd.append(nid)
+
+        if orphan_fwd:
+            logger.warning(
+                "TrainingPipelinePass: %d disconnected fwd compute nodes found: %s",
+                len(orphan_fwd),
+                orphan_fwd[:5],
+            )
+        if orphan_bwd:
+            logger.warning(
+                "TrainingPipelinePass: %d disconnected bwd compute nodes found: %s",
+                len(orphan_bwd),
+                orphan_bwd[:5],
+            )
+
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
         g = graph.clone()
+
+        self._validate_graph_connectivity(g)
 
         pp = ctx.parallel.pp if ctx.parallel else 1
         hw = ctx.hw_spec
@@ -574,6 +629,7 @@ class TrainingPipelinePass(GraphPass):
                     pp,
                 )
             tl = sched.schedule(g)
+            stage_timelines[0] = tl
             _fwd = tl.phase_latency("fwd")
             _bwd = tl.phase_latency("bwd")
             fwd = _fwd if isinstance(_fwd, (int, float)) else 0.0
@@ -589,6 +645,7 @@ class TrainingPipelinePass(GraphPass):
                 stage_fwd[s] = per_stage_fwd
                 stage_bwd[s] = per_stage_bwd
                 stage_bwd_dw[s] = 0.0
+            g.metadata["pp_per_stage_timelines"] = stage_timelines
 
         # ── PP grid scheduling via PPStitcher ───────────────────────────────
         from python.zrt.executor.pp_stitcher import PPStitcher
@@ -626,7 +683,7 @@ class TrainingPipelinePass(GraphPass):
             stage_bwd_dw_us=stage_bwd_dw,
             pp=pp,
             M=M,
-            p2p_latency_us=0.0,
+            p2p_latency_us=_extract_p2p_latency_us(g),
             schedule=pp_schedule,
             vpp_chunks=vpp_chunks,
         )
@@ -682,45 +739,114 @@ class TrainingPipelinePass(GraphPass):
             steady_per_mb=t_fwd_max + t_bwd_max,
         )
 
-        # Overlap-aware comm time: reduce step_time by hidden comm
-        overlap_nodes = [
-            n for n in g.nodes.values()
-            if n.category == "communication"
-            and n.annotations.get("overlap_type", "none") != "none"
-            and n.annotations.get("latency_us", 0) > 0
-        ]
-        total_comm_us = 0.0
-        total_exposed_us = 0.0
-        hidden_us = 0.0
-        if overlap_nodes:
-            for cn in overlap_nodes:
-                comm_lat = cn.annotations["latency_us"]
-                otype = cn.annotations["overlap_type"]
-                cp_rounds = cn.attrs.get("cp_rounds", 1)
-                target_lat = 0.0
-                target_key = cn.annotations.get("overlap_target", "")
-                if target_key:
-                    target_id = target_key.split(":", 1)[1] if ":" in target_key else target_key
-                    target_node = g.nodes.get(target_id)
-                    if target_node:
-                        target_lat = target_node.annotations.get("latency_us", 0.0)
-                if otype == "coc" and target_lat <= 0.0:
-                    pred_ids = g.predecessors(cn.id)
-                    pred_lats = [
-                        g.nodes[p].annotations.get("latency_us", 0.0)
-                        for p in pred_ids
-                        if g.nodes[p].category != "communication"
-                    ]
-                    if pred_lats:
-                        target_lat = max(pred_lats)
-                exposed = compute_exposed_comm_time(
-                    comm_lat, otype, target_lat,
-                    coc_tile_k=cn.attrs.get("coc_tile_k", 4),
-                    cp_rounds=cp_rounds,
+        # Overlap-aware comm time: dual-path analysis.
+        # 1. Trace-based: sweep-line intersection of DAGScheduler intervals per stage.
+        # 2. Formula-based: micro-pipelining overlap (ring_cp, coc, mc2) that the
+        #    coarse-grained DAGScheduler cannot capture.
+        # The final hidden comm per strategy = max(trace_hidden, formula_hidden).
+        from python.zrt.executor.overlap import per_strategy_overlap, PerStrategyOverlapReport
+
+        per_strat = PerStrategyOverlapReport()
+        for s_id, tl in stage_timelines.items():
+            if tl and tl.scheduled_ops:
+                stage_report = per_strategy_overlap(tl)
+                for tag in ("tp", "ep", "pp", "cp"):
+                    curr_total = getattr(stage_report, f"{tag}_total_us", 0.0)
+                    curr_exposed = getattr(stage_report, f"{tag}_exposed_us", 0.0)
+                    curr_hidden = getattr(stage_report, f"{tag}_hidden_us", 0.0)
+                    prev_total = getattr(per_strat, f"{tag}_total_us", 0.0)
+                    if curr_total > prev_total:
+                        setattr(per_strat, f"{tag}_total_us", curr_total)
+                        setattr(per_strat, f"{tag}_exposed_us", curr_exposed)
+                        setattr(per_strat, f"{tag}_hidden_us", curr_hidden)
+
+        # Formula-based overlap for annotated comm nodes (captures micro-pipelining)
+        formula_total_by_tag: dict[str, float] = {"tp": 0.0, "ep": 0.0, "cp": 0.0, "pp": 0.0}
+        formula_hidden_by_tag: dict[str, float] = {"tp": 0.0, "ep": 0.0, "cp": 0.0, "pp": 0.0}
+        for node in g.nodes.values():
+            if node.category != "communication":
+                continue
+            otype = node.annotations.get("overlap_type", "none")
+            if otype == "none" or otype == "":
+                continue
+            comm_lat = node.annotations.get("latency_us", 0.0)
+            if comm_lat <= 0:
+                continue
+
+            cp_rounds = int(node.attrs.get("cp_rounds", 1))
+            coc_tile_k = int(node.attrs.get("coc_tile_k", 4))
+            target_lat = 0.0
+            target_key = node.annotations.get("overlap_target", "")
+            if target_key:
+                target_id = target_key.split(":", 1)[1] if ":" in target_key else target_key
+                target_node = g.nodes.get(target_id)
+                if target_node:
+                    target_lat = target_node.annotations.get("latency_us", 0.0)
+            if otype == "coc" and target_lat <= 0.0:
+                pred_ids = g.predecessors(node.id)
+                pred_lats = [
+                    g.nodes[p].annotations.get("latency_us", 0.0)
+                    for p in pred_ids
+                    if g.nodes[p].category != "communication"
+                ]
+                if pred_lats:
+                    target_lat = max(pred_lats)
+
+            formula_exposed = compute_exposed_comm_time(
+                comm_lat, otype, target_lat,
+                coc_tile_k=coc_tile_k,
+                cp_rounds=cp_rounds,
+            )
+            formula_hidden = max(0.0, comm_lat - formula_exposed)
+
+            # Map to strategy tag
+            node_tag = node.annotations.get("overlap_strategy", "")
+            if not node_tag:
+                raw = node.annotations.get("inserted_by", "")
+                if raw.endswith("_pass"):
+                    raw = raw[:-5]
+                if raw in ("tp", "ep", "cp", "pp"):
+                    node_tag = raw
+            if not node_tag:
+                node_tag = "tp"  # default for untagged comm
+
+            if node_tag in formula_total_by_tag:
+                formula_total_by_tag[node_tag] += comm_lat
+                formula_hidden_by_tag[node_tag] += formula_hidden
+
+        # Merge: per-strategy overlap = max(trace_hidden, formula_hidden)
+        for tag in ("tp", "ep", "pp", "cp"):
+            trace_total = getattr(per_strat, f"{tag}_total_us", 0.0)
+            trace_hidden = getattr(per_strat, f"{tag}_hidden_us", 0.0)
+            f_total = formula_total_by_tag.get(tag, 0.0)
+            f_hidden = formula_hidden_by_tag.get(tag, 0.0)
+            merged_total = max(trace_total, f_total)
+            merged_hidden = max(trace_hidden, f_hidden)
+            setattr(per_strat, f"{tag}_total_us", merged_total)
+            setattr(per_strat, f"{tag}_hidden_us", merged_hidden)
+            setattr(per_strat, f"{tag}_exposed_us", max(0.0, merged_total - merged_hidden))
+
+        total_comm_us = (
+            per_strat.tp_total_us + per_strat.ep_total_us
+            + per_strat.pp_total_us + per_strat.cp_total_us
+        ) * M
+        # Ensure total includes untagged comm ops from per-stage timelines
+        trace_total = 0.0
+        for s_id, tl in stage_timelines.items():
+            if tl and tl.scheduled_ops:
+                trace_total = max(
+                    trace_total,
+                    sum(op.latency_us for op in tl.scheduled_ops if op.stream_type == "comm")
                 )
-                total_comm_us += comm_lat
-                total_exposed_us += exposed
-            hidden_us = total_comm_us - total_exposed_us
+        if trace_total * M > total_comm_us:
+            total_comm_us = trace_total * M
+        total_exposed_us = (
+            per_strat.tp_exposed_us + per_strat.ep_exposed_us
+            + per_strat.pp_exposed_us + per_strat.cp_exposed_us
+        ) * M
+        hidden_us = max(0.0, total_comm_us - total_exposed_us)
+
+        if hidden_us > 0:
             step_time_us -= hidden_us
             step_time_ms = step_time_us / 1000.0
 
@@ -810,10 +936,16 @@ class TrainingPipelinePass(GraphPass):
             total_comm_ms=total_comm_ms,
             dp_exposed_ms=step_result.dp_exposed * 1000.0,
             dp_hidden_ms=step_result.dp_hidden * 1000.0,
+            pipeline_time_ms=step_result.pipeline_time * 1000.0,
+            warmup_ms=step_result.warmup * 1000.0,
+            steady_ms=step_result.steady * 1000.0,
+            cooldown_ms=step_result.cooldown * 1000.0,
         )
 
         g.metadata["pipeline_metrics"] = metrics
         g.metadata["recompute_compute_ms"] = recompute_compute_ms
+
+        g.metadata["per_strategy_overlap"] = per_strat.to_dict()
 
         # Add optimizer step time (per §5.5.2 of design doc)
         opt_compute_us, ag_time_us, rs_time_us, opt_comm_us = self._compute_optimizer_step_time(g, hw, ctx)
@@ -1060,6 +1192,20 @@ class TrainingPipelinePass(GraphPass):
 
 
 # ── Exposed comm-time helper ────────────────────────────────────────────────────
+
+def _extract_p2p_latency_us(g) -> float:
+    """Extract maximum P2P communication latency from send_recv nodes in the graph.
+
+    Returns 0.0 if no P2P nodes are found.
+    """
+    max_lat = 0.0
+    for node in g.nodes.values():
+        if node.op_type == "comm.send_recv" or node.category == "communication":
+            lat = node.annotations.get("latency_us", 0.0)
+            if lat > max_lat:
+                max_lat = lat
+    return max_lat
+
 
 def compute_exposed_comm_time(
     comm_latency_us: float,

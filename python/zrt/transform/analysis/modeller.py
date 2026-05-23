@@ -204,6 +204,7 @@ def estimate_training_from_graphs(
                         str(trace_dir / "pp_per_stage.json"),
                         M=M,
                         pp_stitched=pp_timeline,
+                        replicate=False,
                     )
                     exporter.export_combined(
                         pp_timeline, tl_list,
@@ -219,6 +220,7 @@ def estimate_training_from_graphs(
         forward_flops = g.metadata.get("forward_flops", 0.0)
         backward_flops = g.metadata.get("backward_flops", 0.0)
         total_params = g.metadata.get("total_params", 0)
+        per_strat_meta = g.metadata.get("per_strategy_overlap", {})
     else:
         fwd = results["train_forward"]
         pipeline_metrics = fwd.metadata.get("pipeline_metrics")
@@ -228,6 +230,7 @@ def estimate_training_from_graphs(
         forward_flops = fwd.metadata.get("forward_flops", 0.0)
         backward_flops = fwd.metadata.get("backward_flops", 0.0)
         total_params = fwd.metadata.get("total_params", 0)
+        per_strat_meta = fwd.metadata.get("per_strategy_overlap", {})
 
     step_time_ms = pipeline_metrics.step_time_ms if pipeline_metrics else 0.0
     per_stage_ms = pipeline_metrics.per_stage_ms if pipeline_metrics else 0.0
@@ -249,6 +252,10 @@ def estimate_training_from_graphs(
     dp_hidden_ms = pipeline_metrics.dp_hidden_ms if pipeline_metrics else 0.0
     optimizer_time_ms = pipeline_metrics.optimizer_time_ms if pipeline_metrics else 0.0
     optimizer_comm_ms = pipeline_metrics.optimizer_comm_ms if pipeline_metrics else 0.0
+    pipeline_time_ms = pipeline_metrics.pipeline_time_ms if pipeline_metrics else 0.0
+    warmup_ms = pipeline_metrics.warmup_ms if pipeline_metrics else 0.0
+    steady_ms = pipeline_metrics.steady_ms if pipeline_metrics else 0.0
+    cooldown_ms = pipeline_metrics.cooldown_ms if pipeline_metrics else 0.0
 
     parallel = ctx.parallel
     training = ctx.training
@@ -301,6 +308,20 @@ def estimate_training_from_graphs(
         total_comm_volume_ms=total_comm_ms,
         optimizer_time_ms=optimizer_time_ms,
         optimizer_comm_ms=optimizer_comm_ms,
+        pipeline_time_ms=pipeline_time_ms,
+        warmup_ms=warmup_ms,
+        steady_ms=steady_ms,
+        cooldown_ms=cooldown_ms,
+        tp_exposed_ms=per_strat_meta.get("tp_exposed_us", 0.0) / 1000.0,
+        tp_hidden_ms=per_strat_meta.get("tp_hidden_us", 0.0) / 1000.0,
+        tp_total_ms=per_strat_meta.get("tp_total_us", 0.0) / 1000.0,
+        cp_exposed_ms=per_strat_meta.get("cp_exposed_us", 0.0) / 1000.0,
+        cp_total_ms=per_strat_meta.get("cp_total_us", 0.0) / 1000.0,
+        ep_exposed_ms=per_strat_meta.get("ep_exposed_us", 0.0) / 1000.0,
+        ep_hidden_ms=per_strat_meta.get("ep_hidden_us", 0.0) / 1000.0,
+        ep_total_ms=per_strat_meta.get("ep_total_us", 0.0) / 1000.0,
+        pp_exposed_ms=per_strat_meta.get("pp_exposed_us", 0.0) / 1000.0,
+        pp_total_ms=per_strat_meta.get("pp_total_us", 0.0) / 1000.0,
     )
 
     if return_transformed:
