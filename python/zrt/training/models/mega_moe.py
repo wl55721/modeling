@@ -26,6 +26,7 @@ class WavePipelineResult:
 @dataclass(frozen=True)
 class MegaMoECostTerms:
     tokens: int
+    compute_tokens: int
     n: int
     activation_n: int
     k_eff: int
@@ -99,6 +100,7 @@ def mega_moe_cost_terms_from_meta(meta: Mapping[str, Any]) -> MegaMoECostTerms:
     # hidden dimension for expert GEMM and stored-weight traffic.
     n = n_logical if "k_local" in meta else activation_n
     top_k = int(meta["top_k"])
+    compute_tokens = int(meta.get("compute_tokens_per_rank", tokens * top_k))
     local_experts = int(meta.get("experts_per_rank", meta.get("num_experts", top_k)))
     raw_fwd_multiplier = float(meta.get("fwd_multiplier", 3))
     fwd_multiplier = _mega_moe_fwd_multiplier(raw_fwd_multiplier, top_k)
@@ -112,10 +114,11 @@ def mega_moe_cost_terms_from_meta(meta: Mapping[str, Any]) -> MegaMoECostTerms:
     moe_activation_input_bytes = float(tokens * activation_n * moe_act_bytes)
     weight_bytes = float(local_experts * k_eff * n * fwd_multiplier * weight_stored_bytes)
     fwd_bytes = activation_input_bytes + activation_output_bytes + weight_bytes
-    fwd_flops = float(2 * tokens * top_k * k_eff * n * fwd_multiplier)
+    fwd_flops = float(2 * compute_tokens * k_eff * n * fwd_multiplier)
 
     return MegaMoECostTerms(
         tokens=tokens,
+        compute_tokens=compute_tokens,
         n=n,
         activation_n=activation_n,
         k_eff=k_eff,

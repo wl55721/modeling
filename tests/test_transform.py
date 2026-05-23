@@ -424,6 +424,11 @@ def test_expert_grouped_mm_mega_moe_off_keeps_grouped_forward_path():
     assert [n for n in out.nodes.values() if n.op_type == "mega_moe"] == []
     grouped = [n for n in out.nodes.values() if n.op_type == "GroupedMatMul"]
     assert {n.annotations.get("grouped_mm_role") for n in grouped} == {"gate_up", "down"}
+    by_role = {n.annotations["grouped_mm_role"]: n for n in grouped}
+    assert by_role["gate_up"].inputs[0].shape == (2, 8, 16)
+    assert by_role["down"].inputs[0].shape == (2, 8, 4)
+    assert by_role["gate_up"].annotations["ep_tokens_per_rank"] == 16
+    assert by_role["gate_up"].annotations["ep_tokens_per_expert"] == 8
 
 
 def test_default_pipeline_mega_moe_forward_fuses_without_external_a2a():
@@ -448,8 +453,8 @@ def test_default_pipeline_mega_moe_forward_fuses_without_external_a2a():
     assert mega.annotations["fused_by"] == "mega_moe_graph_capture"
     assert mega.annotations["fused_dispatch_compute_combine"] is True
     assert mega.annotations["mega_moe_waves"] == 3
-    assert mega.annotations["ep_tokens_per_rank"] == 8
-    assert mega.annotations["ep_tokens_per_expert"] == 4
+    assert mega.annotations["ep_tokens_per_rank"] == 16
+    assert mega.annotations["ep_tokens_per_expert"] == 8
     assert "ep_needs_a2a" not in mega.annotations
     assert "ep_a2a_inserted" not in mega.annotations
 
@@ -491,7 +496,9 @@ def test_graph_capture_mega_moe_uses_shared_cost_model_and_formula():
 
     mega = [n for n in out.nodes.values() if n.op_type == "mega_moe"][0]
     terms = mega_moe_cost_terms_from_meta(mega.annotations["mega_moe_meta"])
+    assert terms.compute_tokens == mega.annotations["ep_tokens_per_rank"]
     assert mega.annotations["flops"] == int(terms.fwd_flops)
+    assert terms.fwd_flops == 2 * mega.annotations["ep_tokens_per_rank"] * 4 * 16 * 3
     assert mega.annotations["flops_dx"] == int(terms.fwd_flops)
     assert mega.annotations["flops_dw"] == int(terms.fwd_flops)
     assert (
@@ -501,7 +508,10 @@ def test_graph_capture_mega_moe_uses_shared_cost_model_and_formula():
 
     formulas = get_op_formulas(mega)
     assert "MegaMoE" in formulas["flops_sym"]
-    assert "top_k" in formulas["flops_sym"]
+    assert "compute_tokens" in formulas["flops_sym"]
+    assert "路" not in formulas["flops_sym"]
+    assert "路" not in formulas["flops_num"]
+    assert "*" in formulas["flops_sym"]
     assert "weight" in formulas["read_sym"]
 
 
@@ -522,7 +532,9 @@ def test_graph_capture_mega_moe_meta_uses_logical_tokens_not_routed_tokens():
     meta = mega.annotations["mega_moe_meta"]
     terms = mega_moe_cost_terms_from_meta(meta)
 
-    assert mega.annotations["ep_tokens_per_rank"] == 12
+    assert mega.annotations["ep_tokens_per_rank"] == 48
+    assert mega.inputs[0].shape == (ctx.training.micro_batch * graph.metadata["seq_len"], 16)
+    assert mega.outputs[0].shape == (ctx.training.micro_batch * graph.metadata["seq_len"], 16)
     assert meta["m"] == graph.metadata["seq_len"]
     assert terms.tokens == ctx.training.micro_batch * graph.metadata["seq_len"]
     assert _mega_moe_dispatch_bytes(terms, ep=ctx.parallel.ep) == (
@@ -561,6 +573,87 @@ def test_graph_capture_unset_mega_moe_waves_auto_selects_pipeline_divisor():
 
     mega = [n for n in out.nodes.values() if n.op_type == "mega_moe"][0]
     assert mega.annotations["mega_moe_effective_waves"] == 4
+
+
+def test_mega_moe_report_order_keeps_shared_allreduce_before_routed_branch():
+    src = _linear_node("src", "transformer.layers.0.ffn_norm", (8, 16), (8, 16))
+    shared_up = _linear_node(
+        "shared_up",
+        "transformer.layers.0.ffn.shared_experts.w1",
+        (8, 16),
+        (8, 4),
+    )
+    shared_down = _linear_node(
+        "shared_down",
+        "transformer.layers.0.ffn.shared_experts.w2",
+        (8, 4),
+        (8, 16),
+    )
+    gate = _linear_node("gate", "transformer.layers.0.ffn.experts.0.w1", (8, 16), (8, 4))
+    up = _linear_node("up", "transformer.layers.0.ffn.experts.0.w3", (8, 16), (8, 4))
+    act = OpNode(
+        id="act",
+        op_type="aten.silu.default",
+        inputs=[_t("gate_out", (8, 4)), _t("up_out", (8, 4))],
+        outputs=[_t("act_out", (8, 4))],
+        scope="transformer.layers.0.ffn.experts.0.activation",
+        category="compute",
+    )
+    down = _linear_node("down", "transformer.layers.0.ffn.experts.0.w2", (8, 4), (8, 16))
+    sink = _linear_node("sink", "transformer.layers.0.ffn.out", (8, 16), (8, 16))
+    for n in (shared_up, shared_down, gate, up, act, down):
+        n.annotations["phase"] = "fwd"
+
+    graph = OpGraph(
+        name="shared_and_routed_moe",
+        phase="train_forward",
+        nodes={n.id: n for n in (src, shared_up, shared_down, gate, up, act, down, sink)},
+        edges=[
+            Edge("src", 0, "shared_up", 0, src.outputs[0]),
+            Edge("shared_up", 0, "shared_down", 0, shared_up.outputs[0]),
+            Edge("shared_down", 0, "sink", 0, shared_down.outputs[0]),
+            Edge("src", 0, "gate", 0, src.outputs[0]),
+            Edge("src", 0, "up", 0, src.outputs[0]),
+            Edge("gate", 0, "act", 0, gate.outputs[0]),
+            Edge("up", 0, "act", 1, up.outputs[0]),
+            Edge("act", 0, "down", 0, act.outputs[0]),
+            Edge("down", 0, "sink", 0, down.outputs[0]),
+        ],
+        metadata={"seq_len": 8, "hidden": 16},
+    )
+    ctx = _ctx(tp=2, ep=2)
+    ctx.training = TrainingConfig(micro_batch=1, mega_moe=True, mega_moe_waves=0)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = build_default_pipeline().run(graph, ctx)
+    ordered = [n.id for n in out.topo_sort()]
+
+    assert ordered.index("comm_allreduce_shared_down") < ordered.index(
+        "transformer_layers_0_ffn_mega_moe"
+    )
+
+
+def test_mega_moe_node_id_uses_source_op_style_when_available():
+    graph = routed_moe_graph()
+    graph.nodes["gate"].id = "fused_105_fused_15_op_119"
+    graph.nodes["gate"].scope = "transformer.layers.0.ffn.experts.0.w1"
+    graph.nodes = {
+        ("fused_105_fused_15_op_119" if nid == "gate" else nid): node
+        for nid, node in graph.nodes.items()
+    }
+    for edge in graph.edges:
+        if edge.src == "gate":
+            edge.src = "fused_105_fused_15_op_119"
+        if edge.dst == "gate":
+            edge.dst = "fused_105_fused_15_op_119"
+    graph._rebuild_adjacency()
+    ctx = _ctx(ep=2)
+    ctx.training = TrainingConfig(micro_batch=1, mega_moe=True, mega_moe_waves=0)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = build_default_pipeline().run(graph, ctx)
+
+    assert "mega_moe_op_119" in out.nodes
 
 
 def test_graph_capture_mega_moe_backward_does_not_keep_external_a2a():

@@ -1716,19 +1716,17 @@ def _fs_mega_moe(node: "OpNode") -> dict:
     from zrt.training.models.mega_moe import mega_moe_cost_terms_from_meta
 
     terms = mega_moe_cost_terms_from_meta(meta)
-    m = int(meta.get("m", terms.tokens))
-    micro_batch = int(meta.get("micro_batch", 1))
-    top_k = int(meta.get("top_k", terms.top_k))
+    compute_tokens = terms.compute_tokens
     k_eff = terms.k_eff
     n = terms.n
     fwd_multiplier = terms.fwd_multiplier
     read = terms.activation_input_bytes + terms.weight_bytes
     write = terms.activation_output_bytes
     return _mk(
-        "MegaMoE: 2路tokens路top_k路k_eff路n路fwd_multiplier",
+        "MegaMoE: 2*compute_tokens*k_eff*n*fwd_multiplier",
         (
-            f"2路({micro_batch}路{m})路{top_k}路{k_eff}路{n}"
-            f"路{fwd_multiplier:g} = {int(terms.fwd_flops)}"
+            f"2*{compute_tokens}*{k_eff}*{n}"
+            f"*{fwd_multiplier:g} = {int(terms.fwd_flops)}"
         ),
         "activation input + local expert weight",
         f"{int(read)}",

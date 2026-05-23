@@ -14,6 +14,7 @@ Dataflow:
 from __future__ import annotations
 
 import copy
+import re
 from typing import TYPE_CHECKING
 
 from python.zrt.ir.edge import Edge
@@ -112,6 +113,18 @@ def _quant_variant(ctx: "TransformContext") -> str:
     return "standard"
 
 
+def _source_op_suffix(node_id: str) -> str | None:
+    match = re.search(r"(op_\d+)(?!.*op_\d+)", node_id)
+    return match.group(1) if match else None
+
+
+def _mega_moe_node_id(layer_key: str, src_node: OpNode) -> str:
+    suffix = _source_op_suffix(src_node.id)
+    if suffix:
+        return f"mega_moe_{suffix}"
+    return f"{layer_key.replace('.', '_')}_mega_moe"
+
+
 def _make_mega_moe(node_id: str, scope: str,
                    input_tensor: TensorMeta,
                    output_tensor: TensorMeta,
@@ -188,10 +201,11 @@ class ExpertGroupedMMPass(GraphPass):
         batch = ctx.training.micro_batch if ctx.training else 1
         topk = ctx.profile.moe_active if ctx.profile else 6
         total_routed_tokens = batch * seq * topk
-        # Tokens carried by one EP rank across all local experts. GroupedMM
-        # shapes use M below: per-expert tokens, not per-rank routed tokens.
-        tokens_per_ep_rank = max(1, (total_routed_tokens + ep - 1) // ep)
-        M = max(1, (total_routed_tokens + num_experts - 1) // num_experts)
+        # After EP all-to-all, each target EP rank receives routed tokens from
+        # every source rank in the EP group. Under uniform routing, the per-rank
+        # receive volume equals local_tokens_per_source_rank * top_k.
+        tokens_per_ep_rank = max(1, total_routed_tokens)
+        M = max(1, (tokens_per_ep_rank + experts_per_rank - 1) // experts_per_rank)
         G = experts_per_rank
 
         for (layer_key, phase), nodes in layers.items():
@@ -347,22 +361,24 @@ class ExpertGroupedMMPass(GraphPass):
         if not in_edges or not out_edges:
             return
 
-        input_dtype = gate.inputs[0].dtype if gate.inputs else DType.BF16
-        output_dtype = down.outputs[0].dtype if down.outputs else input_dtype
-        input_tensor = TensorMeta.from_shape_dtype(
-            "mega_moe_in", (tokens_per_rank, H_in), input_dtype)
-        output_tensor = TensorMeta.from_shape_dtype(
-            "mega_moe_out", (tokens_per_rank, H_out), output_dtype)
-
         weight_bytes = (
             float(ctx.quant.weight_bytes)
             if getattr(ctx, "quant", None) is not None
             else _dtype_bytes(gate.inputs[0] if gate.inputs else None)
         )
         logical_tokens = int(g.metadata.get("seq_len", tokens_per_rank))
+        micro_batch = ctx.training.micro_batch if ctx.training else 1
+        boundary_tokens = max(1, micro_batch * logical_tokens)
+        input_dtype = gate.inputs[0].dtype if gate.inputs else DType.BF16
+        output_dtype = down.outputs[0].dtype if down.outputs else input_dtype
+        input_tensor = TensorMeta.from_shape_dtype(
+            "mega_moe_in", (boundary_tokens, H_in), input_dtype)
+        output_tensor = TensorMeta.from_shape_dtype(
+            "mega_moe_out", (boundary_tokens, H_out), output_dtype)
         meta = {
             "m": logical_tokens,
-            "micro_batch": ctx.training.micro_batch if ctx.training else 1,
+            "micro_batch": micro_batch,
+            "compute_tokens_per_rank": tokens_per_rank,
             "n": H_out,
             "k": ffn,
             "top_k": topk,
@@ -380,7 +396,7 @@ class ExpertGroupedMMPass(GraphPass):
             "fused_dispatch_compute_combine": True,
         }
 
-        mega_id = f"{layer_key.replace('.','_')}_mega_moe"
+        mega_id = _mega_moe_node_id(layer_key, gate)
         mega = _make_mega_moe(
             mega_id, f"{layer_key}.moe", input_tensor, output_tensor,
             gate, meta, ctx, tokens_per_rank, tokens_per_expert,

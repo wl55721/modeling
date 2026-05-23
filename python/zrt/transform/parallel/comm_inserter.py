@@ -56,7 +56,7 @@ def _rewire(g: "OpGraph", src_id: str, comm_node: OpNode) -> None:
     old_out = [e for e in g.edges if e.src == src_id]
     g.edges = [e for e in g.edges if e.src != src_id]
 
-    g.nodes[comm_node.id] = comm_node
+    _insert_node_after(g, src_id, comm_node)
     g._succ[comm_node.id] = []
     g._pred[comm_node.id] = []
 
@@ -76,6 +76,20 @@ def _rewire(g: "OpGraph", src_id: str, comm_node: OpNode) -> None:
         ))
 
     g._rebuild_adjacency()
+
+
+def _insert_node_after(g: "OpGraph", src_id: str, new_node: OpNode) -> None:
+    """Place inserted comm nodes next to their producer in report order."""
+    reordered = []
+    inserted = False
+    for nid, node in g.nodes.items():
+        reordered.append((nid, node))
+        if nid == src_id:
+            reordered.append((new_node.id, new_node))
+            inserted = True
+    if not inserted:
+        reordered.append((new_node.id, new_node))
+    g.nodes = dict(reordered)
 
 
 class CommInserterPass(GraphPass):
