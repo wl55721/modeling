@@ -37,6 +37,7 @@ class PPScheduleKind(Enum):
     ONE_F_ONE_B = auto()
     INTERLEAVED = auto()      # VPP
     DUALPIPE = auto()
+    DUALPIPE_V = auto()       # DualPipeV: DualPipe + virtual stage splitting
     ZERO_BUBBLE = auto()      # ZB: split bwd into dx/dw, defer dw
 
 
@@ -262,18 +263,37 @@ def _add_device_serial_dualpipe(
     pp: int,
     M: int,
 ) -> None:
-    """Edge ③ (DualPipe): two anti-parallel streams per device.
+    """Edge ③ (DualPipe): per-device execution order with dual-stream skip.
 
-    Stream A:  F₀→F₁→B₀→F₂→B₁→F₃→B₂→...  (skipping pattern)
-    Stream B:  B₀→B₁→F₀→B₂→F₁→B₃→F₂→...  (reversed, offset)
+    Two parallel streams per device:
+      Stream A:  F₀→F₁→B₀→F₂→B₁→F₃→B₂→...  (skipping pattern)
+      Stream B:  B₀→B₁→F₀→B₂→F₁→B₃→F₂→...  (reversed, offset)
 
-    Simplified model: each device processes two interleaved sequences,
-    adding cross-sequence dependencies at forward/backward hand-off points.
+    Dependencies added per device:
+      1. Forward chain: F[m] → F[m+1]  (serial microbatch order)
+      2. Backward chain: B[m] → B[m+1]  (serial microbatch order)
+      3. Dual skip: B[m] → F[m+2]       (anti-parallel hand-off after each bwd)
+
+    Forward-chain and backward-chain make the per-device ordering explicit,
+    preventing the list scheduler from constructing sub-optimal schedules
+    when stage loads are imbalanced (the chain constrains microbatches to
+    execute in natural order, giving DualPipe's anti-parallel skip a
+    predictable base to work from).
     """
     for s in range(pp):
+        # Forward chain: F[0] → F[1] → ... → F[M-1]
+        _chain_on_device(
+            tasks, s,
+            [(m, "fwd") for m in range(M)],
+        )
+        # Backward chain: B[0] → B[1] → ... → B[M-1]
+        _chain_on_device(
+            tasks, s,
+            [(m, "bwd") for m in range(M)],
+        )
+        # DualPipe skip: B[m] → F[m+2]  (anti-parallel stream hand-off)
         for m in range(M):
             bwd_id = _task_id(s, m, "bwd")
-            # After bwd of mb m, start fwd of mb m+2 (skipping one)
             if m + 2 < M:
                 next_fwd_id = _task_id(s, m + 2, "fwd")
                 if bwd_id in tasks and next_fwd_id in tasks:
@@ -389,9 +409,9 @@ class PPStitcher:
     p2p_latency_us : float
         One-way P2P activation transfer time (µs) between adjacent stages.
     schedule : str
-        Pipeline schedule: "1f1b", "interleaved", "dualpipe", "zb".
+        Pipeline schedule: "1f1b", "interleaved", "dualpipe", "dualpipev", "zb".
     vpp_chunks : int
-        Virtual pipeline stages per device (for VPP/interleaved).
+        Virtual pipeline stages per device (for VPP/interleaved and DualPipeV).
     """
 
     def __init__(
@@ -426,6 +446,9 @@ class PPStitcher:
             return self._stitch_pp1()
 
         kind = self._resolve_schedule_kind()
+        # DualPipeV with vpp<=1 degenerates to DualPipe (same as DualPipeVComposer)
+        if kind == PPScheduleKind.DUALPIPE_V and self._vpp <= 1:
+            kind = PPScheduleKind.DUALPIPE
         eff_pp = self._effective_pp(kind)
         tasks = self._build_grid(kind, eff_pp)
         task_map = _build_task_id_set(tasks)
@@ -465,12 +488,14 @@ class PPStitcher:
     # ── grid construction ─────────────────────────────────────────────────
 
     def _effective_pp(self, kind: PPScheduleKind) -> int:
-        if kind == PPScheduleKind.INTERLEAVED and self._vpp > 1:
+        if kind in (PPScheduleKind.INTERLEAVED, PPScheduleKind.DUALPIPE_V) and self._vpp > 1:
             return self._pp * self._vpp
         return self._pp
 
     def _vstage_to_device(self, virtual_stage: int, kind: PPScheduleKind) -> int:
         if kind == PPScheduleKind.INTERLEAVED and self._vpp > 1:
+            return virtual_stage % self._pp
+        if kind == PPScheduleKind.DUALPIPE_V and self._vpp > 1:
             return virtual_stage % self._pp
         return virtual_stage
 
@@ -516,6 +541,22 @@ class PPStitcher:
                         stage_id=v, mb_id=m, phase="bwd",
                         latency_us=bwd_us, stream_id=phys,
                     ))
+        elif kind == PPScheduleKind.DUALPIPE_V and self._vpp > 1:
+            for v in range(eff_pp):
+                phys = self._vstage_to_device(v, kind)
+                fwd_us = self._stage_fwd.get(v % self._pp, 0.0) / self._vpp
+                bwd_us = self._stage_bwd.get(v % self._pp, 0.0) / self._vpp
+                for m in range(self._M):
+                    tasks.append(GridTask(
+                        task_id=_task_id(v, m, "fwd"),
+                        stage_id=v, mb_id=m, phase="fwd",
+                        latency_us=fwd_us, stream_id=phys,
+                    ))
+                    tasks.append(GridTask(
+                        task_id=_task_id(v, m, "bwd"),
+                        stage_id=v, mb_id=m, phase="bwd",
+                        latency_us=bwd_us, stream_id=phys,
+                    ))
         else:
             for s in range(self._pp):
                 fwd_us = self._stage_fwd.get(s, 0.0)
@@ -542,11 +583,11 @@ class PPStitcher:
     ) -> None:
         """Apply per-device serialization edges (Edge ③).
 
-        For VPP (interleaved), the P2P constraints + list-scheduler's
-        device-free tracking naturally enforce correct device serial
-        ordering across virtual stages — explicit per-virtual-stage
-        1F1B chains would serialize all virtual-stage work on a
-        physical device instead of interleaving them.
+        For VPP (interleaved) and DualPipeV, the P2P constraints +
+        list-scheduler's device-free tracking naturally enforce correct
+        device serial ordering across virtual stages — explicit
+        per-virtual-stage chains would serialize all virtual-stage work
+        on a physical device instead of interleaving them.
         """
         if kind == PPScheduleKind.ONE_F_ONE_B:
             _add_device_serial_1f1b(task_map, eff_pp, self._M)
@@ -555,6 +596,9 @@ class PPStitcher:
                 _add_device_serial_1f1b(task_map, eff_pp, self._M)
         elif kind == PPScheduleKind.DUALPIPE:
             _add_device_serial_dualpipe(task_map, eff_pp, self._M)
+        elif kind == PPScheduleKind.DUALPIPE_V:
+            if self._vpp <= 1:
+                _add_device_serial_dualpipe(task_map, eff_pp, self._M)
         elif kind == PPScheduleKind.ZERO_BUBBLE:
             _add_device_serial_zb(task_map, eff_pp, self._M)
 
@@ -614,6 +658,7 @@ class PPStitcher:
             PPScheduleKind.ONE_F_ONE_B: "1f1b",
             PPScheduleKind.INTERLEAVED: "interleaved",
             PPScheduleKind.DUALPIPE: "dualpipe",
+            PPScheduleKind.DUALPIPE_V: "dualpipev",
             PPScheduleKind.ZERO_BUBBLE: "zb",
         }
 
@@ -677,6 +722,8 @@ class PPStitcher:
             return PPScheduleKind.INTERLEAVED
         if s in ("dualpipe", "dp"):
             return PPScheduleKind.DUALPIPE
+        if s in ("dualpipev", "dpv"):
+            return PPScheduleKind.DUALPIPE_V
         if s in ("zb", "zero_bubble", "zerobubble"):
             return PPScheduleKind.ZERO_BUBBLE
         return PPScheduleKind.ONE_F_ONE_B
