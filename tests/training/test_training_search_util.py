@@ -531,6 +531,7 @@ class TestTrainingConfigManager:
             "pp_schedule": "1f1b",
             "recompute": "none",
             "optimizer": "adam",
+            "max_memory_gb": 1024,
         })
 
         assert result["status"] == "success"
@@ -556,6 +557,7 @@ class TestTrainingConfigManager:
             "recompute": "none",
             "optimizer": "muon",
             "muon_rotation": True,
+            "max_memory_gb": 1024,
         }
 
         result = run_training_task_wrapper(cfg)
