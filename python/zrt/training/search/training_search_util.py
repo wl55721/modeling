@@ -1114,7 +1114,7 @@ if __name__ == "__main__":
         "dp_overlap_in_bubble": [True],
         "recompute": ["none", "mhc"],
         "optimizer": ["muon"],
-        "quant_preset": ["deepseek_v4_fp8_fp4"],
+        "quant_preset": ["deepseek_v4_fp8_fp4", "deepseek_v4_full_fp8"],
     }
 
     df = run_training_search_parallel(
