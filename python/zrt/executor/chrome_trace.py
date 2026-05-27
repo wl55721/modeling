@@ -39,18 +39,18 @@ if TYPE_CHECKING:
 
 # ── colour palette ────────────────────────────────────────────────────────────
 
+_FWD_COLOR = "#1a3a6b"
+_BWD_COLOR = "#8FBC8F"
+
 _COLORS: dict[str, str] = {
-    # FWD phases — warm tones
-    "fwd_compute":        "good",     # green
-    "fwd_comm":           "olive",    # olive
+    "fwd_compute":        "good",
+    "fwd_comm":           "olive",
     "fwd_p2p":            "terracotta",
-    # BWD phases — cool tones
-    "bwd_compute":        "blue",     # blue
+    "bwd_compute":        "blue",
     "bwd_comm":           "purple",
     "bwd_p2p":            "magenta",
     "bwd_dx_compute":     "blue",
     "bwd_dw_compute":     "navy",
-    # Memory / other
     "memory":             "yellow",
     "idle":               "grey",
     "bubble":             "light_grey",
@@ -59,17 +59,17 @@ _COLORS: dict[str, str] = {
 }
 
 _NAMES: dict[str, str] = {
-    "fwd_compute":        "▼ FWD [c]",
-    "fwd_comm":           "▼ FWD [n]",
-    "fwd_p2p":            "▼ FWD [p2p]",
-    "bwd_compute":        "▲ BWD [c]",
-    "bwd_comm":           "▲ BWD [n]",
-    "bwd_p2p":            "▲ BWD [p2p]",
-    "bwd_dx_compute":     "▲ BWD_dX [c]",
-    "bwd_dw_compute":     "▲ BWD_dW [c]",
-    "memory":             "◇ MEM",
-    "idle":               "· idle",
-    "bubble":             "∅ bubble",
+    "fwd_compute":        "[c]",
+    "fwd_comm":           "[n]",
+    "fwd_p2p":            "[p2p]",
+    "bwd_compute":        "[c]",
+    "bwd_comm":           "[n]",
+    "bwd_p2p":            "[p2p]",
+    "bwd_dx_compute":     "dX [c]",
+    "bwd_dw_compute":     "dW [c]",
+    "memory":             "MEM",
+    "idle":               "idle",
+    "bubble":             "bubble",
 }
 
 
@@ -84,9 +84,10 @@ class ChromeTraceEvent:
     ts: float
     dur: float
     args: dict = field(default_factory=dict)
+    color: str | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "ph": "X",
             "name": self.name,
             "cat": self.cat,
@@ -96,6 +97,9 @@ class ChromeTraceEvent:
             "dur": self.dur,
             "args": self.args,
         }
+        if self.color:
+            d["color"] = self.color
+        return d
 
 
 class ChromeTraceExporter:
@@ -124,10 +128,15 @@ class ChromeTraceExporter:
     def _thread_name_meta(pid: int, tid: int, name: str) -> dict:
         return {"ph": "M", "pid": pid, "tid": tid, "ts": 0, "name": "thread_name", "args": {"name": name}}
 
+    @staticmethod
+    def _sort_index_meta(pid: int, sort_index: int) -> dict:
+        return {"ph": "M", "pid": pid, "ts": 0, "name": "sort_index", "args": {"sort_index": sort_index}}
+
     def _grid_meta_events(self, pp: int) -> list[dict]:
         meta: list[dict] = []
         for s in range(pp):
             meta.append(self._process_name_meta(s, f"Stage {s}"))
+            meta.append(self._sort_index_meta(s, -s))
             meta.append(self._thread_name_meta(s, 0, "Grid Schedule"))
         return meta
 
@@ -135,6 +144,7 @@ class ChromeTraceExporter:
         meta: list[dict] = []
         for s in range(pp):
             meta.append(self._process_name_meta(s, f"Stage {s}"))
+            meta.append(self._sort_index_meta(s, -s))
             meta.append(self._thread_name_meta(s, 0, "Compute Ops"))
             meta.append(self._thread_name_meta(s, 1, "Comm Ops"))
         return meta
@@ -143,6 +153,7 @@ class ChromeTraceExporter:
         meta: list[dict] = []
         for s in range(pp):
             meta.append(self._process_name_meta(s, f"Stage {s}"))
+            meta.append(self._sort_index_meta(s, -s))
             meta.append(self._thread_name_meta(s, 0, "Grid Schedule"))
             meta.append(self._thread_name_meta(s, 2, "Compute Ops"))
             meta.append(self._thread_name_meta(s, 3, "Comm Ops"))
@@ -175,6 +186,10 @@ class ChromeTraceExporter:
 
     # ── public API ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _actual_n_stages(result: "PPStitchedTimeline") -> int:
+        return max((t.stage_id for t in result.tasks), default=result.pp) + 1 if result.tasks else result.pp
+
     def export_stitched(
         self, result: "PPStitchedTimeline", path: str | None = None,
     ) -> str:
@@ -188,11 +203,13 @@ class ChromeTraceExporter:
         "Grid Schedule".
         """
         events: list[dict] = []
-        events.extend(self._grid_meta_events(result.pp))
+        n_stages = self._actual_n_stages(result)
+        events.extend(self._grid_meta_events(n_stages))
 
         for task in result.tasks:
             cat = self._grid_cat(task)
             name = self._name_for_task(task)
+            color_val = self._color_for_task(task)
             events.append(ChromeTraceEvent(
                 name=name,
                 cat=cat,
@@ -200,6 +217,7 @@ class ChromeTraceExporter:
                 tid=0,
                 ts=task.start_us * self._mult,
                 dur=max(task.latency_us, self._MIN_VISIBLE_US) * self._mult,
+                color=color_val,
                 args={
                     "phase": task.phase,
                     "mb": task.mb_id,
@@ -209,7 +227,7 @@ class ChromeTraceExporter:
             ).to_dict())
 
         if result.warmup_us > 0:
-            for s in range(result.pp):
+            for s in range(n_stages):
                 events.append(self._instant(
                     name=_NAMES.get("warmup", "warmup"),
                     pid=s, tid=0,
@@ -218,7 +236,7 @@ class ChromeTraceExporter:
                 ))
         if result.cooldown_us > 0:
             cooldown_ts = (result.step_time_us - result.cooldown_us) * self._mult
-            for s in range(result.pp):
+            for s in range(n_stages):
                 events.append(self._instant(
                     name=_NAMES.get("cooldown", "cooldown"),
                     pid=s, tid=0,
@@ -325,7 +343,7 @@ class ChromeTraceExporter:
     ) -> str:
         """Combined export: PP grid + per-stage op detail shared on same pids.
 
-        pid = stage_id (0 .. pp-1).
+        pid = stage_id (0 .. pp-1 or eff_pp-1 for virtual-stage schedules).
 
         Within each stage:
           tid 0 = "Grid Schedule"   — grid-level FWD/BWD blocks, coloured by mb
@@ -335,9 +353,9 @@ class ChromeTraceExporter:
         Grid task categories use ``mb_{mb}`` so the same
         microbatch index gets the same colour across all stages.
         """
-        pp = stitched.pp
+        n_stages = self._actual_n_stages(stitched)
         events: list[dict] = []
-        events.extend(self._combined_meta_events(pp))
+        events.extend(self._combined_meta_events(n_stages))
 
         for task in stitched.tasks:
             events.append(ChromeTraceEvent(
@@ -347,6 +365,7 @@ class ChromeTraceExporter:
                 tid=0,
                 ts=task.start_us * self._mult,
                 dur=max(task.latency_us, self._MIN_VISIBLE_US) * self._mult,
+                color=self._color_for_task(task),
                 args={
                     "phase": task.phase,
                     "mb": task.mb_id,
@@ -390,7 +409,8 @@ class ChromeTraceExporter:
     ) -> str:
         """Stitched grid with per-stage detail on separate tids (same pid).
 
-        pid = stage_id.  Within each stage:
+        pid = stage_id (0 .. pp-1 or eff_pp-1 for virtual-stage schedules).
+        Within each stage:
           tid 0              = grid-level fwd/bwd blocks, coloured by mb
           tid 2 + stream_id  = per-op detail from DAGScheduler Timeline
 
@@ -398,9 +418,9 @@ class ChromeTraceExporter:
         by time offsets from the pipeline schedule, naturally serialised on
         their physical stream.
         """
-        pp = stitched.pp
+        n_stages = self._actual_n_stages(stitched)
         events: list[dict] = []
-        events.extend(self._combined_meta_events(pp))
+        events.extend(self._combined_meta_events(n_stages))
 
         grid_index: dict[tuple[int, int, str], float] = {}
         for task in stitched.tasks:
@@ -415,6 +435,7 @@ class ChromeTraceExporter:
                 tid=0,
                 ts=task.start_us * self._mult,
                 dur=max(task.latency_us, self._MIN_VISIBLE_US) * self._mult,
+                color=self._color_for_task(task),
                 args={"phase": task.phase, "mb": task.mb_id, "view": "grid"},
             ).to_dict())
 
@@ -467,13 +488,20 @@ class ChromeTraceExporter:
 
     @staticmethod
     def _grid_cat(task) -> str:
-        return f"mb_{task.mb_id}"
+        if task.phase == "fwd":
+            return "fwd"
+        return "bwd"
 
     @staticmethod
     def _name_for_task(task) -> str:
-        arrow = "▼" if task.phase in ("fwd",) else "▲"
-        kind = task.phase.upper() if task.phase else "?"
-        return f"{arrow} {kind} s{task.stage_id} m{task.mb_id}"
+        prefix = "F" if task.phase == "fwd" else "B"
+        return f"{prefix} {task.mb_id}"
+
+    @staticmethod
+    def _color_for_task(task) -> str:
+        if task.phase == "fwd":
+            return _FWD_COLOR
+        return _BWD_COLOR
 
     @staticmethod
     def _instant(name: str, pid: int, tid: int, ts: float, args: dict) -> dict:

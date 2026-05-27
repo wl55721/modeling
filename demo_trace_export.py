@@ -18,6 +18,9 @@ import os
 from python.zrt.executor.scheduler import DAGScheduler, Timeline, ScheduledOp
 from python.zrt.executor.pp_stitcher import PPStitcher, PPStitchedTimeline, GridTask
 from python.zrt.executor.chrome_trace import ChromeTraceExporter
+from zrt.pipeline import run_trace_phases
+from zrt.transform.analysis import estimate_training_from_graphs
+import python.zrt.hardware.registry as hw_registry
 
 
 def _build_mock_timelines(pp: int = 4) -> list[Timeline]:
@@ -173,5 +176,67 @@ def _sample(events: list[dict], n: int = 3):
 
 
 if __name__ == "__main__":
-    demo_trace_export()
-    print("\nDone. Open chrome://tracing and load any demo_trace/*.json file.")
+    # Step 1: 抓训练图
+    result = run_trace_phases(
+        model_id="hf_models/deepseek_v4",
+        num_layers=4,
+        phases=("train_forward", "train_backward"),
+    )
+
+    # Step 2: 训练建模（复用已抓的 OpGraph，无需重抓）
+    hw = hw_registry.load("nvidia_h100_sxm")
+    report = estimate_training_from_graphs(
+        forward_graph=result.graphs["train_forward"],
+        backward_graph=result.graphs["train_backward"],
+        hw_spec=hw,
+        tp=8, pp=4, dp=2,
+        total_params=671e9,
+        num_layers_full=61,
+        output_dir="output/deepseek_v4/1f1b",
+        pp_schedule="1f1b",
+        vpp_chunks=1
+    )
+    print("1f1b")
+    print(report.summary())
+
+    report = estimate_training_from_graphs(
+        forward_graph=result.graphs["train_forward"],
+        backward_graph=result.graphs["train_backward"],
+        hw_spec=hw,
+        tp=8, pp=4, dp=2,
+        total_params=671e9,
+        num_layers_full=61,
+        output_dir="output/deepseek_v4/interleaved",
+        pp_schedule="interleaved",
+        vpp_chunks=1
+    )
+    print("interleaved")
+    print(report.summary())
+
+    report = estimate_training_from_graphs(
+        forward_graph=result.graphs["train_forward"],
+        backward_graph=result.graphs["train_backward"],
+        hw_spec=hw,
+        tp=8, pp=4, dp=2,
+        total_params=671e9,
+        num_layers_full=61,
+        output_dir="output/deepseek_v4/dualpipe",
+        pp_schedule="dualpipe",
+        vpp_chunks=1
+    )
+    print("dualpipe")
+    print(report.summary())
+
+    report = estimate_training_from_graphs(
+        forward_graph=result.graphs["train_forward"],
+        backward_graph=result.graphs["train_backward"],
+        hw_spec=hw,
+        tp=8, pp=4, dp=2,
+        total_params=671e9,
+        num_layers_full=61,
+        output_dir="output/deepseek_v4/dualpipev",
+        pp_schedule="dualpipev",
+        vpp_chunks=2
+    )
+    print("dualpipeV")
+    print(report.summary())
