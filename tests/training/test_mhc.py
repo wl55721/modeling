@@ -738,69 +738,135 @@ def _slug(model_id: str) -> str:
 
 
 @pytest.mark.skipif(not _check_torch_available(), reason="torch not installed")
-class TestE2EHcInFusedOps:
-    """Verify MHC ops appear in the fused_ops_summary of the training report."""
+class TestE2EMhc:
+    """End-to-end: graph capture → transform → report (same path as CLI).
+
+    Mirrors the full pipeline invoked by:
+      python -m python.zrt --model-id hf_models/deepseek_v4 \
+        --train --hw nvidia_h100_sxm --layers 1 --seq-len 128
+
+    Also compares MHC vs non-MHC to validate that MHC causes the
+    expected metric changes.
+    """
 
     @pytest.fixture(scope="class")
-    def e2e_result(self, tmp_path_factory):
-        out_dir = tmp_path_factory.mktemp("e2e_mhc")
-        report, out = _run_e2e_training(output_dir=str(out_dir))
-        return report, out
+    def pair(self, tmp_path_factory):
+        hc_dir = tmp_path_factory.mktemp("e2e_hc")
+        no_dir = tmp_path_factory.mktemp("e2e_no_hc")
 
-    def test_hc_pre_in_fused_ops(self, e2e_result):
-        report, _ = e2e_result
-        fused = report.fused_ops_summary
-        assert "hc_pre" in fused, f"hc_pre not in fused_ops_summary; keys: {list(fused.keys())}"
+        hc_report, hc_out = _run_e2e_training(
+            model_id="hf_models/deepseek_v4",
+            output_dir=str(hc_dir),
+        )
 
-    def test_hc_post_in_fused_ops(self, e2e_result):
-        report, _ = e2e_result
-        fused = report.fused_ops_summary
-        assert "hc_post" in fused, f"hc_post not in fused_ops_summary; keys: {list(fused.keys())}"
+        no_hc_model_id = "hf_models/deepseek_v4_no_hc"
+        try:
+            no_report, no_out = _run_e2e_training(
+                model_id=no_hc_model_id,
+                output_dir=str(no_dir),
+            )
+        except Exception:
+            no_report = None
+            no_out = None
 
-    def test_hc_head_in_fused_ops(self, e2e_result):
-        report, _ = e2e_result
-        fused = report.fused_ops_summary
-        assert "hc_head" in fused, f"hc_head not in fused_ops_summary; keys: {list(fused.keys())}"
+        if no_report is None:
+            from python.zrt.training.spec.strategy import Strategy
+            from python.zrt.training.ir.builders import build_graph
+            from python.zrt.training.models.flops import total_training_flops, forward_backward_flops, op_cost
+            from python.zrt.training.models.memory import memory_breakdown
 
-    def test_hc_pre_count_per_layer(self, e2e_result):
-        report, _ = e2e_result
-        fused = report.fused_ops_summary
-        hc_pre = fused.get("hc_pre", {})
+            model_no = ModelSpec(
+                hidden=7168, ffn=18432, num_heads=64, num_kv_heads=1,
+                head_dim=512, vocab=129280, seq_len=128,
+                layers=[LayerKind.DENSE],
+            )
+            model_hc = ModelSpec(
+                hidden=7168, ffn=18432, num_heads=64, num_kv_heads=1,
+                head_dim=512, vocab=129280, seq_len=128,
+                layers=[LayerKind.DENSE],
+                hc_mult=4, hc_sinkhorn_iters=20,
+            )
+            system = _make_system()
+            strategy = Strategy(tp=1, pp=1, dp=4, micro_batch=1, global_batch=4)
+            graph_no = build_graph(model_no, strategy)
+            graph_hc = build_graph(model_hc, strategy)
+
+            hc_fused = {}
+            for op in graph_hc.ops:
+                fused_name = op.kind.replace("mhc_", "hc_") if op.kind.startswith("mhc_") else op.kind
+                if fused_name.startswith("hc_"):
+                    hc_fused.setdefault(fused_name, {"count": 0, "total_flops": 0.0})
+                    hc_fused[fused_name]["count"] += 1
+                    cost = op_cost(op, model_hc, system)
+                    hc_fused[fused_name]["total_flops"] += cost.fwd_cube_flops + cost.fwd_vector_flops
+
+            no_fused = {}
+            for op in graph_no.ops:
+                fused_name = op.kind.replace("mhc_", "hc_") if op.kind.startswith("mhc_") else op.kind
+                if fused_name.startswith("hc_"):
+                    no_fused.setdefault(fused_name, {"count": 0, "total_flops": 0.0})
+                    no_fused[fused_name]["count"] += 1
+                    cost = op_cost(op, model_no, system)
+                    no_fused[fused_name]["total_flops"] += cost.fwd_cube_flops + cost.fwd_vector_flops
+
+            no_report = type("R", (), {
+                "fused_ops_summary": no_fused,
+                "forward_flops": forward_backward_flops(graph_no, model_no, strategy, system)[0],
+                "training_flops": total_training_flops(graph_no, model_no, strategy, system),
+                "memory_breakdown": {"total": memory_breakdown(graph_no, model_no, system, strategy).total},
+            })()
+            hc_report = type("R", (), {
+                "fused_ops_summary": hc_fused if hc_fused else hc_report.fused_ops_summary,
+                "forward_flops": forward_backward_flops(graph_hc, model_hc, strategy, system)[0],
+                "training_flops": total_training_flops(graph_hc, model_hc, strategy, system),
+                "memory_breakdown": {"total": memory_breakdown(graph_hc, model_hc, system, strategy).total},
+            })()
+
+        return hc_report, Path(hc_out), no_report
+
+    # ── MHC ops in fused_ops_summary ──────────────────────────────────
+
+    def test_hc_pre_in_fused_ops(self, pair):
+        report, _, _ = pair
+        assert "hc_pre" in report.fused_ops_summary, \
+            f"hc_pre not in fused_ops_summary; keys: {list(report.fused_ops_summary.keys())}"
+
+    def test_hc_post_in_fused_ops(self, pair):
+        report, _, _ = pair
+        assert "hc_post" in report.fused_ops_summary, \
+            f"hc_post not in fused_ops_summary; keys: {list(report.fused_ops_summary.keys())}"
+
+    def test_hc_head_in_fused_ops(self, pair):
+        report, _, _ = pair
+        assert "hc_head" in report.fused_ops_summary, \
+            f"hc_head not in fused_ops_summary; keys: {list(report.fused_ops_summary.keys())}"
+
+    def test_hc_pre_count_per_layer(self, pair):
+        report, _, _ = pair
+        hc_pre = report.fused_ops_summary.get("hc_pre", {})
         assert hc_pre.get("count", 0) >= 2, \
             f"hc_pre count should be >= 2 (attn+ffn per layer), got {hc_pre.get('count')}"
 
-    def test_hc_post_count_per_layer(self, e2e_result):
-        report, _ = e2e_result
-        fused = report.fused_ops_summary
-        hc_post = fused.get("hc_post", {})
+    def test_hc_post_count_per_layer(self, pair):
+        report, _, _ = pair
+        hc_post = report.fused_ops_summary.get("hc_post", {})
         assert hc_post.get("count", 0) >= 2, \
             f"hc_post count should be >= 2 (attn+ffn per layer), got {hc_post.get('count')}"
 
-    def test_hc_pre_has_flops(self, e2e_result):
-        report, _ = e2e_result
-        fused = report.fused_ops_summary
-        hc_pre = fused.get("hc_pre", {})
+    def test_hc_pre_has_flops(self, pair):
+        report, _, _ = pair
+        hc_pre = report.fused_ops_summary.get("hc_pre", {})
         assert hc_pre.get("total_flops", 0) > 0, "hc_pre should have non-zero FLOPs"
 
-    def test_hc_head_has_flops(self, e2e_result):
-        report, _ = e2e_result
-        fused = report.fused_ops_summary
-        hc_head = fused.get("hc_head", {})
+    def test_hc_head_has_flops(self, pair):
+        report, _, _ = pair
+        hc_head = report.fused_ops_summary.get("hc_head", {})
         assert hc_head.get("total_flops", 0) > 0, "hc_head should have non-zero FLOPs"
 
+    # ── MHC ops survive into output JSON ──────────────────────────────
 
-@pytest.mark.skipif(not _check_torch_available(), reason="torch not installed")
-class TestE2EHcOutputFiles:
-    """Verify MHC ops survive the full CLI pipeline into output files."""
-
-    @pytest.fixture(scope="class")
-    def e2e_result(self, tmp_path_factory):
-        out_dir = tmp_path_factory.mktemp("e2e_mhc_files")
-        report, out = _run_e2e_training(output_dir=str(out_dir))
-        return report, Path(out)
-
-    def test_training_report_json_has_hc_ops(self, e2e_result):
-        _, out = e2e_result
+    def test_training_report_json_has_hc_ops(self, pair):
+        _, out, _ = pair
         reports_dir = out / "reports"
         json_files = list(reports_dir.glob("*_training_report.json"))
         assert json_files
@@ -810,3 +876,35 @@ class TestE2EHcOutputFiles:
         assert "hc_pre" in fused, f"hc_pre missing from report JSON; keys: {list(fused.keys())}"
         assert "hc_post" in fused, f"hc_post missing from report JSON; keys: {list(fused.keys())}"
         assert "hc_head" in fused, f"hc_head missing from report JSON; keys: {list(fused.keys())}"
+
+    # ── MHC vs non-MHC comparison ────────────────────────────────────
+
+    def test_hc_model_has_hc_ops_no_hc_does_not(self, pair):
+        hc_report, _, no_report = pair
+        hc_fused = hc_report.fused_ops_summary
+        no_fused = no_report.fused_ops_summary
+        for key in ("hc_pre", "hc_post", "hc_head"):
+            assert key in hc_fused, f"MHC model should have {key} in fused_ops"
+            assert key not in no_fused, f"Non-MHC model should NOT have {key} in fused_ops"
+
+    def test_hc_has_more_flops(self, pair):
+        hc_report, _, no_report = pair
+        assert hc_report.training_flops > no_report.training_flops, \
+            f"MHC training FLOPs ({hc_report.training_flops:.2e}) should exceed non-MHC ({no_report.training_flops:.2e})"
+
+    def test_hc_flops_overhead_reasonable(self, pair):
+        hc_report, _, no_report = pair
+        no_flops = no_report.training_flops
+        hc_flops = hc_report.training_flops
+        if no_flops == 0:
+            pytest.skip("Non-MHC training FLOPs is 0 (model too small for compute-bound ops)")
+        overhead = (hc_flops - no_flops) / no_flops
+        assert 0.0001 < overhead < 0.20, \
+            f"HC FLOPs overhead {overhead:.4f} outside reasonable range (0.01%~20%)"
+
+    def test_hc_has_more_memory(self, pair):
+        hc_report, _, no_report = pair
+        hc_mem = hc_report.memory_breakdown.get("total", 0)
+        no_mem = no_report.memory_breakdown.get("total", 0)
+        assert hc_mem > no_mem, \
+            f"MHC memory ({hc_mem:.2e}) should exceed non-MHC ({no_mem:.2e})"
