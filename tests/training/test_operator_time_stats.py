@@ -50,6 +50,28 @@ def test_operator_time_stats_splits_matmul_family_without_total_or_lm_head_bucke
     assert by_label["MoE/FFN matmul family"]["op_count"] == 1
 
 
+def test_operator_time_stats_counts_compressor_and_indexer_matmuls_as_attention():
+    rows = build_operator_time_stats(
+        model=_base_model(),
+        report=TrainingReport(step_time_ms=100.0, compute_time_ms=60.0),
+        op_dicts=[
+            {"name": "L0.comp_wkv", "kind": "matmul", "component": "routed_expert", "total_ms": 3.0},
+            {"name": "L0.comp_wgate", "kind": "matmul", "component": "routed_expert", "total_ms": 4.0},
+            {"name": "L0.idx_wq_b", "kind": "matmul", "component": "routed_expert", "total_ms": 5.0},
+            {"name": "L0.idx_weights", "kind": "matmul", "component": "routed_expert", "total_ms": 6.0},
+            {"name": "L0.idx_comp_wkv", "kind": "matmul", "component": "routed_expert", "total_ms": 7.0},
+            {"name": "L0.idx_comp_wgate", "kind": "matmul", "component": "routed_expert", "total_ms": 8.0},
+            {"name": "L0.routed_expert_ffn", "kind": "matmul", "component": "routed_expert", "total_ms": 9.0},
+        ],
+    )
+
+    by_label = _by_label(rows)
+    assert by_label["Attention matmul family"]["time_ms"] == 33.0
+    assert by_label["Attention matmul family"]["op_count"] == 6
+    assert by_label["MoE/FFN matmul family"]["time_ms"] == 9.0
+    assert by_label["MoE/FFN matmul family"]["op_count"] == 1
+
+
 def test_operator_time_stats_uses_compute_time_for_schedule_aware_step_scale():
     rows = build_operator_time_stats(
         model=_base_model(),

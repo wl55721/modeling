@@ -75,37 +75,49 @@ def _is_matmul_op(op: dict) -> bool:
     return str(op.get("kind", "") or "").lower() == "matmul"
 
 
+def _has_any_name_marker(op: dict, markers: tuple[str, ...]) -> bool:
+    name = str(op.get("name", "") or "").lower()
+    return any(marker in name for marker in markers)
+
+
+_ATTENTION_MATMUL_NAME_MARKERS = (
+    "qkv",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj",
+    "kv_b_proj",
+    "wq",
+    "wk",
+    "wv",
+    "wkv",
+    "o_proj",
+    "wo_a",
+    "wo_b",
+    "comp_wkv",
+    "comp_wgate",
+    "idx_wq_b",
+    "idx_weights",
+    "idx_comp_wkv",
+    "idx_comp_wgate",
+)
+
+
 def _is_attention_matmul_op(op: dict) -> bool:
     if not _is_matmul_op(op):
         return False
     if _is_attention_op(op):
         return True
 
-    name = str(op.get("name", "") or "").lower()
-    attention_name_markers = (
-        "qkv",
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "q_a_proj",
-        "q_b_proj",
-        "kv_a_proj",
-        "kv_b_proj",
-        "wq",
-        "wk",
-        "wv",
-        "wkv",
-        "o_proj",
-        "wo_a",
-        "wo_b",
-        "comp_wkv",
-        "idx_wq_b",
-    )
-    return any(marker in name for marker in attention_name_markers)
+    return _has_any_name_marker(op, _ATTENTION_MATMUL_NAME_MARKERS)
 
 
 def _is_ffn_matmul_op(op: dict) -> bool:
     if not _is_matmul_op(op):
+        return False
+    if _is_attention_matmul_op(op):
         return False
 
     component = str(op.get("component", "") or "").lower()
