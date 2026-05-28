@@ -816,7 +816,7 @@ class TrainingPipelinePass(GraphPass):
                 else:
                     tl = sched.schedule(g)
                     stage_timelines[0] = tl
-            _fwd = tl.phase_latency("fwd")
+                    _fwd = tl.phase_latency("fwd")
                     _bwd = tl.phase_latency("bwd")
                     fwd = _fwd if isinstance(_fwd, (int, float)) else 0.0
                     bwd = _bwd if isinstance(_bwd, (int, float)) else 0.0
