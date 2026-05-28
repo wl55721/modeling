@@ -162,6 +162,8 @@ def _add_cross_stage_p2p(
     p2p_fwd_us: dict[tuple[int, int], float] | None = None,
     p2p_bwd_us: dict[tuple[int, int], float] | None = None,
     virtual_stages: list[int] | None = None,
+    *,
+    _phys_device_count: int | None = None,
 ) -> None:
     """Edge ②: inter-stage P2P links.
 
@@ -173,22 +175,38 @@ def _add_cross_stage_p2p(
     the sender finishes.  When per-edge dicts (``p2p_fwd_us``,
     ``p2p_bwd_us``) are provided they take precedence; otherwise
     ``default_p2p_us`` is used for every edge.
+
+    The per-edge dicts are keyed by **physical device** pair
+    ``(phys_src, phys_dst)``.  When ``pp`` differs from
+    ``_phys_device_count`` (VPP / interleaved), the loop index ``s``
+    is a virtual-stage index and is mapped to a physical device
+    before lookup.  Intra-device virtual-stage boundaries have
+    zero P2P latency.
     """
     _fwd = p2p_fwd_us or {}
     _bwd = p2p_bwd_us or {}
+    phys_pp = _phys_device_count if _phys_device_count is not None else pp
+
+    def _phys_dev(vstage: int) -> int:
+        return vstage % phys_pp
+
     for m in range(M):
         for s in range(pp - 1):
             fwd_src = _task_id(s, m, "fwd")
             fwd_dst = _task_id(s + 1, m, "fwd")
             if fwd_src in tasks and fwd_dst in tasks:
-                p2p = _fwd.get((s, s + 1), default_p2p_us)
+                phys_s = _phys_dev(s)
+                phys_d = _phys_dev(s + 1)
+                p2p = _fwd.get((phys_s, phys_d), default_p2p_us) if phys_s != phys_d else 0.0
                 tasks[fwd_dst].dependencies.append(fwd_src)
                 tasks[fwd_dst].delayed_deps[fwd_src] = p2p
 
             bwd_src = _task_id(s + 1, m, "bwd")
             bwd_dst = _task_id(s, m, "bwd")
             if bwd_src in tasks and bwd_dst in tasks:
-                p2p = _bwd.get((s + 1, s), default_p2p_us)
+                phys_s = _phys_dev(s + 1)
+                phys_d = _phys_dev(s)
+                p2p = _bwd.get((phys_s, phys_d), default_p2p_us) if phys_s != phys_d else 0.0
                 tasks[bwd_dst].dependencies.append(bwd_src)
                 tasks[bwd_dst].delayed_deps[bwd_src] = p2p
 
@@ -529,6 +547,7 @@ class PPStitcher:
         _add_cross_stage_p2p(
             task_map, eff_pp, self._M,
             self._p2p_us, self._p2p_fwd, self._p2p_bwd,
+            _phys_device_count=self._pp,
         )
 
         self._add_device_serial(task_map, kind, eff_pp)
@@ -707,6 +726,12 @@ class PPStitcher:
         min_start = min(t.start_us for t in scheduled)
         step_us = max_end - min_start
 
+        # Total P2P gap: sum of all delayed_deps on cross-stage edges.
+        p2p_gap_us = sum(
+            sum(t.delayed_deps.values())
+            for t in scheduled
+        )
+
         per_stage = max(
             self._stage_fwd.get(s, 0.0) + self._stage_bwd.get(s, 0.0)
             for s in range(self._pp)
@@ -753,7 +778,7 @@ class PPStitcher:
             cooldown_us=cooldown_us,
             bubble_us=bubble_us,
             bubble_fraction=bubble_us / (max_end - min_start) if max_end > min_start else 0.0,
-            p2p_overhead_us=0.0,
+            p2p_overhead_us=p2p_gap_us,
         )
 
     # ── helpers ───────────────────────────────────────────────────────────

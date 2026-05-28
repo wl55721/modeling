@@ -263,12 +263,14 @@ s1 m2 fwd ──→ s1 m2 bwd
   s3 m0 bwd ──→ s2 m0 bwd ──→ s1 m0 bwd ──→ s0 m0 bwd
 ```
 
-P2P 传输延迟建模：加到接收方 task 的 `latency_us` 上。
+P2P 传输延迟作为 **delayed_deps 间隙** 建模：接收方 task 的 `latency_us` **不包含** P2P 部分，而是通过依赖边上的 start-time gap 表达——接收方 task 的 `start_us` 必须在发送方 `end_us + p2p_latency_us` 之后。
 
 ```
-s1 m0 fwd.latency = stage_fwd[1] + p2p_latency_us   ← 等待 s0 的激活
-s2 m0 fwd.latency = stage_fwd[2] + p2p_latency_us
+s1 m0 fwd.start ≥ s0 m0 fwd.end + p2p_fwd_us[0→1]   ← 等待 s0 的激活
+s2 m0 fwd.start ≥ s1 m0 fwd.end + p2p_fwd_us[1→2]
 ```
+
+P2P 延迟来自 `_extract_p2p_latency_per_edge()`，按 `(src_stage, dst_stage, phase)` 从图中 `comm.send_recv` 节点的实际 `latency_us`（`CommLatencyPass：msg_bytes / BW + link_latency`）提取瓶颈值。对于 VPP，虚拟 stage 映射到物理 device 后查找对应边界的 P2P 延迟。
 
 ### 边③：设备串行化 (1F1B)
 

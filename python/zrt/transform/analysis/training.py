@@ -925,17 +925,20 @@ class TrainingPipelinePass(GraphPass):
         ) * M
         hidden_us = max(0.0, total_comm_us - total_exposed_us)
 
-        if hidden_us > 0:
-            step_time_us -= hidden_us
-            step_time_ms = step_time_us / 1000.0
-
-        # PP intra-stage send_recv↔compute overlap is already absorbed by
-        # DAGScheduler wall-clock (stage_fwd/stage_bwd) and PPStitcher
-        # delayed_deps.  Undo the PP portion from step_time subtraction —
-        # the overlap benefit was priced in before we ever computed hidden_us.
-        if pp_mode == "trace":
-            step_time_us += per_strat.pp_hidden_us * M
-            step_time_ms = step_time_us / 1000.0
+        # In trace mode PPStitcher already produces the correct wall-clock
+        # time — DAGScheduler multi-stream scheduling absorbed intra-stage
+        # compute↔comm overlap into stage_fwd / stage_bwd, and PPStitcher
+        # delayed_deps correctly model cross-stage P2P gaps.  The trace
+        # sweep-line hidden_us is informational (for the report) and must
+        # NOT be subtracted from step_time.
+        #
+        # In formula mode the bottleneck-based composers do not model
+        # per-stream parallelism, so formula-based hidden still needs to
+        # be subtracted.
+        if pp_mode != "trace":
+            if hidden_us > 0:
+                step_time_us -= hidden_us
+                step_time_ms = step_time_us / 1000.0
 
         exposed_comm_ms = total_exposed_us / 1000.0
         hidden_comm_ms = hidden_us / 1000.0
