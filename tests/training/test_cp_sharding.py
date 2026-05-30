@@ -92,6 +92,16 @@ class TestUlyssesCPSharding:
                 f"{op.name}: expected heads={expected_heads}, got {op.meta.get('heads')}"
             )
 
+    def test_ulysses_attn_kv_heads_divided(self):
+        """Ulysses-CP shards K/V heads when available, with replication below one head."""
+        attn_ops, model, strategy = _attn_ops(CPKind.ULYSSES)
+        expected_kv_heads = max(1, (model.num_kv_heads // strategy.tp) // strategy.cp)
+        for op in attn_ops:
+            assert op.meta.get("kv_heads") == expected_kv_heads, (
+                f"{op.name}: expected kv_heads={expected_kv_heads}, "
+                f"got {op.meta.get('kv_heads')}"
+            )
+
     def test_ulysses_heads_not_gathered(self):
         """Debug marker records that heads are scattered, not gathered."""
         attn_ops, model, strategy = _attn_ops(CPKind.ULYSSES)
@@ -99,6 +109,12 @@ class TestUlyssesCPSharding:
             assert op.meta.get("heads_gathered_by_cp") is False, (
                 f"{op.name}: heads_gathered_by_cp should be False"
             )
+
+    def test_ulysses_does_not_set_ring_tiles(self):
+        """Ulysses uses head sharding rather than Ring-style repeated tiles."""
+        attn_ops, _, _ = _attn_ops(CPKind.ULYSSES)
+        for op in attn_ops:
+            assert "cp_tiles" not in op.meta
 
     def test_first_attn_core_metadata(self):
         """Spot-check the first attn_core op for expected metadata values."""
@@ -149,6 +165,16 @@ class TestRingCPSharding:
         for op in attn_ops:
             assert op.meta.get("heads") == expected_heads, (
                 f"{op.name}: expected heads={expected_heads}, got {op.meta.get('heads')}"
+            )
+
+    def test_ring_attn_kv_heads_only_tp_sharded(self):
+        """Ring-CP streams sequence tiles and does not shard K/V heads by CP."""
+        attn_ops, model, strategy = _attn_ops(CPKind.RING)
+        expected_kv_heads = max(1, model.num_kv_heads // strategy.tp)
+        for op in attn_ops:
+            assert op.meta.get("kv_heads") == expected_kv_heads, (
+                f"{op.name}: expected kv_heads={expected_kv_heads}, "
+                f"got {op.meta.get('kv_heads')}"
             )
 
 

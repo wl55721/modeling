@@ -150,8 +150,25 @@ def test_attn_core_meta():
     assert attn.kind == "attn_core"
     assert attn.meta["s"] == 2048
     assert attn.meta["heads"] == 32
+    assert attn.meta["kv_heads"] == 8
     assert attn.meta["head_dim"] == 128
     assert attn.meta["causal"] is True
+
+
+def test_v4_attn_meta_carries_single_kv_head():
+    """V4 MQA cost modeling needs the shared KV-head count in attention metadata."""
+    model = ModelSpec(
+        hidden=128, ffn=256, num_heads=8, num_kv_heads=1,
+        head_dim=16, vocab=1000, seq_len=256,
+        layers=[LayerKind.DENSE],
+        q_lora_rank=32, qk_rope_head_dim=4,
+        o_lora_rank=16, o_groups=4,
+        compress_ratios=[0], swa_window=64,
+    )
+    graph = build_graph(model, Strategy())
+    attn = next(op for op in graph.ops if op.kind == "swa_attn")
+
+    assert attn.meta["kv_heads"] == 1
 
 
 def test_tp_ag_rs_phase_both():
