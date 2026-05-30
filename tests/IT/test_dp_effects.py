@@ -10,6 +10,7 @@ relationships:
 - dp_hidden_ms and dp_exposed_ms are zero for dp=1, non-zero for dp>1
 - dp_comm_total (dp_hidden + dp_exposed) increases monotonically with dp
 - optimizer state scales approximately as 1/dp across dp=4 and dp=8
+- DP communication hiding invariants (dp_total = dp_hidden + dp_exposed, etc.)
 
 This is a long-running integration test that captures real reports. To avoid
 running it by default in fast CI, it is skipped unless the environment
@@ -63,21 +64,23 @@ def _run_cli_and_load_report(repo_root: Path, outdir: Path, dp: int, timeout: in
         sys.executable,
         "-m",
         "python.zrt",
-        "--model-id",
-        "hf_models/deepseek_v4",
+        "--model-id", "hf_models/deepseek_v4",
         "--train",
-        "--hw",
-        "nvidia_h100_sxm",
-        "--dp",
-        str(dp),
-        "--layers",
-        "4",
-        "--batch-size",
-        "1",
-        "--seq-len",
-        "128",
-        "--output-dir",
-        str(outdir),
+        "--hw", "nvidia_h100_sxm",
+        "--hidden", "7168",
+        "--layers", "4",
+        "--seq-len", "128",
+        "--global-batch", "64",
+        "--micro-batch", "8",
+        "--dp", str(dp),
+        "--pp", "4",
+        "--tp", "1",
+        "--pp-schedule", "1f1b",
+        "--pp-mode", "trace",
+        "--recompute-policy", "full",
+        "--optimizer", "adam",
+        "--zero-stage", "1",
+        "--output-dir", str(outdir),
     ]
 
     proc = subprocess.run(cmd, check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
@@ -262,6 +265,141 @@ def test_dp_comm_volume_monotonic(dp_reports):
     )
 
 
+# ── DP communication hiding ────────────────────────────────────────────────
+
+class TestDpCommHiding:
+    """DP gradient reduction hiding in pipeline bubble.
+
+    Core formula (schedules.py _dp_hidden / _dp_hide_window):
+
+        hide_window = cooldown + ratio * steady_bwd_total   (if dp_overlap_in_bubble)
+        max_hidable = dp_ar_time * (1 - 1/dp_grad_buckets)  (last bucket always exposed)
+        dp_hidden   = min(hide_window, max_hidable)
+        dp_exposed  = dp_ar_time - dp_hidden
+
+    After augmentation, dp_hidden is recalculated as:
+        dp_hidden = max(0, dp_ar_time - dp_exposed)
+
+    Key invariants:
+      1. dp_total_ms = dp_hidden_ms + dp_exposed_ms
+      2. dp_hidden_ms <= bubble_time_ms (cannot hide more than bubble allows)
+      3. dp_exposed_ms >= dp_total_ms / dp_grad_buckets (last bucket residual)
+      4. step_time = pipeline_time + optimizer_time + optimizer_comm
+      5. pipeline_time = warmup + steady + cooldown + dp_exposed
+      6. dp_hidden is absorbed in bubble, does NOT add to step_time
+    """
+
+    def test_dp_total_equals_hidden_plus_exposed(self, dp_reports):
+        """dp_total_ms must equal dp_hidden_ms + dp_exposed_ms for all dp."""
+        for dp in (1, 4, 8):
+            rep = dp_reports[dp]
+            total = rep.get("dp_total_ms", 0.0)
+            hidden = rep.get("dp_hidden_ms", 0.0)
+            exposed = rep.get("dp_exposed_ms", 0.0)
+            assert total == pytest.approx(hidden + exposed, abs=1e-9), (
+                f"dp={dp}: dp_total({total}) != dp_hidden({hidden}) + dp_exposed({exposed})"
+            )
+
+    def test_dp_hidden_leq_bubble_time(self, dp_reports):
+        """dp_hidden cannot exceed the pipeline bubble time (warmup + cooldown)."""
+        for dp in (4, 8):
+            rep = dp_reports[dp]
+            dp_hidden = rep.get("dp_hidden_ms", 0.0)
+            bubble = rep.get("bubble_time_ms", 0.0)
+            assert dp_hidden <= bubble + 1e-6, (
+                f"dp={dp}: dp_hidden({dp_hidden:.4f}ms) > bubble_time({bubble:.4f}ms)"
+            )
+
+    def test_dp_exposed_ge_last_bucket_residual(self, dp_reports):
+        """The last gradient bucket's collective is always exposed.
+
+        dp_exposed >= dp_total / dp_grad_buckets (default buckets=25).
+        """
+        dp_grad_buckets = 25
+        for dp in (4, 8):
+            rep = dp_reports[dp]
+            total = rep.get("dp_total_ms", 0.0)
+            exposed = rep.get("dp_exposed_ms", 0.0)
+            min_exposed = total / dp_grad_buckets
+            assert exposed >= min_exposed - 1e-9, (
+                f"dp={dp}: dp_exposed({exposed:.6f}ms) < "
+                f"dp_total/buckets({min_exposed:.6f}ms)"
+            )
+
+    def test_step_time_equals_pipeline_plus_optimizer(self, dp_reports):
+        """step_time = pipeline_time + optimizer_time + optimizer_comm.
+
+        This is the fundamental step_time decomposition.
+        """
+        for dp in (1, 4, 8):
+            rep = dp_reports[dp]
+            step = rep["step_time_ms"]
+            pipeline = rep.get("pipeline_time_ms", 0.0)
+            opt_time = rep.get("optimizer_time_ms", 0.0)
+            opt_comm = rep.get("optimizer_comm_ms", 0.0)
+            assert step == pytest.approx(pipeline + opt_time + opt_comm, rel=1e-4), (
+                f"dp={dp}: step_time({step:.4f}) != "
+                f"pipeline({pipeline:.4f}) + opt({opt_time:.4f}) + opt_comm({opt_comm:.4f})"
+            )
+
+    def test_pipeline_time_equals_warmup_steady_cooldown_dp_exposed(self, dp_reports):
+        """pipeline_time = warmup + steady + cooldown + dp_exposed.
+
+        dp_hidden is absorbed in bubble and does NOT add to pipeline_time.
+        """
+        for dp in (1, 4, 8):
+            rep = dp_reports[dp]
+            pipeline = rep.get("pipeline_time_ms", 0.0)
+            warmup = rep.get("warmup_ms", 0.0)
+            steady = rep.get("steady_ms", 0.0)
+            cooldown = rep.get("cooldown_ms", 0.0)
+            dp_exposed = rep.get("dp_exposed_ms", 0.0)
+            reconstructed = warmup + steady + cooldown + dp_exposed
+            assert pipeline == pytest.approx(reconstructed, rel=1e-4), (
+                f"dp={dp}: pipeline_time({pipeline:.4f}) != "
+                f"warmup+steady+cooldown+dp_exposed({reconstructed:.4f})"
+            )
+
+    def test_dp_hidden_not_in_step_time(self, dp_reports):
+        """dp_hidden is absorbed in bubble and does NOT increase step_time.
+
+        If dp_hidden were fully exposed, step_time would be larger by dp_hidden.
+        Verify pipeline_time does NOT include dp_hidden as an extra term.
+        """
+        for dp in (4, 8):
+            rep = dp_reports[dp]
+            pipeline = rep.get("pipeline_time_ms", 0.0)
+            dp_hidden = rep.get("dp_hidden_ms", 0.0)
+            warmup = rep.get("warmup_ms", 0.0)
+            steady = rep.get("steady_ms", 0.0)
+            cooldown = rep.get("cooldown_ms", 0.0)
+            dp_exposed = rep.get("dp_exposed_ms", 0.0)
+            without_hidden = warmup + steady + cooldown + dp_exposed
+            with_hidden = without_hidden + dp_hidden
+            assert pipeline == pytest.approx(without_hidden, rel=1e-4), (
+                f"dp={dp}: pipeline_time matches warmup+steady+cooldown+dp_exposed, "
+                f"dp_hidden({dp_hidden:.4f}ms) is absorbed in bubble, not added"
+            )
+            if dp_hidden > 0:
+                assert pipeline < with_hidden, (
+                    f"dp={dp}: pipeline_time should be less than if dp_hidden were exposed"
+                )
+
+    def test_dp_hidden_positive_when_pp_gt1(self, dp_reports):
+        """With PP=4 and dp_overlap_in_bubble=True, dp_hidden should be > 0.
+
+        The pipeline bubble (warmup + cooldown) provides a window for DP
+        communication to hide. With PP=4 there is significant bubble time
+        and moderate comm volume that fits in the bubble.
+        """
+        for dp in (4, 8):
+            rep = dp_reports[dp]
+            dp_hidden = rep.get("dp_hidden_ms", 0.0)
+            assert dp_hidden > 0, (
+                f"dp={dp}: dp_hidden should be >0 with PP=4 bubble, got {dp_hidden}"
+            )
+
+
 # ── Excel: DP comm operator existence ──────────────────────────────────────
 
 class TestDpCommExistence:
@@ -393,3 +531,175 @@ class TestDpScaleOps:
             assert nid.startswith("grad_scale_layer_"), (
                 f"Unexpected scale node ID: {nid}"
             )
+
+
+# ── PP Trace: DP communication nodes ──────────────────────────────────────
+
+def _load_trace_events(trace_path: Path) -> list[dict]:
+    """Load Chrome Trace JSON and return only X-duration events."""
+    with open(trace_path) as f:
+        data = json.load(f)
+    return [
+        evt for evt in data.get("traceEvents", [])
+        if evt.get("ph") == "X"
+    ]
+
+
+def _filter_dp_comm_events(events: list[dict]) -> list[dict]:
+    """Return only DP gradient reduction (reduce_scatter / all_reduce) events."""
+    return [
+        evt for evt in events
+        if evt.get("args", {}).get("op_type", "") in (
+            "comm.reduce_scatter", "comm.all_reduce",
+        )
+    ]
+
+
+@pytest.fixture(scope="session")
+def dp_pp_trace(dp_reports):
+    """Session fixture: load pp_per_stage.json and pp_combined.json trace events."""
+    traces = {}
+    for dp in (1, 4):
+        out_dir = dp_reports[dp].out_dir
+        per_stage_path = out_dir / "pp_trace" / "pp_per_stage.json"
+        combined_path = out_dir / "pp_trace" / "pp_combined.json"
+        stitched_path = out_dir / "pp_trace" / "pp_stitched.json"
+        traces[dp] = {
+            "per_stage": _load_trace_events(per_stage_path) if per_stage_path.exists() else [],
+            "combined": _load_trace_events(combined_path) if combined_path.exists() else [],
+            "stitched": _load_trace_events(stitched_path) if stitched_path.exists() else [],
+        }
+    return traces
+
+
+class TestPpTraceDpCommExistence:
+    """DP communication nodes in PP trace output.
+
+    Trace events are replicated per microbatch (M = global_batch / (micro_batch * dp)).
+    For dp=4: M = 64 / (8*4) = 2, so 4 layers × 2 microbatches = 8 events.
+    For dp=1: M = 64 / (8*1) = 8, but dp=1 has no DP comm, so 0 events.
+    """
+
+    def test_per_stage_count_eq_layers_times_M(self, dp_pp_trace):
+        """dp=4 with 4 layers and M=2 should produce 8 reduce_scatter events in pp_per_stage."""
+        dp_comm = _filter_dp_comm_events(dp_pp_trace[4]["per_stage"])
+        M = 2
+        expected = 4 * M
+        assert len(dp_comm) == expected, (
+            f"Expected {expected} DP comm events (4 layers × {M} microbatches) in pp_per_stage for dp=4, got {len(dp_comm)}"
+        )
+
+    def test_combined_count_eq_layers_times_M(self, dp_pp_trace):
+        """dp=4 with 4 layers and M=2 should produce 8 reduce_scatter events in pp_combined."""
+        dp_comm = _filter_dp_comm_events(dp_pp_trace[4]["combined"])
+        M = 2
+        expected = 4 * M
+        assert len(dp_comm) == expected, (
+            f"Expected {expected} DP comm events (4 layers × {M} microbatches) in pp_combined for dp=4, got {len(dp_comm)}"
+        )
+
+    def test_none_for_dp1_per_stage(self, dp_pp_trace):
+        """dp=1 should have no reduce_scatter events in pp_per_stage."""
+        dp_comm = _filter_dp_comm_events(dp_pp_trace[1]["per_stage"])
+        assert len(dp_comm) == 0, (
+            f"Expected 0 DP comm events for dp=1, got {len(dp_comm)}"
+        )
+
+    def test_none_for_dp1_combined(self, dp_pp_trace):
+        """dp=1 should have no reduce_scatter events in pp_combined."""
+        dp_comm = _filter_dp_comm_events(dp_pp_trace[1]["combined"])
+        assert len(dp_comm) == 0, (
+            f"Expected 0 DP comm events for dp=1, got {len(dp_comm)}"
+        )
+
+    def test_stitched_has_no_dp_comm(self, dp_pp_trace):
+        """pp_stitched only contains coarse-grained F/B blocks, no DP comm nodes."""
+        for dp in (1, 4):
+            dp_comm = _filter_dp_comm_events(dp_pp_trace[dp]["stitched"])
+            assert len(dp_comm) == 0, (
+                f"pp_stitched should not contain DP comm nodes for dp={dp}"
+            )
+
+
+class TestPpTraceDpCommAttributes:
+    """DP communication node attribute correctness in PP trace."""
+
+    def test_phase_is_backward(self, dp_pp_trace):
+        for evt in _filter_dp_comm_events(dp_pp_trace[4]["per_stage"]):
+            assert evt["args"]["phase"] == "bwd", (
+                f"DP comm node should be in backward phase, got {evt['args']['phase']}"
+            )
+
+    def test_category_is_communication(self, dp_pp_trace):
+        for evt in _filter_dp_comm_events(dp_pp_trace[4]["per_stage"]):
+            assert evt["cat"] == "communication", (
+                f"DP comm node category should be 'communication', got {evt['cat']}"
+            )
+
+    def test_stream_type_is_comm(self, dp_pp_trace):
+        for evt in _filter_dp_comm_events(dp_pp_trace[4]["per_stage"]):
+            assert evt["args"].get("stream_type") == "comm", (
+                f"DP comm node stream_type should be 'comm', got {evt['args'].get('stream_type')}"
+            )
+
+    def test_duration_positive(self, dp_pp_trace):
+        for evt in _filter_dp_comm_events(dp_pp_trace[4]["per_stage"]):
+            assert evt["dur"] > 0, (
+                f"DP comm node duration should be > 0, got {evt['dur']}"
+            )
+
+    def test_name_contains_reduce_scatter(self, dp_pp_trace):
+        for evt in _filter_dp_comm_events(dp_pp_trace[4]["per_stage"]):
+            assert "comm.reduce_scatter" in evt["name"], (
+                f"DP comm node name should contain 'comm.reduce_scatter', got {evt['name']}"
+            )
+
+    def test_combined_has_view_detail(self, dp_pp_trace):
+        for evt in _filter_dp_comm_events(dp_pp_trace[4]["combined"]):
+            assert evt["args"].get("view") == "detail", (
+                f"pp_combined DP comm node should have view='detail', got {evt['args'].get('view')}"
+            )
+
+
+class TestPpTraceDpCommStageDistribution:
+    """DP comm nodes are distributed across PP stages based on layer assignment."""
+
+    def test_dp_comm_spans_multiple_stages(self, dp_pp_trace):
+        """With PP=4 and 4 layers, DP comm nodes should appear on at least 2 stages."""
+        dp_comm = _filter_dp_comm_events(dp_pp_trace[4]["per_stage"])
+        pids = {evt["pid"] for evt in dp_comm}
+        assert len(pids) >= 2, (
+            f"DP comm nodes should span at least 2 PP stages, found stages: {pids}"
+        )
+
+    def test_dp_comm_count_per_stage_matches_layers_times_M(self, dp_pp_trace):
+        """Total DP comm nodes across all stages should equal layers × M."""
+        dp_comm = _filter_dp_comm_events(dp_pp_trace[4]["per_stage"])
+        M = 2
+        expected = 4 * M
+        assert len(dp_comm) == expected, (
+            f"Total DP comm nodes should equal {expected} (4 layers × {M} microbatches), got {len(dp_comm)}"
+        )
+
+
+class TestPpTraceDpCommTiming:
+    """DP comm nodes should appear during the backward phase and overlap with compute."""
+
+    def test_dp_comm_in_backward_timeline(self, dp_pp_trace):
+        """All DP comm nodes should have timestamps > 0 (placed in the timeline)."""
+        dp_comm = _filter_dp_comm_events(dp_pp_trace[4]["per_stage"])
+        for evt in dp_comm:
+            assert evt["ts"] > 0, (
+                f"DP comm node should have positive timestamp, got {evt['ts']}"
+            )
+
+    def test_dp_comm_duration_consistent(self, dp_pp_trace):
+        """All DP comm nodes for the same dp should have consistent duration."""
+        dp_comm = _filter_dp_comm_events(dp_pp_trace[4]["per_stage"])
+        durations = [evt["dur"] for evt in dp_comm]
+        if len(durations) > 1:
+            ref = durations[0]
+            for d in durations[1:]:
+                assert d == pytest.approx(ref, rel=0.1), (
+                    f"DP comm durations should be consistent: {durations}"
+                )

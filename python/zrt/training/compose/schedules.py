@@ -732,6 +732,15 @@ def pipeline_step_time(
     pp = strategy.pp
     M = strategy.num_microbatches()
 
+    if M < 1:
+        raise ValueError(
+            f"num_microbatches(M)={M} is invalid: "
+            f"global_batch({strategy.global_batch}) / "
+            f"(micro_batch({strategy.micro_batch}) * dp({strategy.dp})) = "
+            f"{strategy.global_batch} / {strategy.micro_batch * strategy.dp} = {M}. "
+            f"Ensure global_batch >= micro_batch * dp."
+        )
+
     # One resolver per estimate() call. ParallelGroups is enumerated
     # lazily on first .time(c) / .ranks() / .link() lookup, then cached
     # so per-stage and per-collective queries all share it.
