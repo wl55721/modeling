@@ -1098,11 +1098,21 @@ class TestSearchOutputs:
         import zrt.training.io.excel_exporter as excel_exporter
         import zrt.training.ir.builders as builders
         import zrt.training.models.flops as flops
+        import zrt.training.search.training_search_util as search_util
 
         output_dir = Path("output") / "test_search_outputs_best"
         if output_dir.exists():
             shutil.rmtree(output_dir)
         exported = []
+        loaded_models = []
+
+        original_load_model_spec = search_util._load_model_spec
+
+        def recording_load_model_spec(model_name, quant_preset=None):
+            loaded_models.append((model_name, quant_preset))
+            return original_load_model_spec(model_name, quant_preset=quant_preset)
+
+        monkeypatch.setattr(search_util, "_load_model_spec", recording_load_model_spec)
 
         monkeypatch.setattr(
             builders,
@@ -1132,6 +1142,7 @@ class TestSearchOutputs:
                             "pp": 1,
                             "ep": 1,
                             "dp": 8,
+                            "quant_preset": "deepseek_v4_fp8_fp4",
                         },
                         "report": TrainingReport(mfu=0.2, step_time_ms=10.0),
                     },
@@ -1146,6 +1157,7 @@ class TestSearchOutputs:
                             "pp": 1,
                             "ep": 1,
                             "dp": 4,
+                            "quant_preset": "bf16_baseline",
                         },
                         "report": TrainingReport(mfu=0.6, step_time_ms=20.0),
                     },
@@ -1160,6 +1172,7 @@ class TestSearchOutputs:
                             "pp": 1,
                             "ep": 1,
                             "dp": 2,
+                            "quant_preset": "deepseek_v4_fp8_fp4",
                         },
                         "report": TrainingReport(mfu=0.4, step_time_ms=5.0),
                     },
@@ -1171,6 +1184,10 @@ class TestSearchOutputs:
             assert exported[0]["strategy"].tp == 1
             assert exported[0]["system"].world_size == 8
             assert exported[0]["op_costs"] == {"fake_op": 1.0}
+            assert loaded_models == [
+                ("deepseek_v3_2", "deepseek_v4_fp8_fp4"),
+                ("deepseek_v3_2", "deepseek_v4_fp8_fp4"),
+            ]
             assert (output_dir / "deepseek_v3_2_nvidia_h100_sxm_seq4096_ws8_best.xlsx").exists()
             assert (output_dir / "deepseek_v3_2_nvidia_h100_sxm_seq8192_ws8_best.xlsx").exists()
         finally:
