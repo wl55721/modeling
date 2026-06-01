@@ -860,6 +860,16 @@ class TrainingPipelinePass(GraphPass):
             dp_overlap_in_bubble=ctx.training.dp_overlap_in_bubble if ctx.training else True,
         )
         M = strategy_proxy.num_microbatches()
+
+        if M < 1:
+            raise ValueError(
+                f"num_microbatches(M)={M} is invalid: "
+                f"global_batch({strategy_proxy.global_batch}) / "
+                f"(micro_batch({strategy_proxy.micro_batch}) * dp({strategy_proxy.dp})) = "
+                f"{strategy_proxy.global_batch} / {strategy_proxy.micro_batch * strategy_proxy.dp} = {M}. "
+                f"Ensure global_batch >= micro_batch * dp."
+            )
+
         dp_ar_time_s = self._compute_dp_ar_time(g, hw, ctx) / 1e6
 
         # Per-stage recompute: aggregate external_recompute node latencies

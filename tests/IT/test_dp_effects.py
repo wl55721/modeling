@@ -280,12 +280,12 @@ class TestDpCommHiding:
     After augmentation, dp_hidden is recalculated as:
         dp_hidden = max(0, dp_ar_time - dp_exposed)
 
-    Key invariants:
+    Key invariants (Stack B / trace mode):
       1. dp_total_ms = dp_hidden_ms + dp_exposed_ms
       2. dp_hidden_ms <= bubble_time_ms (cannot hide more than bubble allows)
       3. dp_exposed_ms >= dp_total_ms / dp_grad_buckets (last bucket residual)
-      4. step_time = pipeline_time + optimizer_time + optimizer_comm
-      5. pipeline_time = warmup + steady + cooldown + dp_exposed
+      4. step_time = pipeline_time + dp_exposed + optimizer_time + optimizer_comm
+      5. pipeline_time = warmup + steady + cooldown  (dp_exposed NOT included)
       6. dp_hidden is absorbed in bubble, does NOT add to step_time
     """
 
@@ -326,26 +326,31 @@ class TestDpCommHiding:
                 f"dp_total/buckets({min_exposed:.6f}ms)"
             )
 
-    def test_step_time_equals_pipeline_plus_optimizer(self, dp_reports):
-        """step_time = pipeline_time + optimizer_time + optimizer_comm.
+    def test_step_time_equals_pipeline_plus_dp_exposed_plus_optimizer(self, dp_reports):
+        """step_time = pipeline_time + dp_exposed + optimizer_time + optimizer_comm.
 
-        This is the fundamental step_time decomposition.
+        Stack B (trace mode): pipeline_time = warmup + steady + cooldown
+        (does NOT include dp_exposed). dp_exposed is added to step_time
+        separately, then optimizer time is appended.
         """
         for dp in (1, 4, 8):
             rep = dp_reports[dp]
             step = rep["step_time_ms"]
             pipeline = rep.get("pipeline_time_ms", 0.0)
+            dp_exposed = rep.get("dp_exposed_ms", 0.0)
             opt_time = rep.get("optimizer_time_ms", 0.0)
             opt_comm = rep.get("optimizer_comm_ms", 0.0)
-            assert step == pytest.approx(pipeline + opt_time + opt_comm, rel=1e-4), (
+            assert step == pytest.approx(pipeline + dp_exposed + opt_time + opt_comm, rel=1e-4), (
                 f"dp={dp}: step_time({step:.4f}) != "
-                f"pipeline({pipeline:.4f}) + opt({opt_time:.4f}) + opt_comm({opt_comm:.4f})"
+                f"pipeline({pipeline:.4f}) + dp_exposed({dp_exposed:.4f}) + "
+                f"opt({opt_time:.4f}) + opt_comm({opt_comm:.4f})"
             )
 
-    def test_pipeline_time_equals_warmup_steady_cooldown_dp_exposed(self, dp_reports):
-        """pipeline_time = warmup + steady + cooldown + dp_exposed.
+    def test_pipeline_time_equals_warmup_steady_cooldown(self, dp_reports):
+        """pipeline_time = warmup + steady + cooldown.
 
-        dp_hidden is absorbed in bubble and does NOT add to pipeline_time.
+        Stack B (trace mode): pipeline_time does NOT include dp_exposed.
+        dp_exposed is added to step_time separately, not inside pipeline_time.
         """
         for dp in (1, 4, 8):
             rep = dp_reports[dp]
@@ -353,36 +358,36 @@ class TestDpCommHiding:
             warmup = rep.get("warmup_ms", 0.0)
             steady = rep.get("steady_ms", 0.0)
             cooldown = rep.get("cooldown_ms", 0.0)
-            dp_exposed = rep.get("dp_exposed_ms", 0.0)
-            reconstructed = warmup + steady + cooldown + dp_exposed
+            reconstructed = warmup + steady + cooldown
             assert pipeline == pytest.approx(reconstructed, rel=1e-4), (
                 f"dp={dp}: pipeline_time({pipeline:.4f}) != "
-                f"warmup+steady+cooldown+dp_exposed({reconstructed:.4f})"
+                f"warmup+steady+cooldown({reconstructed:.4f})"
             )
 
     def test_dp_hidden_not_in_step_time(self, dp_reports):
         """dp_hidden is absorbed in bubble and does NOT increase step_time.
 
         If dp_hidden were fully exposed, step_time would be larger by dp_hidden.
-        Verify pipeline_time does NOT include dp_hidden as an extra term.
+        Verify step_time does NOT include dp_hidden as an extra additive term
+        beyond the standard decomposition.
         """
         for dp in (4, 8):
             rep = dp_reports[dp]
+            step = rep["step_time_ms"]
             pipeline = rep.get("pipeline_time_ms", 0.0)
-            dp_hidden = rep.get("dp_hidden_ms", 0.0)
-            warmup = rep.get("warmup_ms", 0.0)
-            steady = rep.get("steady_ms", 0.0)
-            cooldown = rep.get("cooldown_ms", 0.0)
             dp_exposed = rep.get("dp_exposed_ms", 0.0)
-            without_hidden = warmup + steady + cooldown + dp_exposed
+            dp_hidden = rep.get("dp_hidden_ms", 0.0)
+            opt_time = rep.get("optimizer_time_ms", 0.0)
+            opt_comm = rep.get("optimizer_comm_ms", 0.0)
+            without_hidden = pipeline + dp_exposed + opt_time + opt_comm
             with_hidden = without_hidden + dp_hidden
-            assert pipeline == pytest.approx(without_hidden, rel=1e-4), (
-                f"dp={dp}: pipeline_time matches warmup+steady+cooldown+dp_exposed, "
+            assert step == pytest.approx(without_hidden, rel=1e-4), (
+                f"dp={dp}: step_time matches pipeline+dp_exposed+opt+opt_comm, "
                 f"dp_hidden({dp_hidden:.4f}ms) is absorbed in bubble, not added"
             )
             if dp_hidden > 0:
-                assert pipeline < with_hidden, (
-                    f"dp={dp}: pipeline_time should be less than if dp_hidden were exposed"
+                assert step < with_hidden, (
+                    f"dp={dp}: step_time should be less than if dp_hidden were exposed"
                 )
 
     def test_dp_hidden_positive_when_pp_gt1(self, dp_reports):

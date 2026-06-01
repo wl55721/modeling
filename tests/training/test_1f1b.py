@@ -131,3 +131,33 @@ def test_mfu_positive_and_bounded():
 
     result = pipeline_step_time(graph, model, system, strategy)
     assert 0 < result.mfu < 1.0
+
+
+def test_m_less_than_1_raises_valueerror():
+    """global_batch < micro_batch * dp → M=0 → ValueError."""
+    model = ModelSpec(
+        hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
+        head_dim=128, vocab=32000, seq_len=2048,
+        layers=[LayerKind.DENSE] * 4,
+    )
+    system = _make_system()
+    strategy = Strategy(tp=1, pp=1, dp=8, micro_batch=8, global_batch=32)
+    graph = build_graph(model, strategy)
+
+    with pytest.raises(ValueError, match=r"num_microbatches\(M\)=0"):
+        pipeline_step_time(graph, model, system, strategy)
+
+
+def test_m_equals_1_succeeds():
+    """global_batch == micro_batch * dp → M=1 → no error."""
+    model = ModelSpec(
+        hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
+        head_dim=128, vocab=32000, seq_len=2048,
+        layers=[LayerKind.DENSE] * 4,
+    )
+    system = _make_system()
+    strategy = Strategy(tp=1, pp=1, dp=4, micro_batch=8, global_batch=32)
+    graph = build_graph(model, strategy)
+
+    result = pipeline_step_time(graph, model, system, strategy)
+    assert result.step_time > 0
