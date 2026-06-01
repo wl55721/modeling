@@ -386,14 +386,15 @@ class StreamAssignPass(GraphPass):
     @staticmethod
     def _detect_overlap_type(node) -> str:
         """Determine overlap type from node annotations and attrs."""
-        # Ring-CP: P2P nodes with fa_tile overlap_target
         overlap_target = node.annotations.get("overlap_target", "")
-        if overlap_target.startswith("fa_tile:"):
+        if overlap_target.startswith("fa_tile:") or overlap_target.startswith("ring_cp:"):
             return "ring_cp"
-        # MC2: fused all_gather + matmul
         if node.attrs.get("fused_ag_matmul"):
             return "mc2"
-        # CoC: communication-over-compute with tile factor
         if node.attrs.get("coc_tile_k"):
             return "coc"
+        if node.annotations.get("mask", False):
+            mask_type = node.annotations.get("mask_type", "")
+            if mask_type == "p2p_overlap":
+                return "p2p_overlap"
         return "none"
