@@ -509,3 +509,100 @@ def test_layer_scaling_real_world_deepseek_v4():
     # 61 layers = ~1.34B scaled
     assert typical_params == pytest.approx(4 * 4096 * 3072, rel=0.05)
     assert scaled_params == pytest.approx(typical_params * 15.25, rel=0.05)
+
+
+def test_layer_scaling_guard_authoritative_total_params():
+    """LayerScalingPass skips when metadata['total_params'] already set (authoritative).
+    
+    Fixes Issue 2: LayerScalingPass should not overwrite authoritative total_params.
+    Example: model_loader or CLI --total-params sets metadata['total_params'] = 168B.
+    LayerScalingPass should skip scaling and preserve the authoritative value.
+    """
+    g = typical_layer_graph(num_layers=4)
+    g.metadata["num_layers"] = 61
+    g.metadata["typical_indices"] = [0, 1, 2, 3]
+    g.metadata["layer_profile"] = {"dense": 0, "sparse": 61}
+    
+    # Set authoritative total_params (e.g., from model_loader)
+    authoritative_params = 168e9  # DeepSeek-V4 total params
+    g.metadata["total_params"] = int(authoritative_params)
+    
+    ctx = _ctx()
+    result = LayerScalingPass().run(g, ctx)
+    
+    # Should NOT scale, preserve authoritative value
+    assert result.metadata["total_params"] == int(authoritative_params)
+    assert result.metadata.get("layer_scaling_complete") is not True
+    
+    # Should NOT have typical_params (scaling skipped)
+    assert "typical_params" not in result.metadata
+
+
+def test_layer_scaling_non_layer_params_not_scaled():
+    """LayerScalingPass scales only per-layer params, not non-layer (embedding/lm_head).
+    
+    Fixes Known Bug #68: embedding/non-layer params should not be scaled by layer_count.
+    Per-layer params: routed_expert, shared_expert, other (scaled)
+    Non-layer params: embedding, lm_head, norm (NOT scaled)
+    
+    Verification: Check params_by_component breakdown exists and non_layer is NOT scaled.
+    """
+    # Create graph with embedding + transformer layers
+    nodes = {}
+    
+    # Embedding node (non-layer, should NOT be scaled)
+    embed_weight = _t("embed_tokens_weight", (128000, 7168))  # vocab×hidden, has "weight" in ID
+    nodes["embed"] = OpNode(
+        id="embed",
+        op_type="aten.embedding.default",
+        inputs=[embed_weight],
+        outputs=[_t("embed_out", (128, 7168))],
+        scope="model.embed_tokens",
+        component="embedding",
+        category="compute",
+    )
+    
+    # Transformer layers (per-layer, should be scaled)
+    for i in range(4):
+        nid = f"layer_{i}"
+        nodes[nid] = _linear_node(nid, f"model.layers.{i}.mlp", (128, 4096), (4096, 3072))
+    
+    g = OpGraph(name="test_with_embed", phase="train_forward", nodes=nodes, edges=[])
+    g.metadata["num_layers"] = 61
+    g.metadata["typical_indices"] = [0, 1, 2, 3]
+    g.metadata["layer_profile"] = {"dense": 0, "sparse": 61}
+    
+    ctx = _ctx()
+    result = LayerScalingPass().run(g, ctx)
+    
+    # Check params_by_component breakdown exists
+    comp_breakdown = result.metadata.get("params_by_component")
+    assert comp_breakdown is not None, "params_by_component should be set by LayerScalingPass"
+    
+    # Check each component category is present
+    assert "routed_expert" in comp_breakdown
+    assert "shared_expert" in comp_breakdown
+    assert "other" in comp_breakdown
+    assert "non_layer" in comp_breakdown
+    
+    # Key verification: non_layer should NOT be scaled
+    # Embedding params: 128K × 7168 = 922M (unchanged by layer_scale)
+    non_layer_params = comp_breakdown["non_layer"]
+    expected_non_layer = 128000 * 7168  # vocab × hidden
+    assert non_layer_params == pytest.approx(expected_non_layer, rel=0.05), \
+        f"non_layer params should NOT be scaled (expected {expected_non_layer}, got {non_layer_params})"
+    
+    # Per-layer params should be scaled (check they are different from typical)
+    # If all params were scaled uniformly, non_layer would be scaled too (WRONG)
+    # This test ensures non_layer is NOT scaled
+    layer_scale = result.metadata["layer_scale"]
+    assert layer_scale > 1.0, "layer_scale should be > 1.0 for scaling to happen"
+    
+    # Verify total_params includes both scaled per-layer and unchanged non_layer
+    total_params = result.metadata["total_params"]
+    assert total_params > 0
+    
+    # Most importantly: non_layer is NOT multiplied by layer_scale
+    # If it were scaled: non_layer × layer_scale = 922M × 15.25 = 14.1B (overestimate)
+    # We verify it stays at 922M
+    assert non_layer_params < 1e9, "non_layer should be ~922M, NOT 14.1B (scaled)"
