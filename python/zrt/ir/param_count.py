@@ -37,6 +37,8 @@ def compute_layer_scale(graph: "OpGraph") -> float:
         return num_layers / num_typical
     
     num_layers_traced = graph.metadata.get("num_layers_traced", num_layers)
+    if num_layers_traced is None:
+        num_layers_traced = num_layers
     if num_layers_traced > 0 and num_layers != num_layers_traced:
         return num_layers / num_layers_traced
     

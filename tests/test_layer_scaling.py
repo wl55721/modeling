@@ -8,7 +8,6 @@ Tests cover:
 5. Integration with count_params and pipeline
 """
 import pytest
-from types import SimpleNamespace
 
 from python.zrt.ir.node import OpNode
 from python.zrt.ir.edge import Edge
@@ -156,28 +155,153 @@ def test_layer_scaling_pass_missing_layer_profile():
 
 
 def test_compute_layer_scale_helper():
-    """compute_layer_scale() computes correct scaling factor."""
+    """compute_layer_scale() computes correct scaling factor with priority logic.
+    
+    Priority order:
+    1. metadata["layer_scale"] (if > 0.0)
+    2. typical_indices present -> num_layers / len(typical_indices)
+    3. num_layers / num_layers_traced
+    4. Return 1.0 if no info available
+    """
     g = typical_layer_graph(num_layers=4)
     
-    # Case 1: metadata already has layer_scale
+    # Case 1: metadata already has layer_scale (highest priority)
     g.metadata["layer_scale"] = 15.25
     assert compute_layer_scale(g) == 15.25
     
-    # Case 2: compute from typical_indices
+    # Case 2: compute from typical_indices (metadata["layer_scale"] = 0.0)
     g.metadata["layer_scale"] = 0.0
     g.metadata["num_layers"] = 61
     g.metadata["typical_indices"] = [0, 1, 2, 3]
     assert compute_layer_scale(g) == pytest.approx(61.0 / 4.0, rel=0.01)
     
-    # Case 3: compute from num_layers ratio
+    # Case 3: compute from num_layers ratio (typical_indices = None)
     g.metadata["typical_indices"] = None
     g.metadata["num_layers_traced"] = 4
     assert compute_layer_scale(g) == pytest.approx(61.0 / 4.0, rel=0.01)
     
-    # Case 4: no scaling needed
+    # Case 4: no scaling needed (num_layers == num_layers_traced)
     g.metadata["num_layers"] = 4
     g.metadata["num_layers_traced"] = 4
     assert compute_layer_scale(g) == 1.0
+    
+    # Case 5: typical_indices empty list
+    g.metadata["num_layers"] = 61
+    g.metadata["typical_indices"] = []
+    g.metadata["num_layers_traced"] = 4
+    assert compute_layer_scale(g) == pytest.approx(61.0 / 4.0, rel=0.01)
+
+
+def test_compute_layer_scale_edge_cases():
+    """compute_layer_scale() handles edge cases gracefully.
+    
+    Edge cases:
+    - num_layers = 0 (return 1.0)
+    - typical_indices = None (fallback to num_layers_traced)
+    - num_layers_traced = 0 (return 1.0)
+    - all info missing (return 1.0)
+    """
+    g = typical_layer_graph(num_layers=4)
+    
+    # Edge case 1: num_layers = 0 -> return 1.0
+    g.metadata["layer_scale"] = 0.0
+    g.metadata["num_layers"] = 0
+    assert compute_layer_scale(g) == 1.0
+    
+    # Edge case 2: typical_indices = None, num_layers_traced = 0
+    g.metadata["num_layers"] = 61
+    g.metadata["typical_indices"] = None
+    g.metadata["num_layers_traced"] = 0
+    assert compute_layer_scale(g) == 1.0
+    
+    # Edge case 3: typical_indices empty, num_layers_traced missing
+    g.metadata["typical_indices"] = []
+    g.metadata["num_layers_traced"] = None
+    assert compute_layer_scale(g) == 1.0
+    
+    # Edge case 4: all metadata missing
+    g.metadata.clear()
+    assert compute_layer_scale(g) == 1.0
+
+
+def test_compute_layer_scale_priority():
+    """compute_layer_scale() respects priority order: metadata > typical_indices > traced."""
+    g = typical_layer_graph(num_layers=4)
+    
+    # Priority 1: metadata["layer_scale"] overrides everything
+    g.metadata["layer_scale"] = 20.0  # Override value
+    g.metadata["num_layers"] = 61
+    g.metadata["typical_indices"] = [0, 1, 2, 3]  # Would give 15.25
+    assert compute_layer_scale(g) == 20.0  # Uses metadata override
+    
+    # Priority 2: typical_indices overrides num_layers_traced
+    g.metadata["layer_scale"] = 0.0  # Remove override
+    g.metadata["num_layers_traced"] = 2  # Would give 30.5
+    g.metadata["typical_indices"] = [0, 1, 2, 3]  # Gives 15.25
+    assert compute_layer_scale(g) == pytest.approx(15.25, rel=0.01)  # Uses typical_indices
+    
+    # Priority 3: num_layers_traced fallback
+    g.metadata["typical_indices"] = None  # Remove typical_indices
+    assert compute_layer_scale(g) == pytest.approx(30.5, rel=0.01)  # Uses num_layers_traced
+
+
+def test_compute_layer_scale_different_ratios():
+    """compute_layer_scale() computes correct ratio for various layer counts.
+    
+    Test different scenarios:
+    - Small ratio (e.g., 8/4 = 2.0)
+    - Large ratio (e.g., 61/4 = 15.25)
+    - Equal (e.g., 4/4 = 1.0)
+    """
+    g = typical_layer_graph(num_layers=4)
+    
+    # Small ratio: 8 total, 4 typical
+    g.metadata["num_layers"] = 8
+    g.metadata["typical_indices"] = [0, 1, 2, 3]
+    assert compute_layer_scale(g) == 2.0
+    
+    # Large ratio: 100 total, 4 typical
+    g.metadata["num_layers"] = 100
+    assert compute_layer_scale(g) == 25.0
+    
+    # Equal ratio: 4 total, 4 typical
+    g.metadata["num_layers"] = 4
+    assert compute_layer_scale(g) == 1.0
+    
+    # Fractional ratio: 7 total, 4 typical
+    g.metadata["num_layers"] = 7
+    assert compute_layer_scale(g) == pytest.approx(1.75, rel=0.01)
+
+
+def test_compute_layer_scale_real_models():
+    """compute_layer_scale() handles real-world model configurations.
+    
+    Examples:
+    - DeepSeek-V4: 61 layers, 4 typical -> 15.25
+    - Llama-3-70B: 80 layers, 4 typical -> 20.0
+    - Mixtral-8x7B: 32 layers, 2 typical -> 16.0
+    """
+    g = typical_layer_graph(num_layers=4)
+    
+    # DeepSeek-V4: 61 sparse MoE layers
+    g.metadata["num_layers"] = 61
+    g.metadata["typical_indices"] = [0, 1, 2, 3]
+    assert compute_layer_scale(g) == pytest.approx(15.25, rel=0.01)
+    
+    # Llama-3-70B: 80 dense layers
+    g.metadata["num_layers"] = 80
+    g.metadata["typical_indices"] = [0, 1, 2, 3]
+    assert compute_layer_scale(g) == 20.0
+    
+    # Mixtral-8x7B: 32 MoE layers (first layer is MoE, capture 2 typical)
+    g.metadata["num_layers"] = 32
+    g.metadata["typical_indices"] = [0, 1]
+    assert compute_layer_scale(g) == 16.0
+    
+    # DeepSeek-V3: 3 dense + 58 MoE, typical_indices = [0, 3] (dense + MoE)
+    g.metadata["num_layers"] = 61
+    g.metadata["typical_indices"] = [0, 3]
+    assert compute_layer_scale(g) == pytest.approx(30.5, rel=0.01)
 
 
 def test_count_params_with_apply_layer_scale():
@@ -192,15 +316,14 @@ def test_count_params_with_apply_layer_scale():
     g.metadata["typical_indices"] = [0, 1, 2, 3]
     
     # Case 1: No metadata["total_params"] - count_params scales in fallback path
-    params_no_meta = count_params(g, apply_layer_scale=True)
+    # (apply_layer_scale works when name heuristic fails)
     typical_params = 4 * 4096 * 3072
-    expected_scaled = typical_params * (61.0 / 4.0)
-    # Note: apply_layer_scale works in structural fallback path
+    expected_scaled = int(typical_params * (61.0 / 4.0))
     
     # Case 2: metadata["total_params"] is set (LayerScalingPass ran)
-    g.metadata["total_params"] = int(expected_scaled)
+    g.metadata["total_params"] = expected_scaled
     params_with_meta = count_params(g, apply_layer_scale=True)
-    assert params_with_meta == int(expected_scaled)
+    assert params_with_meta == expected_scaled
 
 
 def test_count_params_uses_metadata_total_params():
