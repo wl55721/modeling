@@ -176,20 +176,14 @@ class TrainingMemoryPass(GraphPass):
         quant_profile = getattr(ctx, 'quant_profile', None)
 
         # ── Layer scaling for partial-trace graphs ─────────────────────────────
-        # When only a subset of layers is traced, count_params(g) returns the
-        # parameter count for those traced layers.  Scale to full model using
-        # the same layer_scale factor computed by TrainingFlopsPass.
-        num_layers = g.metadata.get("num_layers", 0)
-        num_layers_traced = g.metadata.get("num_layers_traced", num_layers)
-        layer_scale = (
-            num_layers / num_layers_traced
-            if num_layers_traced > 0 and num_layers != num_layers_traced
-            else 1.0
-        )
-
-        total_params = count_params(g)
-        if layer_scale != 1.0:
-            total_params = int(total_params * layer_scale)
+        # Use unified count_params(apply_layer_scale=True) which:
+        # 1. Returns metadata["total_params"] if set by LayerScalingPass (scaled)
+        # 2. Otherwise counts params and applies layer_scale internally
+        # This avoids double-scaling when LayerScalingPass already scaled params.
+        total_params = count_params(g, apply_layer_scale=True)
+        
+        # Get layer_scale for per-component scaling (if quant_profile present)
+        layer_scale = compute_layer_scale(g)
 
         dp = ctx.parallel.dp if ctx.parallel else 1
         tp = ctx.parallel.tp if ctx.parallel else 1

@@ -157,11 +157,14 @@ def test_layer_scaling_pass_missing_layer_profile():
 def test_compute_layer_scale_helper():
     """compute_layer_scale() computes correct scaling factor with priority logic.
     
-    Priority order:
+    Priority order (FIXED):
     1. metadata["layer_scale"] (if > 0.0)
-    2. typical_indices present -> num_layers / len(typical_indices)
-    3. num_layers / num_layers_traced
+    2. num_layers / num_layers_traced (most accurate)
+    3. num_layers / (max(typical_indices) + 1) (fallback estimate)
     4. Return 1.0 if no info available
+    
+    Note: len(typical_indices) is NOT used (would overestimate for sparse indices).
+    Example: typical_indices=[0, 56] -> len=2, but max+1=57 gives correct estimate.
     """
     g = typical_layer_graph(num_layers=4)
     
@@ -169,20 +172,26 @@ def test_compute_layer_scale_helper():
     g.metadata["layer_scale"] = 15.25
     assert compute_layer_scale(g) == 15.25
     
-    # Case 2: compute from typical_indices (metadata["layer_scale"] = 0.0)
+    # Case 2: num_layers_traced available (Priority 2, most accurate)
     g.metadata["layer_scale"] = 0.0
     g.metadata["num_layers"] = 61
-    g.metadata["typical_indices"] = [0, 1, 2, 3]
-    assert compute_layer_scale(g) == pytest.approx(61.0 / 4.0, rel=0.01)
-    
-    # Case 3: compute from num_layers ratio (typical_indices = None)
-    g.metadata["typical_indices"] = None
     g.metadata["num_layers_traced"] = 4
+    g.metadata["typical_indices"] = [0, 1, 2, 3]  # Present but Priority 2 takes precedence
     assert compute_layer_scale(g) == pytest.approx(61.0 / 4.0, rel=0.01)
     
-    # Case 4: no scaling needed (num_layers == num_layers_traced)
+    # Case 3: typical_indices only (use max+1 estimate, Priority 3)
+    g.metadata["num_layers_traced"] = None  # Remove num_layers_traced
+    g.metadata["typical_indices"] = [0, 1, 2, 3]
+    assert compute_layer_scale(g) == pytest.approx(61.0 / 4.0, rel=0.01)  # max([0,1,2,3])+1 = 4
+    
+    # Case 4: sparse typical_indices (e.g., DeepSeek-V3 [0, 56])
+    g.metadata["typical_indices"] = [0, 56]
+    assert compute_layer_scale(g) == pytest.approx(61.0 / 57.0, rel=0.01)  # max+1 = 57
+    
+    # Case 5: no scaling needed (num_layers == num_layers_traced)
     g.metadata["num_layers"] = 4
     g.metadata["num_layers_traced"] = 4
+    g.metadata["typical_indices"] = None
     assert compute_layer_scale(g) == 1.0
     
     # Case 5: typical_indices empty list
@@ -225,24 +234,35 @@ def test_compute_layer_scale_edge_cases():
 
 
 def test_compute_layer_scale_priority():
-    """compute_layer_scale() respects priority order: metadata > typical_indices > traced."""
+    """compute_layer_scale() respects priority order: metadata > num_layers_traced > typical_indices.
+    
+    Priority (FIXED to use num_layers_traced instead of len(typical_indices)):
+    1. metadata["layer_scale"] overrides everything
+    2. num_layers_traced (most accurate)
+    3. max(typical_indices) + 1 (fallback estimate)
+    """
     g = typical_layer_graph(num_layers=4)
     
     # Priority 1: metadata["layer_scale"] overrides everything
     g.metadata["layer_scale"] = 20.0  # Override value
     g.metadata["num_layers"] = 61
-    g.metadata["typical_indices"] = [0, 1, 2, 3]  # Would give 15.25
+    g.metadata["num_layers_traced"] = 4  # Would give 15.25
+    g.metadata["typical_indices"] = [0, 1, 2, 3]  # Would give 15.25 (max+1=4)
     assert compute_layer_scale(g) == 20.0  # Uses metadata override
     
-    # Priority 2: typical_indices overrides num_layers_traced
+    # Priority 2: num_layers_traced takes precedence over typical_indices
     g.metadata["layer_scale"] = 0.0  # Remove override
-    g.metadata["num_layers_traced"] = 2  # Would give 30.5
-    g.metadata["typical_indices"] = [0, 1, 2, 3]  # Gives 15.25
-    assert compute_layer_scale(g) == pytest.approx(15.25, rel=0.01)  # Uses typical_indices
+    g.metadata["num_layers_traced"] = 5  # Would give 61/5=12.2
+    g.metadata["typical_indices"] = [0, 1, 2, 3]  # Would give 61/4=15.25 (max+1=4)
+    assert compute_layer_scale(g) == pytest.approx(12.2, rel=0.01)  # Uses num_layers_traced
     
-    # Priority 3: num_layers_traced fallback
-    g.metadata["typical_indices"] = None  # Remove typical_indices
-    assert compute_layer_scale(g) == pytest.approx(30.5, rel=0.01)  # Uses num_layers_traced
+    # Priority 3: typical_indices fallback (use max+1)
+    g.metadata["num_layers_traced"] = None  # Remove num_layers_traced
+    assert compute_layer_scale(g) == pytest.approx(15.25, rel=0.01)  # Uses max+1=4
+    
+    # Edge case: typical_indices=[0, 56] (sparse indices)
+    g.metadata["typical_indices"] = [0, 56]  # max+1 = 57
+    assert compute_layer_scale(g) == pytest.approx(61.0 / 57.0, rel=0.01)
 
 
 def test_compute_layer_scale_different_ratios():
@@ -274,34 +294,53 @@ def test_compute_layer_scale_different_ratios():
 
 
 def test_compute_layer_scale_real_models():
-    """compute_layer_scale() handles real-world model configurations.
+    """compute_layer_scale() handles real-world model configurations with correct formula.
     
-    Examples:
-    - DeepSeek-V4: 61 layers, 4 typical -> 15.25
-    - Llama-3-70B: 80 layers, 4 typical -> 20.0
-    - Mixtral-8x7B: 32 layers, 2 typical -> 16.0
+    Examples (using FIXED formula: num_layers / num_layers_traced):
+    - DeepSeek-V4: 61 layers, 4 traced -> 15.25 (NOT 61/len([0,1,2,3])=15.25)
+    - DeepSeek-V4-pro: 61 layers, 5 traced -> 12.2 (typical_indices=[0,1,2,3], max+1=4 -> 15.25 if num_layers_traced missing)
+    - Llama-3-70B: 80 layers, 4 traced -> 20.0
+    - Mixtral-8x7B: 32 layers, 2 traced -> 16.0
+    - DeepSeek-V3: 61 layers, 4 traced -> 15.25 (typical_indices=[0, 56], len=2 would give 30.5 WRONG)
+    
+    Note: The fix prevents overestimation from using len(typical_indices) instead of num_layers_traced.
     """
     g = typical_layer_graph(num_layers=4)
     
-    # DeepSeek-V4: 61 sparse MoE layers
+    # DeepSeek-V4: 61 sparse MoE layers, 4 typical traced
     g.metadata["num_layers"] = 61
+    g.metadata["num_layers_traced"] = 4
     g.metadata["typical_indices"] = [0, 1, 2, 3]
     assert compute_layer_scale(g) == pytest.approx(15.25, rel=0.01)
     
-    # Llama-3-70B: 80 dense layers
+    # DeepSeek-V4-pro: 61 layers, 5 traced (max(typical_indices)+1=4, but num_layers_traced=5)
+    g.metadata["num_layers_traced"] = 5
+    assert compute_layer_scale(g) == pytest.approx(12.2, rel=0.01)  # Uses num_layers_traced (correct)
+    # NOT 61/4=15.25 (which would be 25% overestimate)
+    
+    # Llama-3-70B: 80 dense layers, 4 traced
     g.metadata["num_layers"] = 80
+    g.metadata["num_layers_traced"] = 4
     g.metadata["typical_indices"] = [0, 1, 2, 3]
     assert compute_layer_scale(g) == 20.0
     
-    # Mixtral-8x7B: 32 MoE layers (first layer is MoE, capture 2 typical)
+    # Mixtral-8x7B: 32 MoE layers, 2 traced
     g.metadata["num_layers"] = 32
+    g.metadata["num_layers_traced"] = 2
     g.metadata["typical_indices"] = [0, 1]
     assert compute_layer_scale(g) == 16.0
     
-    # DeepSeek-V3: 3 dense + 58 MoE, typical_indices = [0, 3] (dense + MoE)
+    # DeepSeek-V3: 61 layers, typical_indices=[0, 56] (sparse indices)
+    # OLD BUG: len(typical_indices)=2 would give 61/2=30.5 (2x overestimate)
+    # FIXED: num_layers_traced=4 gives 61/4=15.25, or max+1=57 gives 61/57≈1.07
     g.metadata["num_layers"] = 61
-    g.metadata["typical_indices"] = [0, 3]
-    assert compute_layer_scale(g) == pytest.approx(30.5, rel=0.01)
+    g.metadata["num_layers_traced"] = 4
+    g.metadata["typical_indices"] = [0, 56]
+    assert compute_layer_scale(g) == pytest.approx(15.25, rel=0.01)  # Uses num_layers_traced (correct)
+    
+    # Without num_layers_traced, fallback to max+1
+    g.metadata["num_layers_traced"] = None
+    assert compute_layer_scale(g) == pytest.approx(61.0 / 57.0, rel=0.01)  # max([0,56])+1 = 57
 
 
 def test_count_params_with_apply_layer_scale():

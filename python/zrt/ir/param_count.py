@@ -18,8 +18,12 @@ def compute_layer_scale(graph: "OpGraph") -> float:
     
     Priority:
     1. graph.metadata["layer_scale"] — if already set by LayerScalingPass
-    2. LayerProfile-based: num_layers / len(typical_indices)
-    3. Simple ratio: num_layers / num_layers_traced
+    2. num_layers / num_layers_traced — accurate when traced layer count is known
+    3. num_layers / (max(typical_indices) + 1) — fallback when typical_indices present
+    
+    Note: len(typical_indices) is NOT used because it doesn't reflect actual traced layers.
+    Example: DeepSeek-V3 typical_indices=[0, 56] (2 indices) but num_layers_traced=4.
+    Using len would give 61/2=30.5 (2x overestimate), correct is 61/4=15.25.
     
     Returns 1.0 if no scaling needed or information unavailable.
     """
@@ -31,16 +35,21 @@ def compute_layer_scale(graph: "OpGraph") -> float:
     if num_layers == 0:
         return 1.0
     
+    # Priority 2: Use num_layers_traced (most accurate)
+    num_layers_traced = graph.metadata.get("num_layers_traced", None)
+    if num_layers_traced is not None and num_layers_traced > 0:
+        if num_layers != num_layers_traced:
+            return num_layers / num_layers_traced
+        else:
+            return 1.0  # No scaling needed
+    
+    # Priority 3: Fallback to typical_indices estimate
+    # Use max(typical_indices) + 1 as traced layer count estimate
     typical_indices = graph.metadata.get("typical_indices", None)
     if typical_indices is not None and len(typical_indices) > 0:
-        num_typical = len(typical_indices)
-        return num_layers / num_typical
-    
-    num_layers_traced = graph.metadata.get("num_layers_traced", num_layers)
-    if num_layers_traced is None:
-        num_layers_traced = num_layers
-    if num_layers_traced > 0 and num_layers != num_layers_traced:
-        return num_layers / num_layers_traced
+        estimated_traced = max(typical_indices) + 1
+        if estimated_traced > 0 and num_layers != estimated_traced:
+            return num_layers / estimated_traced
     
     return 1.0
 
