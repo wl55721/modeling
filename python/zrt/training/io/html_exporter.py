@@ -23,11 +23,36 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from zrt.training.io.operator_time_stats import build_operator_time_stats
+from zrt.training.io.operator_time_stats import (
+    build_operator_time_stats,
+    classify_op_groups,
+)
 
 if TYPE_CHECKING:
     from zrt.training.ir.training_graph import Graph, Op
     from zrt.training.models.flops import OpCost
+
+
+def _iter_ops(graph):
+    """Iterate compute ops from either Graph or OpGraph."""
+    if hasattr(graph, "ops"):
+        return graph.ops
+    if hasattr(graph, "nodes"):
+        from zrt.training.models.flops import _OpNodeAsOp
+        return [_OpNodeAsOp(n) for n in graph.nodes.values() if not n.is_comm]
+    return []
+
+
+def _ops_for_layer(graph, layer_id: int):
+    """Get ops for a specific layer from either Graph or OpGraph."""
+    if hasattr(graph, "ops_for_layer"):
+        return graph.ops_for_layer(layer_id)
+    if hasattr(graph, "nodes"):
+        from zrt.training.models.flops import _OpNodeAsOp
+        lid_str = str(layer_id)
+        return [_OpNodeAsOp(n) for n in graph.nodes.values()
+                if not n.is_comm and n.layer == lid_str]
+    return []
     from zrt.training.spec.model import ModelSpec
     from zrt.training.spec.report import TrainingReport
     from zrt.training.spec.strategy import Strategy
@@ -411,6 +436,35 @@ def _op_formula(op, cost, model=None, system=None):
     if op.kind == "hash_route":
         return "negligible", "negligible", "negligible", "negligible"
 
+    if op.kind == "mega_moe":
+        from zrt.training.models.mega_moe import mega_moe_cost_terms
+
+        terms = mega_moe_cost_terms(op)
+        mm = m.get("m", 0)
+        micro_batch = m.get("micro_batch", 1)
+        tokens = terms.tokens
+        nn = terms.n
+        kk = terms.k_eff
+        top_k = terms.top_k
+        mult = f"{terms.fwd_multiplier:g}"
+        quant = terms.quant_variant
+        waves = m.get("requested_waves", 0)
+        local_experts = terms.local_experts
+        fwd_str = (
+            "Mega MoE dispatch+FFN+combine: "
+            f"m={mm}, micro_batch={micro_batch}, tokens={tokens}, "
+            f"top_k={top_k}, k={kk}, n={nn}, experts/rank={local_experts}, "
+            f"mult={mult}, quant={quant}, waves={waves}; "
+            f"2*tokens*top_k*k*n*mult = 2*{tokens}*{top_k}*{kk}*{nn}*{mult} = {_fmt_e(ff)}"
+        )
+        bwd_str = f"dx+dw = 2*fwd = {_fmt_e(df + wf)}"
+        bytes_str = (
+            "act_in+act_out+stored_weights "
+            f"(quant={quant}) = {_fmt_e(cost.fwd_bytes)}"
+        )
+        bwd_bytes_str = f"same fused traffic per dx/dw = {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
     return (
         f"fwd = {_fmt_e(ff)}",
         f"bwd = {_fmt_e(df + wf)}",
@@ -569,14 +623,31 @@ def _op_to_dict(op: "Op", cost: "OpCost", system, model=None) -> dict:
         "dx_ms": dx_t * 1000,
         "dw_ms": dw_t * 1000,
         "total_ms": (fwd_t + dx_t + dw_t) * 1000,
+        "cube_flops": cost.fwd_cube_flops + cost.dx_cube_flops + cost.dw_cube_flops,
+        "vector_flops": (
+            cost.fwd_vector_flops + cost.dx_vector_flops + cost.dw_vector_flops
+        ),
         "inputs": detail["inputs"],
         "outputs": detail["outputs"],
         "fwd_formula": detail["fwd_formula"],
         "bwd_formula": detail["bwd_formula"],
         "fwd_bytes_formula": detail["fwd_bytes_formula"],
         "bwd_bytes_formula": detail["bwd_bytes_formula"],
-        "meta": getattr(op, "meta", {}) or {},
+        "meta": _json_safe_meta(getattr(op, "meta", {}) or {}),
     }
+
+
+def _json_safe_meta(meta: dict) -> dict:
+    def convert(value):
+        if hasattr(value, "value"):
+            return value.value
+        if isinstance(value, dict):
+            return {k: convert(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [convert(v) for v in value]
+        return value
+
+    return {k: convert(v) for k, v in meta.items()}
 
 
 def _enum_value(x) -> str:
@@ -761,8 +832,8 @@ def _build_summary(
             "compute_time_ms": getattr(report, "compute_time_ms", 0.0),
             "exposed_comm_ms": getattr(report, "exposed_comm_ms", 0.0),
             "hidden_comm_ms": getattr(report, "hidden_comm_ms", 0.0),
-            "recompute_time_ms": getattr(report, "recompute_time_ms", 0.0),
-            "recompute_time_raw_ms": getattr(report, "recompute_time_raw_ms", 0.0),
+            "recompute_critical_ms": getattr(report, "recompute_critical_ms", 0.0),
+            "recompute_raw_mag_ms": getattr(report, "recompute_raw_mag_ms", 0.0),
             "optimizer_time_ms": getattr(report, "optimizer_time_ms", 0.0),
             "optimizer_comm_ms": getattr(report, "optimizer_comm_ms", 0.0),
             "tokens_per_sec": getattr(report, "tokens_per_sec", 0.0),
@@ -773,8 +844,8 @@ def _build_summary(
             "bubble_time_ms": getattr(report, "bubble_time_ms", 0.0),
             "flops_per_token": getattr(report, "flops_per_token", 0.0),
             "total_flops": getattr(report, "total_flops", 0.0),
-            "recompute_time_ms": getattr(report, "recompute_time_ms", 0.0),
-            "recompute_time_raw_ms": getattr(report, "recompute_time_raw_ms", 0.0),
+            "recompute_critical_ms": getattr(report, "recompute_critical_ms", 0.0),
+            "recompute_raw_mag_ms": getattr(report, "recompute_raw_mag_ms", 0.0),
             "bubble_time_ms": getattr(report, "bubble_time_ms", 0.0),
         },
         "memory": memory,
@@ -1029,9 +1100,10 @@ def _build_layer_tree(
     """Build hierarchical tree: model -> layer -> block -> op."""
     layers = getattr(model, "layers", [])
 
+    all_ops = _iter_ops(graph)
     tree = {
         "model_name": f"{len(layers)} layers, hidden={getattr(model, 'hidden', '-')}",
-        "total_ops": len(graph.ops),
+        "total_ops": len(all_ops),
         "layers": [],
         "global_ops": [],
     }
@@ -1041,7 +1113,7 @@ def _build_layer_tree(
     from zrt.training.models.flops import op_cost
 
     # Global ops: embedding / final head etc.
-    for op in graph.ops:
+    for op in all_ops:
         if getattr(op, "layer_id", -1) < 0:
             cost = op_costs.get(op.name)
             if cost is None:
@@ -1049,6 +1121,7 @@ def _build_layer_tree(
 
             od = _op_to_dict(op, cost, system, model)
             od["component_group"] = _component_of_op(op)
+            od["op_groups"] = classify_op_groups(od)
 
             tree["global_ops"].append(od)
             all_op_dicts.append(od)
@@ -1056,7 +1129,7 @@ def _build_layer_tree(
     # Per-layer data.
     for lid in range(len(layers)):
         lk = _enum_value(layers[lid]).lower()
-        layer_ops = graph.ops_for_layer(lid)
+        layer_ops = _ops_for_layer(graph, lid)
         blocks = _classify_ops_in_layer(layer_ops, lk)
 
         layer_data = {
@@ -1090,6 +1163,7 @@ def _build_layer_tree(
 
                 od = _op_to_dict(op, cost, system, model)
                 od["component_group"] = _component_of_op(op)
+                od["op_groups"] = classify_op_groups(od)
 
                 blk_data["ops"].append(od)
                 all_op_dicts.append(od)
@@ -1128,6 +1202,7 @@ def _build_layer_tree(
 
                 od = _op_to_dict(op, cost, system, model)
                 od["component_group"] = _component_of_op(op)
+                od["op_groups"] = classify_op_groups(od)
 
                 blk_data["ops"].append(od)
                 all_op_dicts.append(od)
@@ -1639,9 +1714,73 @@ details[open] > summary::before { content: "−"; }
   border-radius: 10px;
   margin: 8px 0;
 }
+.pie-toolbar {
+  display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end;
+  margin: 12px 0 18px;
+}
+.pie-field { display: flex; flex-direction: column; gap: 7px; }
+.pie-flabel {
+  font-size: 11px; font-weight: 800; letter-spacing: .03em;
+  text-transform: uppercase; color: var(--muted);
+}
+.pie-toolbar select {
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 11px; background: white; font-weight: 650; min-width: 220px;
+}
+.opshare-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.tog {
+  cursor: pointer; user-select: none;
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 6px 13px; font-size: 12px; font-weight: 650;
+  background: white; color: var(--text); line-height: 1.4;
+}
+.tog.on { background: #2563eb; border-color: #2563eb; color: white; }
+.opshare-head {
+  display: flex; gap: 18px; flex-wrap: wrap; align-items: baseline;
+  padding: 10px 14px; border: 1px solid var(--line); border-radius: 12px;
+  background: #f8fafc; margin-bottom: 14px;
+}
+.opshare-head b { font-size: 18px; }
+.opshare-empty { color: var(--muted); padding: 16px 0; }
+.pie-pair {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px;
+}
+.pie-block {
+  border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+  background: #fdfefe; min-width: 0;
+}
+.pie-title { font-size: 13px; font-weight: 800; margin-bottom: 10px; }
+.pie-layout {
+  display: flex; gap: 22px; align-items: center; flex-wrap: wrap;
+}
+.pie-svg { width: 168px; height: 168px; flex: 0 0 auto; }
+.pie-center-top { font-size: 13px; font-weight: 800; fill: var(--text); }
+.pie-center-sub { font-size: 15px; font-weight: 800; fill: #2563eb; }
+.pie-legend { flex: 1; min-width: 180px; display: flex; flex-direction: column; gap: 2px; }
+.pie-leg-head {
+  font-size: 11px; font-weight: 800; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .03em; margin: 8px 0 2px;
+}
+.pie-leg-head:first-child { margin-top: 0; }
+.pie-leg-row {
+  display: grid; grid-template-columns: 14px 1fr auto auto auto; gap: 9px;
+  align-items: center; padding: 5px 6px; border-radius: 8px; font-size: 13px;
+}
+.pie-leg-row:hover { background: #f5f7fb; }
+.pie-dot { width: 12px; height: 12px; border-radius: 3px; }
+.pie-leg-name { font-weight: 650; display: flex; align-items: center; gap: 10px; min-width: 0; }
+.leg-txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bound-tag {
+  flex: 0 0 auto; margin-left: 4px; font-size: 10px; font-weight: 800; line-height: 1.6;
+  padding: 0 7px; border-radius: 999px; color: #fff;
+}
+.pie-leg-n { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pie-leg-val { color: var(--muted); white-space: nowrap; }
+.pie-leg-pct { font-weight: 800; white-space: nowrap; min-width: 56px; text-align: right; }
 @media (max-width: 1100px) {
   .grid-2, .grid-3, .grid-4, .model-flow { grid-template-columns: 1fr; }
   .flow-block:not(:last-child)::after { display: none; }
+  .pie-pair { grid-template-columns: 1fr; }
 }
 </style>
 </head>
@@ -1656,6 +1795,7 @@ details[open] > summary::before { content: "−"; }
   <section id="topology"></section>
   <section id="model-overview"></section>
   <section id="hierarchy"></section>
+  <section id="op-share"></section>
   <section id="calibration"></section>
 </main>
 
@@ -1773,7 +1913,7 @@ function renderSummary() {
     <h3>step time breakdown</h3>
     <div class="card kv">
       <div>Useful Compute</div><div>${fmt.ms(p.compute_time_ms)}</div>
-      <div>Recompute (crit. path)</div><div>${fmt.ms(p.recompute_time_ms || 0)}</div>
+      <div>Recompute (crit. path)</div><div>${fmt.ms(p.recompute_critical_ms || 0)}</div>
       <div>Communication (exposed)</div><div>${fmt.ms(p.exposed_comm_ms)}</div>
       <div>Pipeline Bubble</div><div>${fmt.ms(p.bubble_time_ms)}</div>
       <div>Optimizer (compute)</div><div>${fmt.ms(p.optimizer_time_ms)}</div>
@@ -1992,7 +2132,7 @@ function renderCalibration() {
   const rows = DATA.calibration || [];
 
   document.getElementById("calibration").innerHTML = `
-    <h2>5. 报告校准</h2>
+    <h2>6. 报告校准</h2>
     <p class="muted">校准分为结构校验、公开 kernel benchmark 对齐、以及目标集群本地 step-time 采样。公开 benchmark 不一定与当前训练配置完全同构，需要看 status 和 note。</p>
 
     <table class="calib-table">
@@ -2022,10 +2162,378 @@ function renderCalibration() {
   `;
 }
 
+// ── Operator time-share analysis (pie) ──────────────────────────────────────
+const OPSHARE = { ops: [], groups: [], scale: 1 };
+const OPSHARE_COLORS = [
+  "#2563eb", "#16a34a", "#d97706", "#9333ea", "#dc2626", "#0891b2",
+  "#ca8a04", "#db2777", "#65a30d", "#0ea5e9", "#7c3aed", "#e11d48",
+  "#0d9488", "#a16207", "#4f46e5", "#be123c",
+];
+
+function opTopBound(op) {
+  // Mirror _build_summary: anything not memory/comm counts as compute.
+  const b = String(op.bound || "").toLowerCase();
+  if (b.includes("memory") || b.includes("hbm")) return "memory";
+  if (b.includes("comm")) return "comm";
+  return "compute";
+}
+
+// Flatten the layer tree into a single op list. Each op already carries
+// op_groups / cube_flops / vector_flops / layer_id / layer_kind from the
+// Python exporter, so all analysis happens client-side with no extra fetch.
+function flattenOps(tree) {
+  const out = [];
+  (tree.global_ops || []).forEach(op => out.push(op));
+  (tree.layers || []).forEach(layer => {
+    (layer.blocks || []).forEach(block => {
+      (block.ops || []).forEach(op => out.push(op));
+    });
+  });
+  return out;
+}
+
+// Per-op times are raw single-microbatch estimates; OPSHARE.scale lifts them
+// into full-step units (matching summary.operator_time_share / compute_time_ms)
+// so percentages against step_time / useful_compute are meaningful.
+function opPhaseTime(op, fwdOn, bwdOn) {
+  return ((fwdOn ? Number(op.fwd_ms || 0) : 0)
+    + (bwdOn ? Number(op.dx_ms || 0) + Number(op.dw_ms || 0) : 0)) * OPSHARE.scale;
+}
+
+const OPGROUP_LABELS = {
+  matmul: "matmul", attention: "attention", attention_matmul: "attn matmul",
+  ffn: "ffn / moe", lm_head: "lm_head", mtp_embed: "mtp embed",
+  indexer: "indexer", sparse_fa: "sparse FA",
+};
+const FOCUS_OPTS = [
+  ["__all__", "全部算子"],
+  ["matmul", "matmul"],
+  ["attention", "attention"],
+  ["ffn", "ffn / moe"],
+  ["attention_matmul", "attn matmul"],
+  ["lm_head", "lm_head"],
+  ["indexer", "indexer"],
+  ["sparse_fa", "sparse FA"],
+];
+// Left-pie (module view) dimensions only — the right pie is always the
+// operator's internal compute-unit breakdown.
+const MODULE_DIM_OPTS = [
+  ["component_group", "模型组件 (attn / moe / …)"],
+  ["kind", "算子 kind"],
+  ["layer_kind", "layer 类型 (dense / moe / mtp)"],
+  ["layer_id", "layer 编号"],
+  ["op_group", "语义分组"],
+];
+
+// Time pieces of an op split into (phase × compute-unit), used only by the
+// compute_unit / phase breakdowns. Compute-bound ops are apportioned to cube /
+// vector by their FLOP ratio; memory / comm ops stay whole.
+function opUnitPieces(op, fwdOn, bwdOn) {
+  const tb = opTopBound(op);
+  const pieces = [];
+  const phases = [
+    ["forward", (fwdOn ? Number(op.fwd_ms || 0) : 0) * OPSHARE.scale],
+    ["backward", (bwdOn ? Number(op.dx_ms || 0) + Number(op.dw_ms || 0) : 0) * OPSHARE.scale],
+  ];
+  const cf = Number(op.cube_flops || 0);
+  const vf = Number(op.vector_flops || 0);
+  const tot = cf + vf;
+  for (const [phase, pt] of phases) {
+    if (pt <= 0) continue;
+    if (tb !== "compute") {
+      pieces.push({ phase, unit: tb, t: pt });
+    } else if (tot > 0) {
+      if (cf > 0) pieces.push({ phase, unit: "cube", t: pt * cf / tot });
+      if (vf > 0) pieces.push({ phase, unit: "vector", t: pt * vf / tot });
+    } else {
+      pieces.push({ phase, unit: "compute_other", t: pt });
+    }
+  }
+  return pieces;
+}
+
+function uniqSorted(values) {
+  return Array.from(new Set(values.filter(v => v !== "" && v != null))).sort();
+}
+
+function togStates(sel) {
+  const out = {};
+  document.querySelectorAll(`[data-sel="${sel}"]`).forEach(el => {
+    out[el.dataset.val] = el.classList.contains("on");
+  });
+  return out;
+}
+
+function selectedVals(sel) {
+  return Object.entries(togStates(sel)).filter(([, on]) => on).map(([v]) => v);
+}
+
+function chip(sel, val, label, on, sub) {
+  return `<span class="tog${sub ? " sub" : ""}${on ? " on" : ""}" `
+    + `data-sel="${esc(sel)}" data-val="${esc(val)}">${esc(label)}</span>`;
+}
+
+function renderOpShare() {
+  const tree = DATA.tree || {};
+  OPSHARE.ops = flattenOps(tree);
+  OPSHARE.groups = new Set([].concat(...OPSHARE.ops.map(o => o.op_groups || [])));
+
+  // Match operator_time_stats._operator_time_scale: lift raw per-op times to
+  // full-step units so "全部算子" ≈ useful compute instead of a tiny fraction.
+  const allOpMs = OPSHARE.ops.reduce((a, o) => a + Number(o.total_ms || 0), 0);
+  const usefulMs = Number((DATA.summary && DATA.summary.performance
+    && DATA.summary.performance.compute_time_ms) || 0);
+  OPSHARE.scale = (allOpMs > 0 && usefulMs > 0) ? usefulMs / allOpMs : 1;
+
+  // Only offer a focus option when at least one op carries that group.
+  const focusOpts = FOCUS_OPTS.filter(
+    ([v]) => v === "__all__" || OPSHARE.groups.has(v)
+  );
+
+  const moduleOpts = MODULE_DIM_OPTS.filter(
+    ([v]) => v !== "op_group" || OPSHARE.groups.size
+  );
+
+  document.getElementById("op-share").innerHTML = `
+    <h2>5. 算子耗时占比分析</h2>
+    <p class="muted">左图为<b>模块视角</b>：算子耗时在各 module / 组件间的占比；
+    右图为<b>算子视角</b>：所选算子内部的计算单元构成 (cube / vector / memory / comm)。
+    用「聚焦算子」「阶段」同时过滤两图。耗时来自 IR op 的 fwd + dx + dw 估算，全部在浏览器端计算。</p>
+
+    <div class="pie-toolbar">
+      <label class="pie-field">
+        <span class="pie-flabel">聚焦算子</span>
+        <select id="opFocus">
+          ${focusOpts.map(([v, l], i) =>
+            `<option value="${esc(v)}"${i === 0 ? " selected" : ""}>${esc(l)}</option>`).join("")}
+        </select>
+      </label>
+      <label class="pie-field">
+        <span class="pie-flabel">模块维度 (左图)</span>
+        <select id="opModuleDim">
+          ${moduleOpts.map(([v, l], i) =>
+            `<option value="${esc(v)}"${i === 0 ? " selected" : ""}>${esc(l)}</option>`).join("")}
+        </select>
+      </label>
+      <div class="pie-field">
+        <span class="pie-flabel">阶段</span>
+        <div class="opshare-chips" data-group="phase">
+          ${chip("phase", "forward", "前向", true)}
+          ${chip("phase", "backward", "反向", true)}
+        </div>
+      </div>
+    </div>
+
+    <div id="opShareResult"></div>
+  `;
+
+  const sec = document.getElementById("op-share");
+  sec.querySelector('[data-group="phase"]').addEventListener("click", e => {
+    const el = e.target.closest(".tog");
+    if (!el) return;
+    el.classList.toggle("on");
+    recomputeOpShare();
+  });
+  document.getElementById("opFocus").addEventListener("change", recomputeOpShare);
+  document.getElementById("opModuleDim").addEventListener("change", recomputeOpShare);
+
+  recomputeOpShare();
+}
+
+// Bucket key for one op under the chosen breakdown dimension. Returns a list of
+// {key, t} so that multi-valued dimensions (compute_unit, phase, op_group) can
+// split a single op across several slices.
+function opShareContribs(op, breakdown, fwdOn, bwdOn) {
+  if (breakdown === "compute_unit" || breakdown === "phase" || breakdown === "bound") {
+    const out = [];
+    for (const pc of opUnitPieces(op, fwdOn, bwdOn)) {
+      let key;
+      if (breakdown === "phase") {
+        key = pc.phase === "forward" ? "前向" : "反向";
+      } else if (breakdown === "bound") {
+        key = (pc.unit === "memory" || pc.unit === "comm") ? pc.unit : "compute";
+      } else {
+        key = ({ cube: "cube", vector: "vector", memory: "memory", comm: "comm",
+                 compute_other: "compute (无 FLOPs)" }[pc.unit] || pc.unit);
+      }
+      out.push({ key, t: pc.t });
+    }
+    return out;
+  }
+
+  const t = opPhaseTime(op, fwdOn, bwdOn);
+  if (t <= 0) return [];
+
+  if (breakdown === "op_group") {
+    const tags = op.op_groups || [];
+    if (!tags.length) return [{ key: "(无语义分组)", t }];
+    return tags.map(tag => ({ key: OPGROUP_LABELS[tag] || tag, t }));
+  }
+
+  let key;
+  switch (breakdown) {
+    case "kind": key = op.kind || "?"; break;
+    case "layer_kind":
+      key = Number(op.layer_id) < 0 ? "global" : (op.layer_kind || "?"); break;
+    case "layer_id":
+      key = Number(op.layer_id) < 0 ? "global" : ("Layer " + op.layer_id); break;
+    default: key = op.component_group || "other"; // component_group
+  }
+  return [{ key, t }];
+}
+
+// Aggregate focused ops into {key: ms} buckets under one breakdown dimension.
+function buildOpShareBuckets(focus, breakdown, fwdOn, bwdOn) {
+  // For module-view dimensions, also record each bucket's bound mix so the
+  // legend can tag it with its dominant bound (compute / memory / comm).
+  const trackBound = !["compute_unit", "phase", "bound"].includes(breakdown);
+  const buckets = new Map();
+  let sum = 0;
+  for (const op of OPSHARE.ops) {
+    if (focus !== "__all__" && !(op.op_groups || []).includes(focus)) continue;
+    const ob = trackBound ? opTopBound(op) : null;
+    for (const c of opShareContribs(op, breakdown, fwdOn, bwdOn)) {
+      if (c.t <= 0) continue;
+      const b = buckets.get(c.key) || { t: 0, n: 0, bt: {} };
+      b.t += c.t;
+      b.n += 1;  // occurrences in this category (= op count for single-key dims)
+      if (ob) b.bt[ob] = (b.bt[ob] || 0) + c.t;
+      buckets.set(c.key, b);
+      sum += c.t;
+    }
+  }
+  const overlaps = breakdown === "op_group";
+  const denom = (overlaps
+    ? Array.from(buckets.values()).reduce((a, b) => a + b.t, 0)
+    : sum) || 1e-12;
+  const rows = Array.from(buckets.entries())
+    .map(([k, v]) => {
+      const bounds = Object.entries(v.bt).sort((a, b) => b[1] - a[1]);
+      return { k, t: v.t, n: v.n, bound: bounds.length ? bounds[0][0] : null };
+    })
+    .sort((a, b) => b.t - a.t)
+    .map((r, i) => ({ ...r, color: OPSHARE_COLORS[i % OPSHARE_COLORS.length] }));
+  return { rows, denom, overlaps };
+}
+
+// Fixed colors so bound (outer ring) and compute-unit (inner ring) read
+// consistently: cube/vector are blue shades within the blue "compute" bound.
+const BOUND_COLORS = {
+  compute: "#2563eb", memory: "#d97706", comm: "#0891b2", "compute (无 FLOPs)": "#94a3b8",
+};
+const UNIT_COLORS = {
+  cube: "#2563eb", vector: "#7dd3fc", memory: "#d97706", comm: "#0891b2",
+  "compute (无 FLOPs)": "#94a3b8",
+};
+
+function legendHtml(rows, denom) {
+  return rows.map(r => {
+    const tag = r.bound
+      ? `<span class="bound-tag" style="background:${BOUND_COLORS[r.bound] || "#94a3b8"}">${esc(r.bound)}</span>`
+      : "";
+    return `
+    <div class="pie-leg-row">
+      <span class="pie-dot" style="background:${r.color}"></span>
+      <span class="pie-leg-name"><span class="leg-txt">${esc(r.k)}</span>${tag}</span>
+      <span class="pie-leg-n">${r.n}个</span>
+      <span class="pie-leg-val">${fmt.ms(r.t)}</span>
+      <span class="pie-leg-pct">${fmt.pct(r.t / denom)}</span>
+    </div>`;
+  }).join("");
+}
+
+function pieBlock(title, data) {
+  if (!data.rows.length) {
+    return `<div class="pie-block"><div class="pie-title">${title}</div>`
+      + `<div class="opshare-empty">无数据</div></div>`;
+  }
+  return `
+    <div class="pie-block">
+      <div class="pie-title">${title}</div>
+      ${data.overlaps ? `<p class="muted" style="font-size:11px;margin:0 0 6px">分组可重叠，饼图按各分组之和归一化</p>` : ""}
+      <div class="pie-layout">
+        ${donutSvg(data.rows, data.denom)}
+        <div class="pie-legend">${legendHtml(data.rows, data.denom)}</div>
+      </div>
+    </div>
+  `;
+}
+
+
+function recomputeOpShare() {
+  const focus = document.getElementById("opFocus").value;
+  const moduleDim = document.getElementById("opModuleDim").value;
+  const phaseOn = togStates("phase");
+  const fwdOn = !!phaseOn.forward;
+  const bwdOn = !!phaseOn.backward;
+
+  // True focused total (no double counting) for the headline percentages.
+  let total = 0;
+  for (const op of OPSHARE.ops) {
+    if (focus !== "__all__" && !(op.op_groups || []).includes(focus)) continue;
+    total += opPhaseTime(op, fwdOn, bwdOn);
+  }
+
+  const el = document.getElementById("opShareResult");
+  if (total <= 0) {
+    el.innerHTML = `<div class="opshare-empty">当前筛选无匹配算子。</div>`;
+    return;
+  }
+
+  const p = (DATA.summary && DATA.summary.performance) || {};
+  const stepT = Number(p.step_time_ms || 0);
+  const usefulT = Number(p.compute_time_ms || 0);
+
+  const moduleLabel = (MODULE_DIM_OPTS.find(o => o[0] === moduleDim) || [, moduleDim])[1];
+  const left = buildOpShareBuckets(focus, moduleDim, fwdOn, bwdOn);
+  const right = buildOpShareBuckets(focus, "compute_unit", fwdOn, bwdOn);
+  right.rows.forEach(r => { r.color = UNIT_COLORS[r.k] || r.color; });
+
+  el.innerHTML = `
+    <div class="opshare-head">
+      <span>聚焦合计 <b>${fmt.ms(total)}</b></span>
+      <span>占 step time <b>${fmt.pct(stepT > 0 ? total / stepT : 0)}</b></span>
+      <span>占 useful compute <b>${fmt.pct(usefulT > 0 ? total / usefulT : 0)}</b></span>
+    </div>
+    <div class="pie-pair">
+      ${pieBlock(`模块视角 · ${esc(moduleLabel)}`, left)}
+      ${pieBlock("算子视角 · 计算单元", right)}
+    </div>
+  `;
+}
+
+// Pure-SVG donut (no chart library). Each slice is a stroked circle arc placed
+// via stroke-dasharray / dashoffset, starting at 12 o'clock.
+function donutSvg(rows, denom) {
+  const R = 70, CX = 90, CY = 90, SW = 34, C = 2 * Math.PI * R;
+  let acc = 0;
+  const arcs = rows.map(r => {
+    const frac = Math.max(0, r.t / denom);
+    const len = frac * C;
+    const seg = `<circle cx="${CX}" cy="${CY}" r="${R}" fill="none" `
+      + `stroke="${r.color}" stroke-width="${SW}" `
+      + `stroke-dasharray="${len.toFixed(3)} ${(C - len).toFixed(3)}" `
+      + `stroke-dashoffset="${(-acc).toFixed(3)}" `
+      + `transform="rotate(-90 ${CX} ${CY})"><title>${esc(r.k)} · ${fmt.pct(frac)}</title></circle>`;
+    acc += len;
+    return seg;
+  }).join("");
+  const top = rows[0];
+  return `
+    <svg class="pie-svg" viewBox="0 0 180 180" role="img" aria-label="operator time share">
+      <circle cx="${CX}" cy="${CY}" r="${R}" fill="none" stroke="#eef1f6" stroke-width="${SW}"></circle>
+      ${arcs}
+      <text x="${CX}" y="${CY - 4}" text-anchor="middle" class="pie-center-top">${esc(top.k)}</text>
+      <text x="${CX}" y="${CY + 16}" text-anchor="middle" class="pie-center-sub">${fmt.pct(top.t / denom)}</text>
+    </svg>
+  `;
+}
+
 renderSummary();
 renderTopology();
 renderModelOverview();
 renderHierarchy();
+renderOpShare();
 renderCalibration();
 </script>
 </body>

@@ -25,6 +25,7 @@ from zrt.hardware.registry import load as load_hw
 from zrt.training.io.config_loader import _parse_model, _parse_system, _parse_strategy
 from zrt.training.models.memory import memory_breakdown
 from zrt.training.search.estimator import estimate
+from zrt.training.search.metric_filters import report_passes_filters
 from zrt.training.search.report import report_summary
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.report import TrainingReport
@@ -61,7 +62,7 @@ RAW_DATA_HEADERS = [
     "cp_exposed_ms", "ep_total_ms", "ep_exposed_ms", "pp_total_ms",
     "pp_exposed_ms", "pp_hidden_ms", "dp_total_ms", "dp_exposed_ms",
     "optimizer_compute_ms", "optimizer_comm_ms", "optimizer_exposed_ms",
-    "recompute_time_ms", "recompute_time_raw_ms", "step_time_ms",
+    "recompute_critical_ms", "recompute_raw_mag_ms", "step_time_ms",
     "pipeline_time_ms", "mfu", "mfu_native", "hfu", "bubble_fraction",
     "bubble_time_ms", "tokens_per_sec", "weights_gb", "grads_gb",
     "opt_state_gb", "activations_gb", "comm_buffers_gb", "memory_gb",
@@ -69,7 +70,7 @@ RAW_DATA_HEADERS = [
 
 ANALYSIS_HEADERS = [
     "组号", "硬件+seq", "TP", "PP", "DP", "EP", "CP", "重计算",
-    "单卡迭代时间", "单卡吞吐", "单卡吞吐归一化", "计算占比",
+    "单卡迭代时间", "集群吞吐", "集群吞吐归一化", "计算占比",
     "TP通信占比", "EP通信占比", "PP通信占比", "DP通信占比",
     "CP通信占比", "优化器占比", "空泡占比", "fw_time", "bw_time",
     "recompute_time", "计算时间", "TP通信时间(未掩盖)",
@@ -87,10 +88,10 @@ RAW_TO_ANALYSIS = {
     "CP": "cp",
     "重计算": "recompute",
     "单卡迭代时间": "step_time_ms",
-    "单卡吞吐": "tokens_per_sec",
+    "集群吞吐": "tokens_per_sec",
     "fw_time": "fwd_compute_ms",
     "bw_time": "bwd_compute_ms",
-    "recompute_time": "recompute_time_ms",
+    "recompute_critical": "recompute_critical_ms",
     "TP通信时间(未掩盖)": "tp_total_ms",
     "EP通信时间(未掩盖)": "ep_total_ms",
     "PP通信时间(未掩盖)": "pp_total_ms",
@@ -201,6 +202,7 @@ def _system_from_hw(
             cube_tflops=hw.compute.cube_bf16_tflops,
             vector_tflops=hw.compute.vector_bf16_tflops,
             overlap_ratio=dict(hw.compute.overlap_ratio),
+            ep_overlap_waves=hw.compute.ep_overlap_waves,
             compute_efficiency=hw.compute.compute_efficiency,
             mem_bw_efficiency=hw.memory.mem_bw_efficiency,
         ),
@@ -363,6 +365,8 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
         muon_config=muon_config,
         tp_overlap=TPOverlap(config.get("tp_overlap", "none")),
         ep_overlap=config.get("ep_overlap", False),
+        mega_moe=config.get("mega_moe", False),
+        mega_moe_waves=int(config.get("mega_moe_waves", 0)),
         cp_kind=CPKind(config.get("cp_kind", "none")),
         cp_ulysses=config.get("cp_ulysses"),
         cp_ring=config.get("cp_ring"),
@@ -446,6 +450,8 @@ class TrainingConfigManager:
             muon_config=muon_config,
             tp_overlap=TPOverlap(other_config.get("tp_overlap", "none")),
             ep_overlap=other_config.get("ep_overlap", False),
+            mega_moe=other_config.get("mega_moe", False),
+            mega_moe_waves=int(other_config.get("mega_moe_waves", 0)),
             cp_kind=CPKind(other_config.get("cp_kind", "none")),
             cp_ulysses=other_config.get("cp_ulysses"),
             cp_ring=other_config.get("cp_ring"),
@@ -803,7 +809,7 @@ def _batched(iterable, batch_size: int):
 
 
 def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
-    from zrt.training.ir.builders import build_graph
+    from zrt.training.ir.opgraph_builder import build_explicit_graph
 
     model_name = config.get("model", "deepseek_v3_2")
     hw_name = config.get("hw", "nvidia_h100_sxm")
@@ -853,7 +859,7 @@ def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
         graph_key = _graph_cache_key(config)
         graph = _WORKER_GRAPH_CACHE.get(graph_key)
         if graph is None:
-            graph = build_graph(model, strategy)
+            graph = build_explicit_graph(model, strategy)
             _WORKER_GRAPH_CACHE[graph_key] = graph
         report = estimate(model, system, strategy, graph=graph)
 
@@ -869,7 +875,12 @@ def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
         return {"status": "error", "config": config, "type": "runtime_error"}
 
 
-def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.DataFrame:
+def format_results(
+    reports: List[TrainingReport],
+    configs: List[Dict],
+    sort_by: str = "tokens_per_sec",
+    ascending: bool = False,
+) -> pd.DataFrame:
     rows = []
     for cfg, report in zip(configs, reports):
         d = cfg.copy()
@@ -903,8 +914,8 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         d["optimizer_compute_ms"] = round(report.optimizer_time_ms, 4)
         d["optimizer_comm_ms"] = round(report.optimizer_comm_ms + report.optimizer_comm_hidden_ms, 2)
         d["optimizer_exposed_ms"] = round(report.optimizer_comm_ms, 2)
-        d["recompute_time_ms"] = round(report.recompute_time_ms, 3)
-        d["recompute_time_raw_ms"] =  round(report.recompute_time_raw_ms, 3)
+        d["recompute_critical_ms"] = round(report.recompute_critical_ms, 3)
+        d["recompute_raw_mag_ms"] =  round(report.recompute_raw_mag_ms, 3)
         d["step_time_ms"] = round(report.step_time_ms, 3)
         d["pipeline_time_ms"] = round(report.pipeline_time_ms, 3)
         d["mfu"] = round(report.mfu, 4)
@@ -926,15 +937,15 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         rows.append(d)
 
     df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values("tokens_per_sec", ascending=False)
+    if not df.empty and sort_by in df.columns:
+        df = df.sort_values(sort_by, ascending=ascending)
 
     metric_cols = ["compute_time_ms", "fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
                    "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
                    "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
                    "pp_hidden_ms", "dp_total_ms", "dp_exposed_ms",
-                   "optimizer_compute_ms", "optimizer_comm_ms", "optimizer_exposed_ms", "recompute_time_ms",
-                   "recompute_time_raw_ms", "step_time_ms", "pipeline_time_ms",
+                   "optimizer_compute_ms", "optimizer_comm_ms", "optimizer_exposed_ms", "recompute_critical_ms",
+                   "recompute_raw_mag_ms", "step_time_ms", "pipeline_time_ms",
                    "mfu", "mfu_native", "hfu", "bubble_fraction", "bubble_time_ms", "tokens_per_sec",
                    "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
                    "comm_buffers_gb", "memory_gb"]
@@ -1266,9 +1277,9 @@ def _analysis_value(
         return (
             _safe_float(row, "fwd_compute_ms")
             + _safe_float(row, "bwd_compute_ms")
-            + _safe_float(row, "recompute_time_ms")
+            + _safe_float(row, "recompute_critical_ms")
         )
-    if header == "单卡吞吐归一化":
+    if header == "集群吞吐归一化":
         current = _safe_float(row, "tokens_per_sec")
         return round(current / baseline_tokens, 3) if baseline_tokens else None
     if step_time <= 0:
@@ -1310,7 +1321,7 @@ def _write_analysis_sheet(
             cell.value = _analysis_value(header, row, baseline)
             if header in PERCENT_ANALYSIS_HEADERS:
                 cell.number_format = "0.00%"
-            elif header == "单卡吞吐归一化":
+            elif header == "集群吞吐归一化":
                 cell.number_format = "0.000"
             elif isinstance(cell.value, float):
                 cell.number_format = "0.00"
@@ -1369,8 +1380,8 @@ def export_best_configs_excel(
         all_results: List[Dict],
         output_path: str
 ) -> None:
-    from zrt.training.ir.builders import build_graph
-    from zrt.training.models.flops import op_cost as _op_cost
+    from zrt.training.ir.opgraph_builder import build_explicit_graph
+    from zrt.training.models.flops import op_cost_from_node as _op_cost_from_node
     from zrt.training.io.excel_exporter import export_estimate_excel
 
     if not all_results:
@@ -1417,10 +1428,11 @@ def export_best_configs_excel(
 
         strategy = _make_strategy_from_config(best_config)
 
-        graph = build_graph(model, strategy)
+        graph = build_explicit_graph(model, strategy)
         op_costs = {}
-        for op in graph.ops:
-            op_costs[op.name] = _op_cost(op, model, system)
+        for node in graph.nodes.values():
+            if not node.is_comm:
+                op_costs[node.id] = _op_cost_from_node(node, model, system)
 
         excel_name = f"{model_name}_{hw_name}_seq{seq_len}_ws{world_size}_best.xlsx"
         excel_path = os.path.join(output_path, excel_name)
@@ -1451,7 +1463,18 @@ def run_training_search_parallel(
         analysis_excel_template: Optional[str] = None,
         analysis_excel_name: Optional[str] = None,
         comparison_hw_groups: Optional[List[List[str]]] = None,
+        filters: Optional[List[Dict[str, Any]]] = None,
+        sort_by: str = "tokens_per_sec",
+        sort_ascending: bool = False,
 ) -> pd.DataFrame:
+    """Grid-search parallel strategies and tabulate the results.
+
+    ``filters`` is an optional list of ``{metric, op, value}`` constraints
+    (see :mod:`zrt.training.search.metric_filters`) applied on top of the
+    memory-feasibility / ``mfu_threshold`` checks. ``sort_by`` / ``sort_ascending``
+    pick the ranking column. Defaults reproduce the historical behaviour
+    (no extra filters, ranked by tokens/s descending).
+    """
     model_name = param_grid.get("model", ["unknown"])
     if isinstance(model_name, list):
         model_name = model_name[0] if model_name else "unknown"
@@ -1539,6 +1562,8 @@ def run_training_search_parallel(
         rep = r["report"]
         hw_name = r.get("hw_name") or r["config"].get("hw", "nvidia_h100_sxm")
         cap_gb = load_hw(hw_name).memory.capacity_gb
+        if not report_passes_filters(rep, filters):
+            continue
         if rep.memory is None:
             feasible_results.append(r)
             continue
@@ -1554,7 +1579,7 @@ def run_training_search_parallel(
 
     all_reports = [r["report"] for r in feasible_results]
     all_configs = [r["config"] for r in feasible_results]
-    all_df = format_results(all_reports, all_configs)
+    all_df = format_results(all_reports, all_configs, sort_by=sort_by, ascending=sort_ascending)
 
     filtered_df = all_df[all_df["mfu"] > mfu_threshold] if mfu_threshold > 0 else all_df
     if filtered_df.empty:
@@ -1612,8 +1637,8 @@ if __name__ == "__main__":
         "model": ["deepseek_v4_pro"],
         "hw": ["nvidia_b300", "nvidia_gb300_nvl576", "ascend_910c"],
         "world_size": [8192],
-        "tp": [1, 2, 4, 8, 16, 32, 64, 128],
-        "cp": [1, 2, 4, 8, 16, 32, 64, 128],
+        "tp": [1, 2, 4, 8,],
+        "cp": [1, 2, 4, 8,],
         "pp": [1, 2, 4, 8, 16],
         # EP must divide DP under the current expert-DP sharding model.
         "ep": [32, 64, 128],

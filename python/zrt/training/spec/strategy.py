@@ -27,6 +27,31 @@ class PPSched(Enum):
     DUALPIPE = "dualpipe"
     DUALPIPE_V = "dualpipev"
 
+    @classmethod
+    def _missing_(cls, value):
+        """Accept friendly aliases (UI / YAML presets) in addition to enum values.
+
+        The UI and config presets use names like ``interleaved`` / ``zero_bubble``
+        / ``dualpipe_v`` while the canonical values are ``i1f1b`` / ``zb`` /
+        ``dualpipev``. Normalize both here so every ``PPSched(<string>)`` call
+        site (search, config_loader, offline script) parses consistently.
+        """
+        if isinstance(value, str):
+            aliases = {
+                "1f1b": cls.ONE_F_ONE_B,
+                "one_f_one_b": cls.ONE_F_ONE_B,
+                "interleaved": cls.INTERLEAVED,
+                "i1f1b": cls.INTERLEAVED,
+                "vpp": cls.INTERLEAVED,
+                "zero_bubble": cls.ZERO_BUBBLE,
+                "zb": cls.ZERO_BUBBLE,
+                "dualpipe": cls.DUALPIPE,
+                "dualpipe_v": cls.DUALPIPE_V,
+                "dualpipev": cls.DUALPIPE_V,
+            }
+            return aliases.get(value.strip().lower())
+        return None
+
 
 class CPKind(Enum):
     NONE = "none"
@@ -182,6 +207,11 @@ class Strategy:
     # overlap
     tp_overlap: TPOverlap = TPOverlap.NONE
     ep_overlap: bool = False
+    # Spec-path fused MoE operator. When enabled, MoE routed experts are built
+    # as one mega_moe op that includes dispatch, expert FFN, and combine.
+    mega_moe: bool = False
+    # 0 means resolve from hardware ep_overlap_waves or a conservative default.
+    mega_moe_waves: int = 0
     # PP P2P (activation send between adjacent stages) hide-in-bwd_dw, only
     # meaningful for dual-stream schedules (DualPipe / DualPipeV). Default
     # OFF: even with DualPipe(V), PP P2P stays on the critical path unless
