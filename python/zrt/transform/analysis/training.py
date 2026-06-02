@@ -949,7 +949,7 @@ class TrainingPipelinePass(GraphPass):
                 target_node = g.nodes.get(target_id)
                 if target_node:
                     target_lat = target_node.annotations.get("latency_us", 0.0)
-            if otype == "coc" and target_lat <= 0.0:
+            if otype in ("coc", "p2p_overlap", "ring_cp") and target_lat <= 0.0:
                 pred_ids = g.predecessors(node.id)
                 pred_lats = [
                     g.nodes[p].annotations.get("latency_us", 0.0)
@@ -1644,7 +1644,7 @@ def compute_exposed_comm_time(
 
     Args:
         comm_latency_us: latency of the comm node in microseconds.
-        overlap_type: "coc", "mc2", "ring_cp", or "none".
+        overlap_type: "coc", "mc2", "ring_cp", "p2p_overlap", or "none".
         target_latency_us: latency of the compute node being overlapped.
         coc_tile_k: number of tiles for CoC overlap (default 4).
         cp_rounds: number of CP P2P rounds (for ring_cp).
@@ -1667,5 +1667,9 @@ def compute_exposed_comm_time(
         p2p_round_latency = comm_latency_us / cp_rounds if cp_rounds > 1 else comm_latency_us
         exposed_per_round = max(0.0, p2p_round_latency - fa_tile_latency)
         return exposed_per_round * cp_rounds
+    elif overlap_type == "p2p_overlap":
+        if target_latency_us > 0:
+            return max(0.0, comm_latency_us - target_latency_us)
+        return comm_latency_us
     else:
         return comm_latency_us

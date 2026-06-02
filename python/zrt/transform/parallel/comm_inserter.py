@@ -441,7 +441,8 @@ class CommInserterPass(GraphPass):
                 "layer": layer,
             },
             annotations={
-                "overlap_target": "attention_block",
+                "overlap_target": f"ring_cp:{first_node.id}",
+                "overlap_strategy": "cp",
                 "phase": phase,
                 "inserted_by": "cp_pass",
                 "mask": True,
@@ -507,7 +508,8 @@ class CommInserterPass(GraphPass):
                 "layer": layer,
             },
             annotations={
-                "overlap_target": "attention_block",
+                "overlap_target": f"p2p:{first_node.id}",
+                "overlap_strategy": "cp",
                 "phase": phase,
                 "inserted_by": "cp_pass",
                 "mask": True,
@@ -586,6 +588,8 @@ class CommInserterPass(GraphPass):
                 "inserted_by": "cp_pass",
                 "mask": True,
                 "mask_type": "p2p_overlap",
+                "overlap_target": f"p2p:{first_node.id}",
+                "overlap_strategy": "cp",
             },
             scope=first_node.scope,
             layer=layer,
