@@ -237,6 +237,13 @@ class TestMakeStrategyFromConfig:
 
         assert strategy.cp_kind == CPKind.ULYSSES
 
+    def test_mega_moe_fields(self):
+        config = {"mega_moe": True, "mega_moe_waves": 4}
+        strategy = _make_strategy_from_config(config)
+
+        assert strategy.mega_moe is True
+        assert strategy.mega_moe_waves == 4
+
     def test_hybrid_cp_factors(self):
         strategy = _make_strategy_from_config({
             "cp": 8,
@@ -1001,7 +1008,7 @@ class TestBestAnalysisReport:
             "tokens_per_sec": 150.0,
             "fwd_compute_ms": 20.0,
             "bwd_compute_ms": 30.0,
-            "recompute_time_ms": 10.0,
+            "recompute_critical_ms": 10.0,
             "tp_exposed_ms": 2.0,
             "ep_exposed_ms": 3.0,
             "pp_exposed_ms": 4.0,
