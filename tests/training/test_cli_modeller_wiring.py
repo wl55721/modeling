@@ -4,6 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from python.zrt.ir.edge import Edge
+from python.zrt.ir.graph import OpGraph
+from python.zrt.ir.node import OpNode
+
 
 def _check_torch_available():
     """Check if torch is available."""
@@ -19,23 +23,56 @@ class _Report:
     def summary(self) -> str:
         return "graph-native report"
 
+    def to_dict(self) -> dict:
+        return {"summary": "graph-native report"}
 
-def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
+
+def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys, tmp_path):
     if not _check_torch_available():
         pytest.skip("torch not installed")
     
     from python.zrt import cli
 
     calls = []
+    onnx_calls = []
+
+    transformed_unified = OpGraph(name="transformed_unified", phase="train")
+    transformed_unified.add_node(OpNode(
+        id="comm_a2a_dispatch",
+        op_type="comm.all_to_all",
+        annotations={"phase": "fwd"},
+    ))
+    transformed_unified.add_node(OpNode(
+        id="grouped_gate_up",
+        op_type="GroupedMatMul",
+        annotations={"phase": "fwd"},
+    ))
+    transformed_unified.add_node(OpNode(
+        id="grouped_down_bwd",
+        op_type="GroupedMatMul",
+        annotations={"phase": "bwd"},
+    ))
+    transformed_unified.add_edge(Edge(
+        src="comm_a2a_dispatch", src_idx=0,
+        dst="grouped_gate_up", dst_idx=0,
+    ))
 
     def fake_estimate_training_from_graphs(**kwargs):
         calls.append(kwargs)
         # cli.py unpacks (report, ctx, transformed); return matching 3-tuple
-        return _Report(), None, {}
+        return _Report(), None, {"unified": transformed_unified}
+
+    def fake_export_transformed_graph_onnx(graph, output_path):
+        onnx_calls.append({"graph": graph, "output_path": output_path})
+        return output_path
 
     monkeypatch.setattr(
         "python.zrt.transform.analysis.estimate_training_from_graphs",
         fake_estimate_training_from_graphs,
+    )
+    monkeypatch.setattr(
+        "python.zrt.transform.exporter.export_transformed_graph_onnx",
+        fake_export_transformed_graph_onnx,
     )
 
     args = SimpleNamespace(
@@ -45,6 +82,7 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         seq_len=128,
         tp=2,
         pp=3,
+        tp_coc=False,
         ep=1,
         dp=4,
         cp=5,
@@ -67,14 +105,15 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         mega_moe=True,
         mega_moe_waves=4,
     )
-    fwd_graph = object()
-    bwd_graph = object()
+    fwd_graph = SimpleNamespace(metadata={})
+    bwd_graph = SimpleNamespace(metadata={})
     result = SimpleNamespace(
         graphs={
             "train_forward": fwd_graph,
             "train_backward": bwd_graph,
         },
-        output_dir=None,
+        output_dir=tmp_path,
+        phase_records={},
     )
     hw = object()
 
@@ -96,3 +135,17 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
     assert calls[0]["mega_moe"] is True
     assert calls[0]["mega_moe_waves"] == 4
     assert "graph-native report" in capsys.readouterr().out
+    assert {call["output_path"].name for call in onnx_calls} == {
+        "llama3_8b_train_forward_graph.onnx",
+        "llama3_8b_train_backward_graph.onnx",
+        "llama3_8b_unified_graph.onnx",
+    }
+    onnx_by_name = {call["output_path"].name: call["graph"] for call in onnx_calls}
+    assert onnx_by_name["llama3_8b_unified_graph.onnx"] is transformed_unified
+    assert {n.op_type for n in onnx_by_name["llama3_8b_train_forward_graph.onnx"].nodes.values()} == {
+        "comm.all_to_all",
+        "GroupedMatMul",
+    }
+    assert {n.op_type for n in onnx_by_name["llama3_8b_train_backward_graph.onnx"].nodes.values()} == {
+        "GroupedMatMul",
+    }

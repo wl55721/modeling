@@ -291,6 +291,7 @@ class TrainingConfig:
     # (K-wave overlap), reducing exposed comm time in trace mode.
     tp_coc: bool = False
     tp_coc_tile_k: int = 4
+    trace_ep_waves: bool = False
 
     # Memory offloading (optional, disabled by default)
     offload: OffloadConfig | None = None

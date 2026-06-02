@@ -55,6 +55,7 @@ def estimate_training_from_graphs(
     vpp_chunks: int = 1,
     pp_mode: str = "trace",
     tp_coc: bool = False,
+    trace_ep_waves: bool = False,
     return_transformed: bool = False,
     quant: str | None = None,
     quant_preset: str | None = None,
@@ -170,6 +171,7 @@ def estimate_training_from_graphs(
             vpp_chunks=vpp_chunks,
             pp_mode=pp_mode,
             tp_coc=tp_coc,
+            trace_ep_waves=trace_ep_waves,
             seq_len=seq_len,
             hidden=hidden,
             cp_kind=cp_kind,
@@ -238,7 +240,10 @@ def estimate_training_from_graphs(
                 from python.zrt.executor.chrome_trace import ChromeTraceExporter
                 trace_dir = out / "pp_trace"
                 trace_dir.mkdir(parents=True, exist_ok=True)
-                exporter = ChromeTraceExporter()
+                exporter = ChromeTraceExporter(
+                    trace_ep_waves=ctx.training.trace_ep_waves if ctx.training else False,
+                    ep_wave_k=getattr(hw_spec.compute, "ep_overlap_waves", 0),
+                )
                 M = pp_timeline.M
 
                 exporter.export_stitched(pp_timeline, str(trace_dir / "pp_stitched.json"))
