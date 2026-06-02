@@ -93,8 +93,23 @@ def count_params(graph: OpGraph, apply_layer_scale: bool = False) -> int:
 
     If ``apply_layer_scale=True`` and metadata["total_params"] is 0, applies
     layer_scale to the counted params (useful for training FLOPs calculation).
+    
+    IMPORTANT: When metadata["total_params"] > 0, apply_layer_scale is IGNORED
+    because the authoritative value is already set (possibly pre-scaled by
+    LayerScalingPass). Callers should understand this behavior:
+    - If LayerScalingPass ran, metadata["total_params"] is already scaled
+    - apply_layer_scale=True only helps when LayerScalingPass did NOT run
     """
     if graph.metadata.get("total_params", 0) > 0:
+        if apply_layer_scale:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(
+                "count_params(apply_layer_scale=True) ignored because "
+                "metadata['total_params'] already set (value=%d). "
+                "Use metadata value directly.",
+                graph.metadata["total_params"]
+            )
         return int(graph.metadata["total_params"])
 
     counted_ids: set[str] = set()

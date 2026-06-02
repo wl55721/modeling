@@ -214,12 +214,30 @@ class TrainingMemoryPass(GraphPass):
         # ── Per-component dtype sizing when quant_profile available ──────────
         if quant_profile is not None:
             from zrt.training.spec.dtype import Dtype
-            comp_params = count_params_by_component(g)
-            if layer_scale != 1.0:
-                comp_params.routed_expert = int(comp_params.routed_expert * layer_scale)
-                comp_params.shared_expert = int(comp_params.shared_expert * layer_scale)
-                comp_params.other = int(comp_params.other * layer_scale)
-                # non_layer (embedding, lm_head, final_norm) captured at full size
+            from python.zrt.ir.param_count import ComponentParams
+            
+            # ── Get component params ───────────────────────────────────────────
+            # Use metadata["params_by_component"] if available (set by LayerScalingPass)
+            # to avoid double-scaling. LayerScalingPass already scaled per-layer params.
+            if "params_by_component" in g.metadata:
+                comp_breakdown = g.metadata["params_by_component"]
+                comp_params = ComponentParams(
+                    routed_expert=comp_breakdown["routed_expert"],
+                    shared_expert=comp_breakdown["shared_expert"],
+                    other=comp_breakdown["other"],
+                    non_layer=comp_breakdown["non_layer"],
+                )
+                # params_by_component already scaled by LayerScalingPass, no additional scaling
+            else:
+                # No pre-computed breakdown, count params by component
+                comp_params = count_params_by_component(g)
+                # Apply layer_scale only when metadata["total_params"] is NOT set
+                # (to avoid double-scaling when LayerScalingPass already scaled)
+                if g.metadata.get("total_params", 0) == 0 and layer_scale != 1.0:
+                    comp_params.routed_expert = int(comp_params.routed_expert * layer_scale)
+                    comp_params.shared_expert = int(comp_params.shared_expert * layer_scale)
+                    comp_params.other = int(comp_params.other * layer_scale)
+                    # non_layer (embedding, lm_head, final_norm) captured at full size
 
             # Weights use stored_bytes (includes FP4 MXFP block overhead for
             # on-device storage).  Grads use raw .bytes (grads are always
