@@ -108,6 +108,10 @@ def count_params(graph: OpGraph, apply_layer_scale: bool = False) -> int:
                     counted_ids.add(inp.id)
                     name_total += math.prod(inp.shape)
     if name_total > 0:
+        if apply_layer_scale:
+            layer_scale = compute_layer_scale(graph)
+            if layer_scale != 1.0:
+                name_total = int(name_total * layer_scale)
         return name_total
 
     produced_ids: set[str] = set()
