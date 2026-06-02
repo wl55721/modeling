@@ -95,6 +95,7 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
     from python.zrt.transform.training.recompute import RecomputePass
     from python.zrt.transform.training.optimizer import OptimizerPass
     from python.zrt.transform.training.offload import OffloadPass
+    from python.zrt.transform.layer_scaling import LayerScalingPass
 
     is_train = lambda c: c.is_training
 
@@ -102,6 +103,9 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
 
     # ── Stage 1: Split ────────────────────────────────────────────────────────
     # All passes here read raw aten op_types, so they MUST run before `fuse`.
+    # LayerScalingPass MUST run FIRST to scale metadata before TP/EP sharding.
+    # Condition: run when graph has typical_indices (set by model_loader)
+    pipe.add("split", LayerScalingPass())
     pipe.add("split", DataParallelPass(),
              condition=lambda c: c.parallel.dp > 1 and c.is_training)
     pipe.add("split", TensorParallelPass(),

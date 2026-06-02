@@ -13,6 +13,36 @@ if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
 
 
+def compute_layer_scale(graph: "OpGraph") -> float:
+    """Compute layer scaling factor from typical_indices or num_layers ratio.
+    
+    Priority:
+    1. graph.metadata["layer_scale"] — if already set by LayerScalingPass
+    2. LayerProfile-based: num_layers / len(typical_indices)
+    3. Simple ratio: num_layers / num_layers_traced
+    
+    Returns 1.0 if no scaling needed or information unavailable.
+    """
+    layer_scale = graph.metadata.get("layer_scale", 0.0)
+    if layer_scale > 0.0:
+        return layer_scale
+    
+    num_layers = graph.metadata.get("num_layers", 0)
+    if num_layers == 0:
+        return 1.0
+    
+    typical_indices = graph.metadata.get("typical_indices", None)
+    if typical_indices is not None and len(typical_indices) > 0:
+        num_typical = len(typical_indices)
+        return num_layers / num_typical
+    
+    num_layers_traced = graph.metadata.get("num_layers_traced", num_layers)
+    if num_layers_traced > 0 and num_layers != num_layers_traced:
+        return num_layers / num_layers_traced
+    
+    return 1.0
+
+
 @dataclass
 class ComponentParams:
     """Parameter counts split by component category."""
@@ -40,14 +70,18 @@ def op_short(op_type: str) -> str:
     return parts[1] if len(parts) >= 2 else parts[0]
 
 
-def count_params(graph: OpGraph) -> int:
+def count_params(graph: OpGraph, apply_layer_scale: bool = False) -> int:
     """Count model parameters from an OpGraph.
 
     Three-tier strategy, tried in order:
     1. graph.metadata["total_params"] — authoritative when set by a model loader
+       (or LayerScalingPass for pre-scaled params)
     2. Name heuristic — tensor IDs containing "weight" or "param" (synthetic graphs)
     3. Structural fallback — external 2-D inputs to matmul/embedding ops, skipping
        activation positions that differ per op type (captured graphs use opaque IDs)
+
+    If ``apply_layer_scale=True`` and metadata["total_params"] is 0, applies
+    layer_scale to the counted params (useful for training FLOPs calculation).
     """
     if graph.metadata.get("total_params", 0) > 0:
         return int(graph.metadata["total_params"])
@@ -91,6 +125,12 @@ def count_params(graph: OpGraph) -> int:
             if inp.shape and len(inp.shape) == 2:
                 counted_ids.add(inp.id)
                 struct_total += math.prod(inp.shape)
+    
+    if apply_layer_scale and struct_total > 0:
+        layer_scale = compute_layer_scale(graph)
+        if layer_scale != 1.0:
+            struct_total = int(struct_total * layer_scale)
+    
     return struct_total
 
 

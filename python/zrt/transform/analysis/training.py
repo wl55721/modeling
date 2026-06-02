@@ -5,7 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from python.zrt.ir.param_count import count_params, count_params_by_component
+from python.zrt.ir.param_count import count_params, count_params_by_component, compute_layer_scale
 from python.zrt.transform.base import GraphPass
 from python.zrt.transform.training.recompute import is_external_recompute_node
 
@@ -23,12 +23,13 @@ _BWD_PHASES = {"bwd", "backward", "train_backward"}
 # ── TrainingFlopsPass ───────────────────────────────────────────────────────────
 
 class TrainingFlopsPass(GraphPass):
-    """Annotate graph with training FLOPs.
+    """Annotate graph with forward/backward training FLOPs and parameter count.
 
-    Strategy (priority order):
-    1. Per-node annotations: sum flops_fwd / flops_dx / flops_dw from
-       ``FlopsPass`` when available (more accurate for MoE, comm, etc.)
-    2. 6P rule fallback: 6 * total_params * tokens (dense transformers)
+    Uses two sources:
+    1. Per-node annotations (flops_fwd, flops_dx, flops_dw) from FlopsPass
+       when available (more accurate for MoE, comm, etc.)
+    2. Pre-scaled metadata from LayerScalingPass (if layer_scaling_complete)
+       This avoids underestimation when TP/EP shards the graph before scaling.
 
     Adds to graph.metadata:
       "training_flops": float
@@ -42,38 +43,17 @@ class TrainingFlopsPass(GraphPass):
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
         g = graph.clone()
 
-        has_param_override = g.metadata.get("total_params", 0) > 0
-
-        total_params = count_params(g)
-
-        num_layers = g.metadata.get("num_layers", 0)
-        num_layers_traced = g.metadata.get("num_layers_traced", num_layers)
+        # ── Get params and layer_scale (unified logic) ─────────────────────────
+        # count_params() checks metadata["total_params"] internally (set by LayerScalingPass)
+        # If not set, apply_layer_scale=True computes and scales params in one step
+        total_params = count_params(g, apply_layer_scale=True)
+        layer_scale = compute_layer_scale(g)
         
-        # Check for LayerProfile-based scaling
-        layer_profile = g.metadata.get("layer_profile", None)
-        typical_indices = g.metadata.get("typical_indices", None)
-        
-        if layer_profile is not None and typical_indices is not None:
-            # LayerProfile-based scaling: use precise layer type counts
-            # This is more accurate than simple num_layers / num_layers_traced
-            # when different layer types have different computational costs
-            num_typical = len(typical_indices)
-            layer_scale = num_layers / num_typical if num_typical > 0 else 1.0
+        if layer_scale != 1.0:
             logger.info(
-                "Using LayerProfile scaling: typical_indices=%s, "
-                "num_layers=%d, scale=%.2f",
-                typical_indices, num_layers, layer_scale,
+                "TrainingFlopsPass: layer_scale=%.2f (params=%d)",
+                layer_scale, total_params
             )
-        else:
-            # Legacy scaling: simple layer count ratio
-            layer_scale = (
-                num_layers / num_layers_traced 
-                if num_layers_traced > 0 and num_layers != num_layers_traced 
-                else 1.0
-            )
-
-        if not has_param_override and layer_scale != 1.0:
-            total_params = int(total_params * layer_scale)
 
         # ── Try per-node annotation path ────────────────────────────────────
         is_stitched = g.metadata.get("fwd_bwd_stitched", False)
