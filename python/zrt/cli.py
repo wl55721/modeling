@@ -738,6 +738,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         mega_moe_waves=getattr(args, "mega_moe_waves", 0),
         pp_schedule=args.pp_schedule,
         vpp_chunks=args.vpp_chunks,
+        pp_mode=getattr(args, "pp_mode", "trace"),
         dp_overlap_in_bubble=args.dp_overlap,
         dp_bucket_mode="ddp" if getattr(args, "dp_ddp_buckets", False) else "layer",
         dp_bucket_cap_mb=args.dp_bucket_cap_mb,
