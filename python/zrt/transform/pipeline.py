@@ -95,6 +95,7 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
     from python.zrt.transform.training.recompute import RecomputePass
     from python.zrt.transform.training.optimizer import OptimizerPass
     from python.zrt.transform.training.offload import OffloadPass
+    from python.zrt.transform.passes.coarsen import GraphCoarsenPass
 
     is_train = lambda c: c.is_training
 
@@ -129,6 +130,11 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
              condition=lambda c: c.is_training and c.training.tp_coc)
     pipe.add("split", PipelineParallelPass(),
              condition=lambda c: c.parallel.pp > 1)
+    # GraphCoarsenPass aggregates aten-level nodes into block-level nodes
+    # by leaf module scope.  No-op for already block-level inputs and for
+    # stitched fwd+bwd graphs (which have reversed gradient-flow edges
+    # that would create cycles after coarsening).
+    pipe.add("split", GraphCoarsenPass())
 
     # ── Stage 2: Fuse ─────────────────────────────────────────────────────────
     pipe.add("fuse", FusionPass())
