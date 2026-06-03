@@ -56,6 +56,7 @@ def estimate_training_from_graphs(
     pp_mode: str = "trace",
     tp_coc: bool = False,
     trace_ep_waves: bool = False,
+    trace_moe_fb_overlap: bool = False,
     return_transformed: bool = False,
     quant: str | None = None,
     quant_preset: str | None = None,
@@ -172,6 +173,7 @@ def estimate_training_from_graphs(
             pp_mode=pp_mode,
             tp_coc=tp_coc,
             trace_ep_waves=trace_ep_waves,
+            trace_moe_fb_overlap=trace_moe_fb_overlap,
             seq_len=seq_len,
             hidden=hidden,
             cp_kind=cp_kind,
@@ -240,8 +242,10 @@ def estimate_training_from_graphs(
                 from python.zrt.executor.chrome_trace import ChromeTraceExporter
                 trace_dir = out / "pp_trace"
                 trace_dir.mkdir(parents=True, exist_ok=True)
+                trace_moe_fb = ctx.training.trace_moe_fb_overlap if ctx.training else False
                 exporter = ChromeTraceExporter(
-                    trace_ep_waves=ctx.training.trace_ep_waves if ctx.training else False,
+                    trace_ep_waves=(ctx.training.trace_ep_waves and not trace_moe_fb) if ctx.training else False,
+                    trace_moe_fb_overlap=trace_moe_fb,
                     ep_wave_k=getattr(hw_spec.compute, "ep_overlap_waves", 0),
                 )
                 M = pp_timeline.M
@@ -350,6 +354,12 @@ def estimate_training_from_graphs(
         ep_exposed_ms=_d("ep_exposed_ms", 0.0),
         ep_hidden_ms=_d("ep_hidden_ms", 0.0),
         ep_total_ms=_d("ep_total_ms", 0.0),
+        ep_fb_total_ms=_d("ep_fb_total_ms", 0.0),
+        ep_fb_hidden_ms=_d("ep_fb_hidden_ms", 0.0),
+        ep_fb_exposed_ms=_d("ep_fb_exposed_ms", 0.0),
+        ep_fb_steady_hidden_ms=_d("ep_fb_steady_hidden_ms", 0.0),
+        ep_fb_boundary_hidden_ms=_d("ep_fb_boundary_hidden_ms", 0.0),
+        mega_moe_hidden_ms=_d("mega_moe_hidden_ms", 0.0),
         pp_exposed_ms=_d("pp_exposed_ms", 0.0),
         pp_hidden_ms=_d("pp_hidden_ms", 0.0),
         pp_total_ms=_d("pp_total_ms", 0.0),

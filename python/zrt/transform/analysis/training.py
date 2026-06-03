@@ -20,6 +20,37 @@ logger = logging.getLogger(__name__)
 _BWD_PHASES = {"bwd", "backward", "train_backward"}
 
 
+def _graph_moe_fb_overlap_us(
+    *,
+    ep_total_us: float,
+    fwd_compute_us: float,
+    bwd_compute_us: float,
+    strategy: Any,
+) -> tuple[float, float]:
+    """Estimate graph-path MoE F/B EP hiding from the PP schedule window."""
+    if (
+        ep_total_us <= 0.0
+        or not getattr(strategy, "moe_fb_overlap", True)
+        or getattr(strategy, "ep", 1) <= 1
+    ):
+        return 0.0, max(0.0, ep_total_us)
+
+    from zrt.training.models.moe_fb_overlap import (
+        schedule_window_factor,
+        steady_fraction,
+    )
+
+    factor = schedule_window_factor(strategy)
+    steady = steady_fraction(strategy)
+    if factor <= 0.0 or steady <= 0.0:
+        return 0.0, max(0.0, ep_total_us)
+
+    compute_window_us = max(0.0, fwd_compute_us) + max(0.0, bwd_compute_us)
+    hidden = min(max(0.0, ep_total_us), compute_window_us * factor * steady)
+    exposed = max(0.0, ep_total_us - hidden)
+    return hidden, exposed
+
+
 # ── TrainingFlopsPass ───────────────────────────────────────────────────────────
 
 class TrainingFlopsPass(GraphPass):
@@ -996,6 +1027,44 @@ class TrainingPipelinePass(GraphPass):
             setattr(per_strat, f"{tag}_hidden_us", merged_hidden)
             setattr(per_strat, f"{tag}_exposed_us", max(0.0, merged_total - merged_hidden))
 
+        moe_fb_enabled = bool(getattr(ctx.training, "moe_fb_overlap", True))
+        ep_fb_total_us = per_strat.ep_total_us
+        ep_fb_hidden_us = 0.0
+        ep_fb_exposed_us = ep_fb_total_us
+        ep_fb_steady_hidden_us = 0.0
+        ep_fb_boundary_hidden_us = 0.0
+        if moe_fb_enabled:
+            stage_comm_us = (
+                per_strat.tp_total_us + per_strat.ep_total_us
+                + per_strat.pp_total_us + per_strat.cp_total_us
+            )
+            stage_window_us = max(
+                0.0,
+                stage_fwd.get(bottleneck_stage, 0.0)
+                + stage_bwd.get(bottleneck_stage, 0.0)
+                - stage_comm_us,
+            )
+            fb_hidden, fb_exposed = _graph_moe_fb_overlap_us(
+                ep_total_us=per_strat.ep_total_us,
+                fwd_compute_us=stage_window_us,
+                bwd_compute_us=0.0,
+                strategy=strategy_proxy,
+            )
+            if fb_hidden > per_strat.ep_hidden_us:
+                per_strat.ep_hidden_us = fb_hidden
+                per_strat.ep_exposed_us = fb_exposed
+            else:
+                per_strat.ep_exposed_us = max(
+                    0.0,
+                    per_strat.ep_total_us - per_strat.ep_hidden_us,
+                )
+            ep_fb_hidden_us = per_strat.ep_hidden_us
+            ep_fb_exposed_us = per_strat.ep_exposed_us
+            ep_fb_steady_hidden_us = ep_fb_hidden_us
+        else:
+            per_strat.ep_hidden_us = 0.0
+            per_strat.ep_exposed_us = per_strat.ep_total_us
+
         total_comm_us = (
             per_strat.tp_total_us + per_strat.ep_total_us
             + per_strat.pp_total_us + per_strat.cp_total_us
@@ -1170,6 +1239,20 @@ class TrainingPipelinePass(GraphPass):
                 key = f"{tag}_{suffix}"
                 us_key = key.replace("_ms", "_us")
                 sr[key] = getattr(per_strat, us_key, 0.0) / 1000.0
+
+        if moe_fb_enabled:
+            sr["ep_fb_total_ms"] = ep_fb_total_us / 1000.0
+            sr["ep_fb_hidden_ms"] = ep_fb_hidden_us / 1000.0
+            sr["ep_fb_exposed_ms"] = ep_fb_exposed_us / 1000.0
+            sr["ep_fb_steady_hidden_ms"] = ep_fb_steady_hidden_us / 1000.0
+            sr["ep_fb_boundary_hidden_ms"] = ep_fb_boundary_hidden_us / 1000.0
+        else:
+            sr["ep_fb_total_ms"] = 0.0
+            sr["ep_fb_hidden_ms"] = 0.0
+            sr["ep_fb_exposed_ms"] = 0.0
+            sr["ep_fb_steady_hidden_ms"] = 0.0
+            sr["ep_fb_boundary_hidden_ms"] = 0.0
+        sr.setdefault("mega_moe_hidden_ms", 0.0)
 
         g.metadata["step_result"] = sr
         g.metadata["recompute_compute_ms"] = recompute_compute_ms

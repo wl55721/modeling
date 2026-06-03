@@ -294,6 +294,11 @@ def main() -> None:
              "segments in PP Chrome traces. This changes trace presentation "
              "only; it does not alter step-time modelling.",
     )
+    parser.add_argument(
+        "--trace-moe-fb-overlap", action="store_true", default=False,
+        help="Render MindSpeed-style MoE forward/backward A2A overlap metadata "
+             "in PP Chrome traces when available.",
+    )
 
     args = parser.parse_args()
 
@@ -721,6 +726,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         pp_mode=getattr(args, "pp_mode", "trace"),
         tp_coc=args.tp_coc,
         trace_ep_waves=getattr(args, "trace_ep_waves", False),
+        trace_moe_fb_overlap=getattr(args, "trace_moe_fb_overlap", False),
         return_transformed=True,
         quant=args.quant,
         moe_total_experts=_moe_total,

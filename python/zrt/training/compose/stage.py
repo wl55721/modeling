@@ -55,6 +55,12 @@ class StageTime:
     comm_fwd: float = 0.0   # exposed comm in fwd (after TP/EP overlap reductions)
     comm_bwd: float = 0.0   # exposed comm in bwd (after TP/EP overlap reductions)
     ep_hidden: float = 0.0  # EP comm hidden by wave-overlap (fwd + bwd combined)
+    ep_fb_hidden: float = 0.0
+    ep_fb_exposed: float = 0.0
+    ep_fb_total: float = 0.0
+    ep_fb_steady_hidden: float = 0.0
+    ep_fb_boundary_hidden: float = 0.0
+    mega_moe_hidden: float = 0.0
     tp_hidden: float = 0.0  # TP comm hidden by CoC/MC2 (fwd + bwd combined)
     tp_exposed: float = 0.0  # TP comm exposed after CoC/MC2 (fwd + bwd combined)
     ep_exposed: float = 0.0  # EP comm exposed after wave-overlap (fwd + bwd combined)
@@ -363,38 +369,11 @@ def stage_time(
     # as a single pool.
     # Fix (2026-05-18): use pre-computed t_ep_raw_comm_fwd/bwd (post-imbalance);
     # no inner re-loop over collectives needed.
+    # Normal EP hidden stays zero here; composer-level `moe_fb_overlap` owns
+    # any schedule-window hiding for non-MegaMoE EP A2A.
     t_ep_hidden = 0.0
-    t_ep_exposed_fwd = t_ep_raw_comm_fwd  # default: no overlap
+    t_ep_exposed_fwd = t_ep_raw_comm_fwd
     t_ep_exposed_bwd = t_ep_raw_comm_bwd
-    if strategy.ep_overlap and strategy.ep > 1 and model.num_experts > 0:
-        # EP GEMM times needed by both K-wave formula and inter-batch non_ep_compute.
-        t_ep_gemm_fwd = _ep_gemm_time(stage_ops, model, system, strategy, gpu_name)
-        t_ep_gemm_bwd = 0.0
-        for op in stage_ops:
-            if _is_routed_expert_compute(op):
-                cost = op_cost(op, model, system)
-                op_overlap = gpu.overlap_ratio.get(_kind(op), 0.0)
-                op_dtype = _resolve_compute_dtype(op, model)
-                dx_t = _cost_phase_time(cost, "dx", system, gpu_name, op_overlap, op_dtype)
-                dw_t = _cost_phase_time(cost, "dw", system, gpu_name, op_overlap, op_dtype)
-                t_ep_gemm_bwd += dx_t + dw_t
-
-        saved_fwd = 0.0
-        saved_bwd = 0.0
-
-        # Intra-batch K-wave overlap: splits EP A2A into K sub-waves, each pipelined
-        # with expert GEMM within the same microbatch.
-        # Requires hardware-level fine-grained A2A/GEMM streaming (NVIDIA CUDA: K=4;
-        # Ascend HCCS: ep_overlap_waves=0, not supported).
-        if gpu.ep_overlap_waves > 0:
-            K = gpu.ep_overlap_waves
-            saved_fwd = _wave_overlap_saved(t_ep_raw_comm_fwd, t_ep_gemm_fwd, K)
-            saved_fwd = min(saved_fwd, t_ep_raw_comm_fwd)
-            t_ep_hidden += saved_fwd
-
-            saved_bwd = _wave_overlap_saved(t_ep_raw_comm_bwd, t_ep_gemm_bwd, K)
-            saved_bwd = min(saved_bwd, t_ep_raw_comm_bwd)
-            t_ep_hidden += saved_bwd
 
         # Inter-batch EP overlap: when dual_batch=True and pp>1, two microbatches
         # run simultaneously. Batch A's residual EP A2A (after K-wave overlap)
@@ -415,39 +394,6 @@ def stage_time(
         # bubble = (pp-1)/(2V) * t_stage. Scaling inter_saved by the steady-state
         # fraction M/(M + bubble_slots) makes the aggregate step saving exactly
         # M * inter_saved (steady only), not (M + bubble_slots) * inter_saved.
-        if strategy.dualbatch and strategy.pp > 1:
-            residual_ep_fwd = max(0.0, t_ep_raw_comm_fwd - saved_fwd)
-            residual_ep_bwd = max(0.0, t_ep_raw_comm_bwd - saved_bwd)
-
-            non_ep_compute_fwd = max(0.0, t_fwd - t_comm_fwd - t_ep_gemm_fwd)
-            non_ep_compute_bwd = max(0.0, (t_bwd_dx + t_bwd_dw) - t_comm_bwd - t_ep_gemm_bwd)
-
-            inter_saved_fwd = min(residual_ep_fwd, non_ep_compute_fwd)
-            inter_saved_bwd = min(residual_ep_bwd, non_ep_compute_bwd)
-
-            V = max(1, strategy.vpp_chunks)
-            M_mb = strategy.num_microbatches()
-            bubble_slots = (strategy.pp - 1) / (2.0 * V)
-            denom = M_mb + bubble_slots
-            steady_fraction = M_mb / denom if denom > 0 else 1.0
-            inter_saved_fwd *= steady_fraction
-            inter_saved_bwd *= steady_fraction
-
-            t_ep_hidden += inter_saved_fwd + inter_saved_bwd
-            saved_fwd += inter_saved_fwd
-            saved_bwd += inter_saved_bwd
-
-        # Remove hidden EP from combined comm totals
-        t_comm_fwd -= saved_fwd
-        t_comm_bwd -= saved_bwd
-        # Update fwd/bwd totals (EP portion reduced)
-        t_fwd -= saved_fwd
-        t_bwd_dx -= saved_bwd
-
-        # EP exposed per direction
-        t_ep_exposed_fwd = max(0.0, t_ep_raw_comm_fwd - saved_fwd)
-        t_ep_exposed_bwd = max(0.0, t_ep_raw_comm_bwd - saved_bwd)
-
     # MegaMoE fused internal dispatch/combine is not part of the raw external
     # EP A2A pool above, so scale it here without feeding it back through the
     # legacy ep_overlap post-process.
@@ -471,6 +417,7 @@ def stage_time(
         comm_fwd=t_comm_fwd,
         comm_bwd=t_comm_bwd,
         ep_hidden=t_ep_hidden,
+        mega_moe_hidden=fused_ep_hidden,
         tp_hidden=t_tp_hidden,
         tp_exposed=t_tp_exposed_fwd + t_tp_exposed_bwd,
         ep_exposed=t_ep_exposed_fwd + t_ep_exposed_bwd,

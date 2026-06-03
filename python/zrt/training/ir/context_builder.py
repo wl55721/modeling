@@ -88,6 +88,7 @@ def build_context(
         micro_batch=strategy.micro_batch,
         global_batch=strategy.global_batch,
         recompute_policy=getattr(strategy, "recompute_policy", "none"),
+        moe_fb_overlap=getattr(strategy, "moe_fb_overlap", True),
         pp_schedule=_resolve_pp_schedule(strategy),
         vpp_chunks=getattr(strategy, "vpp_chunks", 1),
         pp_mode=pp_mode,

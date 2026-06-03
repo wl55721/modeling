@@ -125,11 +125,13 @@ class ChromeTraceExporter:
         time_unit: str = "us",
         *,
         trace_ep_waves: bool = False,
+        trace_moe_fb_overlap: bool = False,
         ep_wave_k: int = 0,
     ) -> None:
         self._mult = 1000.0 if time_unit == "ns" else 1.0
         self._time_unit = time_unit
         self._trace_ep_waves = trace_ep_waves
+        self._trace_moe_fb_overlap = trace_moe_fb_overlap
         self._ep_wave_k = max(0, int(ep_wave_k))
 
     # ── metadata helpers ──────────────────────────────────────────────────
@@ -447,6 +449,35 @@ class ChromeTraceExporter:
                         },
                     ).to_dict())
 
+        if self._trace_moe_fb_overlap:
+            for s, tl in enumerate(timelines):
+                fwd_lat = tl.phase_latency("fwd")
+                bwd_lat = tl.phase_latency("bwd")
+                if fwd_lat == 0.0 and bwd_lat == 0.0:
+                    fwd_lat = tl.total_latency_us
+                stage_total = fwd_lat + bwd_lat
+                num_replicas = M if replicate else 1
+                overlay_tid = self._moe_fb_overlay_tid(tl, detail_base=0)
+                for m in range(num_replicas):
+                    fwd_base = grid_slot.get((s, m, "fwd"), m * stage_total)
+                    bwd_base = grid_slot.get(
+                        (s, m, "bwd"),
+                        grid_slot.get((s, m, "bwd_dx"), m * stage_total + fwd_lat),
+                    )
+                    events.extend(self._moe_fb_overlap_events(
+                        tl.scheduled_ops,
+                        pid=s,
+                        tid=overlay_tid,
+                        base=fwd_base if replicate else 0.0,
+                        mb=m if replicate else None,
+                        name_prefix=f"m{m}:" if replicate else "",
+                        rel_start=lambda candidate, bwd_base=bwd_base, fwd_base=fwd_base: (
+                            candidate.start_us
+                            if candidate.phase == "fwd" or not candidate.phase
+                            else bwd_base - fwd_base + candidate.start_us - fwd_lat
+                        ),
+                    ))
+
         events = self._deduplicate(events)
         doc = self._build_doc(events)
         if path:
@@ -521,6 +552,17 @@ class ChromeTraceExporter:
                         "view": "detail",
                     },
                 ).to_dict())
+            if self._trace_moe_fb_overlap:
+                overlay_tid = self._moe_fb_overlay_tid(tl, detail_base=detail_base)
+                events.extend(self._moe_fb_overlap_events(
+                    tl.scheduled_ops,
+                    pid=d,
+                    tid=overlay_tid,
+                    base=0.0,
+                    mb=None,
+                    name_prefix="",
+                    rel_start=lambda candidate: candidate.start_us,
+                ))
 
         events = self._deduplicate(events)
         doc = self._build_doc(events)
@@ -695,12 +737,86 @@ class ChromeTraceExporter:
                             },
                         ).to_dict())
 
+        if self._trace_moe_fb_overlap:
+            for d, tl in enumerate(timelines):
+                fwd_lat = tl.phase_latency("fwd")
+                overlay_tid = self._moe_fb_overlay_tid(tl, detail_base=detail_base)
+                for m in range(stitched.M):
+                    fwd_base = grid_index.get((d, m, "fwd"), 0.0)
+                    bwd_base = grid_index.get(
+                        (d, m, "bwd"),
+                        grid_index.get((d, m, "bwd_dx"), 0.0),
+                    )
+                    events.extend(self._moe_fb_overlap_events(
+                        tl.scheduled_ops,
+                        pid=d,
+                        tid=overlay_tid,
+                        base=fwd_base,
+                        mb=m,
+                        name_prefix=f"m{m}:",
+                        rel_start=lambda candidate, bwd_base=bwd_base, fwd_base=fwd_base: (
+                            candidate.start_us
+                            if candidate.phase == "fwd" or not candidate.phase
+                            else bwd_base - fwd_base + candidate.start_us - fwd_lat
+                        ),
+                    ))
+
         doc = self._build_doc(events)
         if path:
             self._write(path, doc)
         return doc
 
     # ── internals ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _moe_fb_overlay_tid(timeline, *, detail_base: int) -> int:
+        max_stream = max((op.stream_id for op in timeline.scheduled_ops), default=0)
+        return detail_base + max_stream + 1
+
+    def _moe_fb_overlap_events(
+        self,
+        ops,
+        *,
+        pid: int,
+        tid: int,
+        base: float,
+        mb: int | None,
+        name_prefix: str,
+        rel_start,
+    ) -> list[dict]:
+        events: list[dict] = []
+        for op in ops:
+            if not (
+                op.stream_type == "comm"
+                and op.parallelism_tag == "ep"
+                and op.op_type == "comm.all_to_all"
+                and op.comm_role in ("dispatch", "combine")
+            ):
+                continue
+            phase = op.phase or "fwd"
+            role = op.comm_role
+            events.append(ChromeTraceEvent(
+                name=f"{name_prefix}{phase}:moe_fb-hidden-{role}",
+                cat="communication.ep.moe_fb.hidden",
+                pid=pid,
+                tid=tid,
+                ts=(base + rel_start(op)) * self._mult,
+                dur=max(op.latency_us, self._MIN_VISIBLE_US) * self._mult,
+                args={
+                    "phase": phase,
+                    "mb": mb,
+                    "op_type": op.op_type,
+                    "view": "moe_fb_overlap",
+                    "parallelism": "ep",
+                    "overlap": "moe_fb",
+                    "role": role,
+                    "hidden": True,
+                    "original_node": op.node_id,
+                    "stream_type": op.stream_type,
+                },
+                color="cq_build_passed",
+            ).to_dict())
+        return events
 
     @staticmethod
     def _is_ep_dispatch(op) -> bool:
