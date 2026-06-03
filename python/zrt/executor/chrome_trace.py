@@ -564,8 +564,8 @@ class ChromeTraceExporter:
                     if op.phase == "fwd":
                         dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
                         ts = (fwd_base + op.start_us) * self._mult
-                        if op.overlap_type == "coc" and op.overlap_target:
-                            ts = self._coc_shift_ts(op, compute_index, fwd_base, ts)
+                        if op.overlap_type not in ("none", "") and op.overlap_target:
+                            ts = self._shift_overlap_comm_op(op, compute_index, fwd_base, ts)
                         events.append(ChromeTraceEvent(
                             name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
                             cat="compute" if op.stream_type != "comm" else "communication",
@@ -591,8 +591,8 @@ class ChromeTraceExporter:
                         dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
                         relative_start = op.start_us - bwd_origin
                         ts = (bwd_base + relative_start) * self._mult
-                        if op.overlap_type == "coc" and op.overlap_target:
-                            ts = self._coc_shift_ts(op, compute_index, bwd_base, ts)
+                        if op.overlap_type not in ("none", "") and op.overlap_target:
+                            ts = self._shift_overlap_comm_op(op, compute_index, bwd_base, ts)
                         events.append(ChromeTraceEvent(
                             name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
                             cat="compute" if op.stream_type != "comm" else "communication",
@@ -636,32 +636,94 @@ class ChromeTraceExporter:
 
     @staticmethod
     def _coc_shift_ts(
+    def _shift_overlap_comm_op(
+        self,
         op,
         compute_index: dict[str, tuple[float, float]],
         base_us: float,
         original_ts: float,
     ) -> float:
-        """Shift CoC comm op start time to model K-wave overlap in trace.
+        """Shift overlap comm op start time to visualize overlap in trace.
 
-        Extracts the target compute op id from ``overlap_target``
-        (format ``coc:<node_id>``), looks up its start and latency,
-        and shifts the comm op's ``ts`` earlier by
-        ``target_latency * (K-1) / K`` microseconds so the visual
-        block overlaps the tail of compute instead of starting after
-        it fully finishes.
+        Handles three overlap types:
+        - CoC: K-wave shift (target_lat * (K-1) / K)
+        - P2P/Ring-CP: full overlap (shift by target_lat)
+        - Others: no shift
+
+        Args:
+            op: ScheduledOp with overlap_type, overlap_target, coc_tile_k
+            compute_index: dict mapping node_id -> (start_us, latency_us) - NOT multiplied
+            base_us: base timestamp for the current microbatch - NOT multiplied
+            original_ts: original timestamp from scheduler - ALREADY multiplied by self._mult
+
+        Returns:
+            Shifted timestamp to show overlap in trace visualization.
         """
+        overlap_type = op.overlap_type
+        if overlap_type in ("none", ""):
+            return original_ts
+
         target_key = op.overlap_target
         if not target_key or ":" not in target_key:
             return original_ts
+
         target_id = target_key.split(":", 1)[1]
         entry = compute_index.get(target_id)
         if entry is None:
             return original_ts
-        _target_start, target_lat = entry
-        if target_lat <= 0 or op.coc_tile_k <= 1:
+
+        target_start_us, target_lat = entry  # NOT multiplied
+        if target_lat <= 0:
             return original_ts
-        shift_us = target_lat * (op.coc_tile_k - 1) / op.coc_tile_k
-        return original_ts - shift_us
+
+        if overlap_type == "coc":
+            coc_tile_k = getattr(op, "coc_tile_k", 4)
+            if coc_tile_k <= 1:
+                return original_ts
+            shift_us = target_lat * (coc_tile_k - 1) / coc_tile_k  # NOT multiplied
+            return original_ts - shift_us * self._mult
+
+        elif overlap_type in ("p2p_overlap", "ring_cp"):
+            # P2P should overlap with target compute
+            # Strategy: shift P2P backward by target_latency to show overlap
+            
+            # Compute desired P2P start time (NOT multiplied)
+            # P2P starts at same time as target (parallel execution)
+            desired_start_us = base_us + target_start_us
+            
+            # Shift amount (NOT multiplied)
+            # current = base_us + op.start_us
+            # desired = base_us + target_start_us
+            # shift = desired - current = target_start_us - op.start_us
+            
+            # But P2P might already start before target (scheduler put it earlier)
+            # In that case, we want to shift forward to align
+            
+            # Alternative: shift backward by target_lat to show full overlap
+            # This makes P2P appear during compute's execution window
+            
+            # Simple approach: shift by target_latency (shows P2P completely hidden)
+            shift_us = target_lat
+            
+            # Apply shift (multiplied)
+            shifted_ts = original_ts - shift_us * self._mult
+            
+# Clamp to >= 0 (can't have negative time in trace)
+            return max(0.0, shifted_ts)
+
+        return original_ts
+
+    def _coc_shift_ts(
+        self,
+        op,
+        compute_index: dict[str, tuple[float, float]],
+        base_us: float,
+        original_ts: float,
+    ) -> float:
+        """Legacy wrapper for backward compatibility."""
+        return self._shift_overlap_comm_op(
+            op, compute_index, base_us, original_ts
+        )
 
     @staticmethod
     def _grid_cat(task) -> str:

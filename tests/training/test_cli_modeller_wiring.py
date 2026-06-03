@@ -95,6 +95,11 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         hidden=4096,
         num_layers_full=32,
         quant=None,
+        pp_schedule="dualpipev",
+        vpp_chunks=2,
+        pp_mode="formula",
+        mega_moe=True,
+        mega_moe_waves=4,
     )
     fwd_graph = SimpleNamespace(metadata={})
     bwd_graph = SimpleNamespace(metadata={})
@@ -286,6 +291,11 @@ def test_train_cli_without_ddp_buckets_uses_original_dp_overlap(monkeypatch, cap
     call = estimate_calls[0]
     assert call["dp_overlap_in_bubble"] is True
     assert call["dp_bucket_mode"] == "layer"
+    assert calls[0]["pp_schedule"] == "dualpipev"
+    assert calls[0]["vpp_chunks"] == 2
+    assert calls[0]["pp_mode"] == "formula"
+    assert calls[0]["mega_moe"] is True
+    assert calls[0]["mega_moe_waves"] == 4
     assert "graph-native report" in capsys.readouterr().out
 
 
