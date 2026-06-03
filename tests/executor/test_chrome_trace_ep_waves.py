@@ -173,6 +173,7 @@ def test_moe_fb_trace_draws_hidden_overlay_without_ep_waves():
     assert not any("wave" in name for name in names)
     assert len(fb_events) == 2
     assert {e["cat"] for e in fb_events} == {"communication.ep.moe_fb.hidden"}
+    assert {e["tid"] for e in fb_events} == {3}
     assert {e["args"]["role"] for e in fb_events} == {"dispatch", "combine"}
     assert all(e["args"]["overlap"] == "moe_fb" for e in fb_events)
 

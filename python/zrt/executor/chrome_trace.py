@@ -457,7 +457,6 @@ class ChromeTraceExporter:
                     fwd_lat = tl.total_latency_us
                 stage_total = fwd_lat + bwd_lat
                 num_replicas = M if replicate else 1
-                overlay_tid = self._moe_fb_overlay_tid(tl, detail_base=0)
                 for m in range(num_replicas):
                     fwd_base = grid_slot.get((s, m, "fwd"), m * stage_total)
                     bwd_base = grid_slot.get(
@@ -467,7 +466,7 @@ class ChromeTraceExporter:
                     events.extend(self._moe_fb_overlap_events(
                         tl.scheduled_ops,
                         pid=s,
-                        tid=overlay_tid,
+                        detail_base=0,
                         base=fwd_base if replicate else 0.0,
                         mb=m if replicate else None,
                         name_prefix=f"m{m}:" if replicate else "",
@@ -553,11 +552,10 @@ class ChromeTraceExporter:
                     },
                 ).to_dict())
             if self._trace_moe_fb_overlap:
-                overlay_tid = self._moe_fb_overlay_tid(tl, detail_base=detail_base)
                 events.extend(self._moe_fb_overlap_events(
                     tl.scheduled_ops,
                     pid=d,
-                    tid=overlay_tid,
+                    detail_base=detail_base,
                     base=0.0,
                     mb=None,
                     name_prefix="",
@@ -740,7 +738,6 @@ class ChromeTraceExporter:
         if self._trace_moe_fb_overlap:
             for d, tl in enumerate(timelines):
                 fwd_lat = tl.phase_latency("fwd")
-                overlay_tid = self._moe_fb_overlay_tid(tl, detail_base=detail_base)
                 for m in range(stitched.M):
                     fwd_base = grid_index.get((d, m, "fwd"), 0.0)
                     bwd_base = grid_index.get(
@@ -750,7 +747,7 @@ class ChromeTraceExporter:
                     events.extend(self._moe_fb_overlap_events(
                         tl.scheduled_ops,
                         pid=d,
-                        tid=overlay_tid,
+                        detail_base=detail_base,
                         base=fwd_base,
                         mb=m,
                         name_prefix=f"m{m}:",
@@ -768,17 +765,12 @@ class ChromeTraceExporter:
 
     # ── internals ─────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _moe_fb_overlay_tid(timeline, *, detail_base: int) -> int:
-        max_stream = max((op.stream_id for op in timeline.scheduled_ops), default=0)
-        return detail_base + max_stream + 1
-
     def _moe_fb_overlap_events(
         self,
         ops,
         *,
         pid: int,
-        tid: int,
+        detail_base: int,
         base: float,
         mb: int | None,
         name_prefix: str,
@@ -799,7 +791,7 @@ class ChromeTraceExporter:
                 name=f"{name_prefix}{phase}:moe_fb-hidden-{role}",
                 cat="communication.ep.moe_fb.hidden",
                 pid=pid,
-                tid=tid,
+                tid=detail_base + op.stream_id,
                 ts=(base + rel_start(op)) * self._mult,
                 dur=max(op.latency_us, self._MIN_VISIBLE_US) * self._mult,
                 args={
