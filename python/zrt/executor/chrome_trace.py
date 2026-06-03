@@ -353,16 +353,10 @@ class ChromeTraceExporter:
                     grid_slot[(task.stage_id, task.mb_id, task.phase)] = task.start_us
 
         for s, tl in enumerate(timelines):
+            ddp_tail_args = self._ddp_tail_args_by_bucket_id(tl)
             fwd_lat = tl.phase_latency("fwd")
             bwd_lat = tl.phase_latency("bwd")
-            bwd_origin = min(
-                (
-                    op.start_us
-                    for op in tl.scheduled_ops
-                    if op.phase and "bwd" in op.phase
-                ),
-                default=fwd_lat,
-            )
+            bwd_origin = self._phase_origin(tl, "bwd", default=0.0)
             if fwd_lat == 0.0 and bwd_lat == 0.0:
                 fwd_lat = tl.total_latency_us
             stage_total = fwd_lat + bwd_lat
@@ -406,6 +400,7 @@ class ChromeTraceExporter:
                             "stream_type": op.stream_type,
                             "parallelism": op.parallelism_tag,
                             **self._bucket_args(op),
+                            **ddp_tail_args.get(op.node_id, {}),
                             "mb": m,
                         },
                     ).to_dict())
@@ -466,6 +461,7 @@ class ChromeTraceExporter:
             ).to_dict())
 
         for d, tl in enumerate(timelines):
+            ddp_tail_args = self._ddp_tail_args_by_bucket_id(tl)
             for op in tl.scheduled_ops:
                 cat = "communication" if op.stream_type == "comm" else "compute"
                 name = f"{op.phase}:{op.op_type}" if op.phase else op.op_type
@@ -484,6 +480,7 @@ class ChromeTraceExporter:
                         "stream_type": op.stream_type,
                         "parallelism": op.parallelism_tag,
                         **self._bucket_args(op),
+                        **ddp_tail_args.get(op.node_id, {}),
                         "view": "detail",
                     },
                 ).to_dict())
@@ -543,14 +540,8 @@ class ChromeTraceExporter:
             ).to_dict())
 
         for d, tl in enumerate(timelines):
-            bwd_origin = min(
-                (
-                    op.start_us
-                    for op in tl.scheduled_ops
-                    if op.phase and "bwd" in op.phase
-                ),
-                default=0.0,
-            )
+            ddp_tail_args = self._ddp_tail_args_by_bucket_id(tl)
+            bwd_origin = self._phase_origin(tl, "bwd", default=0.0)
 
             # Index compute ops by node_id for CoC start-time shift
             compute_index: dict[str, tuple[float, float]] = {}
@@ -608,6 +599,7 @@ class ChromeTraceExporter:
                                 "stream_type": op.stream_type,
                                 "parallelism": op.parallelism_tag,
                                 **self._bucket_args(op),
+                                **ddp_tail_args.get(op.node_id, {}),
                                 "view": "detail",
                             },
                         ).to_dict())
@@ -623,6 +615,7 @@ class ChromeTraceExporter:
     def _bucket_args(op) -> dict:
         attrs = getattr(op, "attrs", {}) or {}
         keys = (
+            "role",
             "bucket_index",
             "bucket_bytes",
             "bucket_cap_mb",
@@ -633,6 +626,69 @@ class ChromeTraceExporter:
             "dp_grad_group_idx",
         )
         return {key: attrs[key] for key in keys if key in attrs}
+
+    @staticmethod
+    def _phase_origin(tl: "Timeline", phase: str, *, default: float = 0.0) -> float:
+        return min(
+            (
+                op.start_us
+                for op in tl.scheduled_ops
+                if op.phase and phase in op.phase
+            ),
+            default=default,
+        )
+
+    @staticmethod
+    def _ddp_exposed_tail_segments(tl: "Timeline") -> list[dict]:
+        """Return timing boundaries for the DDP tail that remains exposed."""
+        ops = list(getattr(tl, "scheduled_ops", []) or [])
+        by_id = {op.node_id: op for op in ops}
+        buckets = [
+            op for op in ops
+            if getattr(op, "parallelism_tag", "") == "dp"
+            and (getattr(op, "attrs", {}) or {}).get("role") == "dp_grad_reduce"
+        ]
+        if not buckets:
+            return []
+
+        waits = [
+            op for op in ops
+            if getattr(op, "parallelism_tag", "") == "dp"
+            and (getattr(op, "attrs", {}) or {}).get("role") == "ddp_wait_all_buckets"
+        ]
+        last_bucket = max(buckets, key=lambda op: (op.end_us, op.start_us))
+        attrs = getattr(last_bucket, "attrs", {}) or {}
+        ready_node_id = attrs.get("bucket_ready_node")
+        ready_op = by_id.get(ready_node_id)
+        start_us = ready_op.end_us if ready_op is not None else last_bucket.start_us
+        wait_op = max(waits, key=lambda op: op.end_us) if waits else None
+        end_us = max(wait_op.end_us if wait_op is not None else 0.0, last_bucket.end_us)
+        tail_us = max(0.0, end_us - start_us)
+        if tail_us <= 0.0:
+            return []
+
+        return [{
+            "start_us": start_us,
+            "end_us": end_us,
+            "tail_us": tail_us,
+            "stream_id": last_bucket.stream_id,
+            "bucket_node_id": last_bucket.node_id,
+            "bucket_index": attrs.get("bucket_index"),
+            "bucket_ready_node": ready_node_id,
+            "wait_node_id": wait_op.node_id if wait_op is not None else None,
+        }]
+
+    @classmethod
+    def _ddp_tail_args_by_bucket_id(cls, tl: "Timeline") -> dict[str, dict]:
+        return {
+            segment["bucket_node_id"]: {
+                "ddp_exposed_tail_us": segment["tail_us"],
+                "bucket_ready_ts_us": segment["start_us"],
+                "ddp_complete_ts_us": segment["end_us"],
+                "wait_node_id": segment["wait_node_id"],
+            }
+            for segment in cls._ddp_exposed_tail_segments(tl)
+        }
 
     def _shift_overlap_comm_op(
         self,
@@ -695,18 +751,6 @@ class ChromeTraceExporter:
             return max(0.0, shifted_ts)
 
         return original_ts
-
-    def _coc_shift_ts(
-        self,
-        op,
-        compute_index: dict[str, tuple[float, float]],
-        base_us: float,
-        original_ts: float,
-    ) -> float:
-        """Legacy wrapper for backward compatibility."""
-        return self._shift_overlap_comm_op(
-            op, compute_index, base_us, original_ts
-        )
 
     @staticmethod
     def _grid_cat(task) -> str:

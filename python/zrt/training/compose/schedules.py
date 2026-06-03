@@ -1096,7 +1096,15 @@ def _populate_hbm_traffic(
         return t.shape_logical
 
     GB = float(1 << 30)
-    M = max(1, strategy.num_microbatches())
+    M = strategy.num_microbatches()
+    if M < 1:
+        raise ValueError(
+            f"num_microbatches(M)={M} is invalid: "
+            f"global_batch({strategy.global_batch}) / "
+            f"(micro_batch({strategy.micro_batch}) * dp({strategy.dp})) = "
+            f"{strategy.global_batch} / {strategy.micro_batch * strategy.dp} = {M}. "
+            f"Ensure global_batch >= micro_batch * dp."
+        )
 
     weight_bytes = 0.0
     act_bytes = 0.0

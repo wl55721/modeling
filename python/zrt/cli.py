@@ -260,7 +260,7 @@ def main() -> None:
         help="Global batch size across DP ranks (training, default: 32).",
     )
     parser.add_argument(
-        "--dp-bucket-cap-mb", type=float, default=25.0,
+        "--dp-bucket-cap-mb", type=float, default=None,
         help="DDP gradient bucket cap in MiB when --dp-ddp-buckets is enabled "
              "(training, default: 25.0).",
     )
@@ -268,9 +268,9 @@ def main() -> None:
         "--dp-overlap",
         dest="dp_overlap",
         action="store_true",
-        default=True,
-        help="Enable original DP hidden/exposed overlap accounting "
-             "(training, default: enabled).",
+        default=None,
+        help="Explicitly reaffirm original DP hidden/exposed overlap accounting "
+             "(training default: enabled).",
     )
     parser.add_argument(
         "--no-dp-overlap",
@@ -316,11 +316,15 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    if args.dp_ddp_buckets and not args.dp_overlap:
+    dp_overlap = True if args.dp_overlap is None else args.dp_overlap
+    dp_bucket_cap_mb = 25.0 if args.dp_bucket_cap_mb is None else args.dp_bucket_cap_mb
+    if args.dp_ddp_buckets and not dp_overlap:
         parser.error(
             "--dp-ddp-buckets requires DP overlap to be enabled. "
             "Use --no-dp-overlap without --dp-ddp-buckets for pure DP."
         )
+    args.dp_overlap = dp_overlap
+    args.dp_bucket_cap_mb = dp_bucket_cap_mb
 
     # ── --list-fusion-rules: print and exit ──────────────────────────────────
     if args.list_fusion_rules:
@@ -739,9 +743,9 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         pp_schedule=args.pp_schedule,
         vpp_chunks=args.vpp_chunks,
         pp_mode=getattr(args, "pp_mode", "trace"),
-        dp_overlap_in_bubble=args.dp_overlap,
+        dp_overlap_in_bubble=True if args.dp_overlap is None else args.dp_overlap,
         dp_bucket_mode="ddp" if getattr(args, "dp_ddp_buckets", False) else "layer",
-        dp_bucket_cap_mb=args.dp_bucket_cap_mb,
+        dp_bucket_cap_mb=args.dp_bucket_cap_mb if args.dp_bucket_cap_mb is not None else 25.0,
         tp_coc=args.tp_coc,
         return_transformed=True,
         quant=args.quant,

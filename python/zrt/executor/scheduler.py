@@ -172,6 +172,9 @@ class DAGScheduler:
             # resource constraint: wait for stream to be free
             s_free = stream_avail.get(stream_id, 0.0)
             if node.annotations.get("blocking_comm"):
+                # A blocking comm fences compute streams that have already
+                # appeared in topological scheduling. If none exist yet, this
+                # naturally reduces to the current stream's availability.
                 s_free = max(
                     [s_free] + [
                         t for sid, t in stream_avail.items()

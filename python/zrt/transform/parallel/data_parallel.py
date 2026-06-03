@@ -80,6 +80,7 @@ class DataParallelPass(GraphPass):
         cap_bytes = max(1, int(cap_mb * 1024 * 1024))
         pp = ctx.parallel.pp if ctx.parallel else 1
         buckets = self._build_buckets(entries, cap_bytes, split_by_layer=pp > 1)
+        scale_nodes: list[OpNode] = []
 
         for bucket_idx, bucket in enumerate(buckets):
             last_node = bucket[-1].node
@@ -113,8 +114,13 @@ class DataParallelPass(GraphPass):
             comm_node.annotations["phase"] = "bwd"
             if dp_overlap:
                 comm_node.annotations["overlap_in_bubble"] = True
+            else:
+                comm_node.annotations["blocking_comm"] = True
 
-            self._add_side_branch(graph, last_node, comm_node)
+            if dp_overlap:
+                self._add_side_branch(graph, last_node, comm_node)
+            else:
+                self._insert_after(graph, last_node, comm_node)
 
             scale_node = OpNode(
                 id=f"grad_scale_bucket_{bucket_idx}",
@@ -126,7 +132,14 @@ class DataParallelPass(GraphPass):
             scale_node.annotations["inserted_by"] = "data_parallel_pass"
             scale_node.annotations["phase"] = "bwd"
             scale_node.annotations["dp_comm_postprocess"] = True
-            self._add_side_branch(graph, comm_node, scale_node)
+            if dp_overlap:
+                self._add_side_branch(graph, comm_node, scale_node)
+            else:
+                self._insert_after(graph, comm_node, scale_node)
+            scale_nodes.append(scale_node)
+
+        if scale_nodes:
+            self._insert_ddp_wait(graph, scale_nodes)
 
     def _insert_layer_buckets(
         self,
@@ -210,6 +223,10 @@ class DataParallelPass(GraphPass):
                 ))
             return sorted(entries, key=lambda entry: topo_index.get(entry.node.id, len(topo_index)))
 
+        logger.warning(
+            "is_param annotations absent; DP comm volume falls back to backward "
+            "node output bytes and may overcount activation gradients."
+        )
         entries = []
         for node in graph.topo_sort():
             if not self._is_backward_node(node):
@@ -289,6 +306,34 @@ class DataParallelPass(GraphPass):
             dst_idx=0,
             tensor=tensor,
         ))
+        graph._rebuild_adjacency()
+
+    def _insert_ddp_wait(self, graph: OpGraph, scale_nodes: list[OpNode]) -> None:
+        """Insert a zero-latency wait barrier before optimizer-dependent work."""
+        wait_node = OpNode(
+            id="ddp_wait_all_buckets",
+            op_type="comm.wait",
+            attrs={
+                "role": "ddp_wait_all_buckets",
+                "bucket_count": len(scale_nodes),
+            },
+            scope="data_parallel.wait",
+            category="communication",
+        )
+        wait_node.annotations["inserted_by"] = "data_parallel_pass"
+        wait_node.annotations["phase"] = "bwd"
+        wait_node.annotations["dp_wait"] = True
+        wait_node.annotations["latency_us"] = 0.0
+
+        graph.nodes[wait_node.id] = wait_node
+        for scale_node in scale_nodes:
+            graph.edges.append(Edge(
+                src=scale_node.id,
+                src_idx=0,
+                dst=wait_node.id,
+                dst_idx=0,
+                tensor=None,
+            ))
         graph._rebuild_adjacency()
 
     def _insert_after(self, graph: OpGraph, src_node: OpNode, dst_node: OpNode) -> None:

@@ -233,6 +233,8 @@ class OpGraph:
 
     def subgraph(self, node_ids: set[str]) -> "OpGraph":
         """Return a new OpGraph induced on ``node_ids``."""
+        # Preserve the original graph insertion/topological order; node_ids may
+        # be an unordered set supplied by analysis passes.
         nodes = {
             nid: node
             for nid, node in self.nodes.items()

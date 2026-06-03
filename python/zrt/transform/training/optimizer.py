@@ -382,6 +382,16 @@ class OptimizerPass(GraphPass):
                 ))
                 graph._succ[sink_node.id].append(first_node.id)
                 graph._pred[first_node.id].append(sink_node.id)
+            else:
+                graph.edges.append(Edge(
+                    src=sink_node.id,
+                    src_idx=0,
+                    dst=first_node.id,
+                    dst_idx=0,
+                    tensor=None,
+                ))
+                graph._succ[sink_node.id].append(first_node.id)
+                graph._pred[first_node.id].append(sink_node.id)
 
         # Connect chain nodes sequentially
         for i in range(len(chain) - 1):

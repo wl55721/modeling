@@ -504,10 +504,66 @@ class TrainingPipelinePass(GraphPass):
             )
 
     @staticmethod
+    def _phase_latency(timeline, phase: str, *, exclude_dp: bool = False) -> float:
+        ops = [
+            op for op in timeline.scheduled_ops
+            if op.phase == phase and not (exclude_dp and op.parallelism_tag == "dp")
+        ]
+        if not ops:
+            return 0.0
+        return max(op.end_us for op in ops) - min(op.start_us for op in ops)
+
+    @staticmethod
+    def _ddp_bucket_exposed_tail_us(stage_timelines) -> tuple[bool, float]:
+        """Return exposed DDP bucket tail from scheduled per-stage timelines.
+
+        DDP overlap is driven by reducer bucket readiness, not by arbitrary
+        later bwd-phase bookkeeping ops. Once the last bucket is ready, there
+        is no remaining gradient-producing backward compute to hide queued
+        bucket communication. Use the final bucket's ready-node end time as
+        the wait-ready boundary.
+        """
+        has_buckets = False
+        exposed_tail_us = 0.0
+        for tl in stage_timelines.values():
+            if not tl or not getattr(tl, "scheduled_ops", None):
+                continue
+            dp_buckets = [
+                op for op in tl.scheduled_ops
+                if (
+                    op.stream_type == "comm"
+                    and op.parallelism_tag == "dp"
+                    and op.attrs.get("role") == "dp_grad_reduce"
+                )
+            ]
+            if not dp_buckets:
+                continue
+            has_buckets = True
+            by_id = {op.node_id: op for op in tl.scheduled_ops}
+            waits = [
+                op for op in tl.scheduled_ops
+                if op.parallelism_tag == "dp"
+                and op.attrs.get("role") == "ddp_wait_all_buckets"
+            ]
+            last_bucket = max(dp_buckets, key=lambda op: op.end_us)
+            ready_id = last_bucket.attrs.get("bucket_ready_node")
+            ready_op = by_id.get(ready_id) if ready_id else None
+            wait_ready_us = ready_op.end_us if ready_op else last_bucket.start_us
+            dp_complete_end = (
+                max(op.end_us for op in waits)
+                if waits else max(op.end_us for op in dp_buckets)
+            )
+            exposed_tail_us = max(
+                exposed_tail_us, max(0.0, dp_complete_end - wait_ready_us)
+            )
+        return has_buckets, exposed_tail_us
+
+    @staticmethod
     def _build_trace_step_result(
         g, pp, M, pp_schedule, vpp_chunks,
         stage_fwd, stage_bwd, stage_bwd_dw,
         strategy_proxy, dp_ar_time_s,
+        stage_timelines=None, dp_bucket_mode="layer",
         recompute_time_ms=0.0, recompute_raw_mag_ms=0.0,
     ):
         """Build StepResult using grid-based PPStitcher (trace mode)."""
@@ -546,11 +602,23 @@ class TrainingPipelinePass(GraphPass):
         t_fwd_max = max(stage_fwd.values()) / 1e6 if stage_fwd else 0.0
         t_bwd_max = max(stage_bwd.values()) / 1e6 if stage_bwd else 0.0
 
-        hidden_s = _dp_hidden(
-            dp_ar_time_s, pp_timeline.cooldown_us / 1e6,
-            M * t_bwd_max, strategy_proxy,
-        )
-        dp_exposed_s = dp_ar_time_s - hidden_s
+        if dp_bucket_mode == "ddp":
+            has_ddp_buckets, exposed_tail_us = (
+                TrainingPipelinePass._ddp_bucket_exposed_tail_us(stage_timelines or {})
+            )
+        else:
+            has_ddp_buckets, exposed_tail_us = False, 0.0
+
+        if has_ddp_buckets:
+            dp_exposed_s = min(dp_ar_time_s, exposed_tail_us / 1e6)
+            hidden_s = max(0.0, dp_ar_time_s - dp_exposed_s)
+            g.metadata["dp_bucket_exposed_tail_us"] = exposed_tail_us
+        else:
+            hidden_s = _dp_hidden(
+                dp_ar_time_s, pp_timeline.cooldown_us / 1e6,
+                M * t_bwd_max, strategy_proxy,
+            )
+            dp_exposed_s = dp_ar_time_s - hidden_s
 
         step_time_s = (pp_timeline.step_time_us + dp_exposed_s * 1e6) / 1e6
 
@@ -581,9 +649,9 @@ class TrainingPipelinePass(GraphPass):
             steady_bwd=steady_bwd,
             cooldown_fwd=cooldown_fwd,
             cooldown_bwd=cooldown_bwd,
-            steady_fwd_per_mb=steady_fwd / max(1, M) if M > 0 else 0.0,
-            steady_bwd_per_mb=steady_bwd / max(1, M) if M > 0 else 0.0,
-            steady_per_mb=(steady_fwd + steady_bwd) / max(1, M) if M > 0 else 0.0,
+            steady_fwd_per_mb=steady_fwd / M if M > 0 else 0.0,
+            steady_bwd_per_mb=steady_bwd / M if M > 0 else 0.0,
+            steady_per_mb=(steady_fwd + steady_bwd) / M if M > 0 else 0.0,
             recompute_critical=recompute_time_ms / 1000.0,
             recompute_raw_mag=recompute_raw_mag_ms / 1000.0,
         )
@@ -605,6 +673,8 @@ class TrainingPipelinePass(GraphPass):
         stage_bwd: dict[int, float] = {}
         stage_bwd_dw: dict[int, float] = {}
         stage_timelines: dict[int, "Timeline"] = {}  # per-stage DAGScheduler output
+        dp_bucket_mode = getattr(ctx.training, "dp_bucket_mode", "layer") if ctx.training else "layer"
+        exclude_dp_from_bwd = dp_bucket_mode == "ddp"
 
         # Check for typical layer data for layer-type scaling
         layer_profile = g.metadata.get("layer_profile", None)
@@ -634,8 +704,8 @@ class TrainingPipelinePass(GraphPass):
                 sub = g.subgraph(node_ids)
                 tl = sched.schedule(sub)
                 stage_timelines[s_id] = tl
-                fwd = tl.phase_latency("fwd")
-                bwd = tl.phase_latency("bwd")
+                fwd = self._phase_latency(tl, "fwd")
+                bwd = self._phase_latency(tl, "bwd", exclude_dp=exclude_dp_from_bwd)
                 # If no phase annotations, fall back to total latency as fwd
                 if fwd == 0.0 and bwd == 0.0:
                     fwd = tl.total_latency_us
@@ -809,8 +879,8 @@ class TrainingPipelinePass(GraphPass):
             else:
                 tl = sched.schedule(g)
                 stage_timelines[0] = tl
-                _fwd = tl.phase_latency("fwd")
-                _bwd = tl.phase_latency("bwd")
+                _fwd = self._phase_latency(tl, "fwd")
+                _bwd = self._phase_latency(tl, "bwd", exclude_dp=exclude_dp_from_bwd)
                 fwd = _fwd if isinstance(_fwd, (int, float)) else 0.0
                 bwd = _bwd if isinstance(_bwd, (int, float)) else 0.0
                 if fwd == 0.0 and bwd == 0.0:
@@ -900,6 +970,8 @@ class TrainingPipelinePass(GraphPass):
             g, pp, M, pp_schedule, vpp_chunks,
             stage_fwd, stage_bwd, stage_bwd_dw,
             strategy_proxy, dp_ar_time_s,
+            stage_timelines=stage_timelines,
+            dp_bucket_mode=dp_bucket_mode,
             recompute_time_ms=recompute_time_ms,
             recompute_raw_mag_ms=recompute_raw_mag_ms,
         )

@@ -297,6 +297,68 @@ def test_train_cli_without_ddp_buckets_uses_original_dp_overlap(monkeypatch, cap
     assert "graph-native report" in capsys.readouterr().out
 
 
+def test_training_modelling_normalizes_optional_dp_cli_defaults(monkeypatch, capsys):
+    if not _check_torch_available():
+        pytest.skip("torch not installed")
+
+    from python.zrt import cli
+
+    calls = []
+
+    monkeypatch.setattr(
+        "python.zrt.transform.analysis.estimate_training_from_graphs",
+        lambda **kwargs: calls.append(kwargs) or (_Report(), None, {}),
+    )
+
+    args = SimpleNamespace(
+        hw="test_gpu",
+        layers=4,
+        batch_size=1,
+        seq_len=128,
+        tp=1,
+        pp=1,
+        ep=1,
+        dp=1,
+        cp=1,
+        cp_kind="ulysses",
+        zero_stage=0,
+        optimizer="adam",
+        muon_rotation=True,
+        muon_ns_steps=None,
+        micro_batch=1,
+        global_batch=1,
+        dp_overlap=None,
+        dp_ddp_buckets=False,
+        dp_bucket_cap_mb=None,
+        recompute_policy=None,
+        gradient_checkpointing=False,
+        total_params=None,
+        hidden=4096,
+        num_layers_full=None,
+        quant=None,
+        pp_schedule="1f1b",
+        vpp_chunks=1,
+        tp_coc=False,
+        pp_mode="trace",
+        mega_moe=False,
+        mega_moe_waves=0,
+    )
+    fwd_graph = SimpleNamespace(metadata={})
+    bwd_graph = SimpleNamespace(metadata={})
+    result = SimpleNamespace(
+        graphs={"train_forward": fwd_graph, "train_backward": bwd_graph},
+        phase_records={},
+        output_dir=None,
+    )
+
+    cli._run_training_modelling(args, "hf_models/llama3_8b", object(), result)
+
+    assert len(calls) == 1
+    assert calls[0]["dp_overlap_in_bubble"] is True
+    assert calls[0]["dp_bucket_cap_mb"] == 25.0
+    assert "graph-native report" in capsys.readouterr().out
+
+
 def test_train_cli_no_dp_overlap_uses_pure_dp(monkeypatch, capsys):
     if not _check_torch_available():
         pytest.skip("torch not installed")
