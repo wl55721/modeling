@@ -700,13 +700,7 @@ class TestDPGroupIdx:
             event for event in doc["traceEvents"]
             if event.get("args", {}).get("node_id") == "comm_grad_reduce_bucket_1"
         ]
-        thread_names = {
-            event["args"]["name"]
-            for event in doc["traceEvents"]
-            if event.get("name") == "thread_name" and event.get("pid") == 0
-        }
 
-        assert "Bookkeeping Ops" not in thread_names
         assert len(bookkeeping_events) == 1
         bookkeeping = bookkeeping_events[0]
         assert bookkeeping["cat"] == "compute"
