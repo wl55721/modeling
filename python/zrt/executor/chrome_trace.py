@@ -634,8 +634,6 @@ class ChromeTraceExporter:
         )
         return {key: attrs[key] for key in keys if key in attrs}
 
-    @staticmethod
-    def _coc_shift_ts(
     def _shift_overlap_comm_op(
         self,
         op,
@@ -687,28 +685,13 @@ class ChromeTraceExporter:
             # P2P should overlap with target compute
             # Strategy: shift P2P backward by target_latency to show overlap
             
-            # Compute desired P2P start time (NOT multiplied)
-            # P2P starts at same time as target (parallel execution)
-            desired_start_us = base_us + target_start_us
-            
-            # Shift amount (NOT multiplied)
-            # current = base_us + op.start_us
-            # desired = base_us + target_start_us
-            # shift = desired - current = target_start_us - op.start_us
-            
-            # But P2P might already start before target (scheduler put it earlier)
-            # In that case, we want to shift forward to align
-            
-            # Alternative: shift backward by target_lat to show full overlap
-            # This makes P2P appear during compute's execution window
-            
             # Simple approach: shift by target_latency (shows P2P completely hidden)
             shift_us = target_lat
             
             # Apply shift (multiplied)
             shifted_ts = original_ts - shift_us * self._mult
             
-# Clamp to >= 0 (can't have negative time in trace)
+            # Clamp to >= 0 (can't have negative time in trace)
             return max(0.0, shifted_ts)
 
         return original_ts

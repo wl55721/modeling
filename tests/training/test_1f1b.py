@@ -142,7 +142,7 @@ def test_m_less_than_1_raises_valueerror():
     )
     system = _make_system()
     strategy = Strategy(tp=1, pp=1, dp=8, micro_batch=8, global_batch=32)
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     with pytest.raises(ValueError, match=r"num_microbatches\(M\)=0"):
         pipeline_step_time(graph, model, system, strategy)
@@ -157,7 +157,7 @@ def test_m_equals_1_succeeds():
     )
     system = _make_system()
     strategy = Strategy(tp=1, pp=1, dp=4, micro_batch=8, global_batch=32)
-    graph = build_graph(model, strategy)
+    graph = build_opgraph(model, strategy)
 
     result = pipeline_step_time(graph, model, system, strategy)
     assert result.step_time > 0
