@@ -325,7 +325,7 @@ def _parse_strategy(d: dict) -> Strategy:
         offload=offload,
         tp_overlap=TPOverlap(d.get("tp_overlap", "none")),
         ep_overlap=d.get("ep_overlap", False),
-        moe_fb_overlap=d.get("moe_fb_overlap", True),
+        moe_fb_overlap=d.get("moe_fb_overlap", False),
         mega_moe=d.get("mega_moe", False),
         mega_moe_waves=int(d.get("mega_moe_waves", 0)),
         pp_overlap=d.get("pp_overlap", False),

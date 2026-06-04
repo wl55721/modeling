@@ -11,7 +11,10 @@ from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.report import TrainingReport
 from zrt.training.spec.strategy import PPSched, Strategy
 from zrt.training.spec.system import GPU, SystemSpec
-from zrt.transform.analysis.training import _graph_moe_fb_overlap_us
+from zrt.transform.analysis.training import (
+    _apply_moe_fb_disabled_ep_accounting,
+    _graph_moe_fb_overlap_us,
+)
 
 
 def _system(*, ep_overlap_waves: int = 4) -> SystemSpec:
@@ -64,9 +67,10 @@ def _moe_model(**kwargs) -> ModelSpec:
     return ModelSpec(**base)
 
 
-def test_moe_fb_overlap_defaults_on_and_can_be_disabled():
-    assert Strategy().moe_fb_overlap is True
-    assert _parse_strategy({}).moe_fb_overlap is True
+def test_moe_fb_overlap_defaults_off_and_can_be_enabled():
+    assert Strategy().moe_fb_overlap is False
+    assert _parse_strategy({}).moe_fb_overlap is False
+    assert _parse_strategy({"moe_fb_overlap": True}).moe_fb_overlap is True
     assert _parse_strategy({"moe_fb_overlap": False}).moe_fb_overlap is False
 
 
@@ -185,3 +189,37 @@ def test_graph_path_moe_fb_overlap_can_be_disabled():
 
     assert hidden == pytest.approx(0.0)
     assert exposed == pytest.approx(260.0)
+
+
+def test_training_context_defaults_moe_fb_overlap_off():
+    from zrt.training.ir.context_builder import build_context
+
+    model = _moe_model()
+    system = _system()
+    strategy = Strategy(ep=4, dp=4)
+
+    ctx = build_context(model, system, strategy)
+
+    assert ctx.training.moe_fb_overlap is False
+
+
+def test_graph_path_disabling_moe_fb_overlap_preserves_existing_ep_hidden():
+    from zrt.executor.overlap import PerStrategyOverlapReport
+
+    per_strat = PerStrategyOverlapReport(
+        ep_total_us=100.0,
+        ep_exposed_us=70.0,
+        ep_hidden_us=30.0,
+    )
+
+    fb_total, fb_hidden, fb_exposed, fb_steady, fb_boundary = (
+        _apply_moe_fb_disabled_ep_accounting(per_strat)
+    )
+
+    assert per_strat.ep_hidden_us == pytest.approx(30.0)
+    assert per_strat.ep_exposed_us == pytest.approx(70.0)
+    assert fb_total == pytest.approx(100.0)
+    assert fb_hidden == pytest.approx(0.0)
+    assert fb_exposed == pytest.approx(100.0)
+    assert fb_steady == pytest.approx(0.0)
+    assert fb_boundary == pytest.approx(0.0)

@@ -5,6 +5,18 @@ from python.zrt.executor.pp_stitcher import GridTask, PPStitchedTimeline
 from python.zrt.executor.scheduler import ScheduledOp, Timeline
 
 
+def test_ep_wave_scope_match_requires_non_empty_scopes():
+    same_scope = ChromeTraceExporter._same_ep_region_scope(
+        "transformer.layers.0.ffn.moe",
+        "transformer.layers.0.ffn.experts",
+    )
+
+    assert same_scope is True
+    assert ChromeTraceExporter._same_ep_region_scope("", "") is False
+    assert ChromeTraceExporter._same_ep_region_scope("transformer.layers.0.ffn.moe", "") is False
+    assert ChromeTraceExporter._same_ep_region_scope("", "transformer.layers.0.ffn.experts") is False
+
+
 def test_ep_wave_trace_segments_dispatch_compute_and_combine_on_original_streams():
     stitched = PPStitchedTimeline(
         tasks=[
@@ -51,6 +63,7 @@ def test_ep_wave_trace_segments_dispatch_compute_and_combine_on_original_streams
                 category="compute",
                 phase="fwd",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.experts",
                 ep_wave_k=2,
             ),
             ScheduledOp(
@@ -65,6 +78,7 @@ def test_ep_wave_trace_segments_dispatch_compute_and_combine_on_original_streams
                 phase="fwd",
                 parallelism_tag="ep",
                 comm_role="combine",
+                scope="transformer.layers.0.ffn.moe",
                 ep_wave_k=2,
             ),
         ]
@@ -109,7 +123,7 @@ def test_ep_wave_trace_segments_dispatch_compute_and_combine_on_original_streams
     )
 
 
-def test_moe_fb_trace_marks_original_all_to_all_without_overlay():
+def test_moe_fb_trace_marks_unannotated_all_to_all_as_exposed_without_overlay():
     stitched = PPStitchedTimeline(
         tasks=[
             GridTask(
@@ -175,12 +189,40 @@ def test_moe_fb_trace_marks_original_all_to_all_without_overlay():
 
     assert not any("wave" in name for name in names)
     assert len(fb_events) == 2
-    assert {e["cat"] for e in fb_events} == {"communication.ep.moe_fb.hidden"}
+    assert {e["cat"] for e in fb_events} == {"communication.ep.moe_fb.exposed"}
     assert {e["tid"] for e in fb_events} == {3}
     assert {e["args"]["op_type"] for e in fb_events} == {"comm.all_to_all"}
     assert {e["args"]["role"] for e in fb_events} == {"dispatch", "combine"}
     assert all("comm.all_to_all" in e["name"] for e in fb_events)
-    assert all("moe_fb hidden" in e["name"] for e in fb_events)
+    assert all("moe_fb exposed" in e["name"] for e in fb_events)
+    assert all(e["args"]["hidden"] is False for e in fb_events)
+
+
+def test_moe_fb_trace_marks_annotated_hidden_all_to_all():
+    op = ScheduledOp(
+        node_id="dispatch",
+        stream_id=1,
+        stream_type="comm",
+        start_us=0.0,
+        end_us=20.0,
+        latency_us=20.0,
+        op_type="comm.all_to_all",
+        category="communication",
+        phase="fwd",
+        parallelism_tag="ep",
+        comm_role="dispatch",
+        overlap_hidden_us=12.0,
+        overlap_exposed_us=8.0,
+    )
+    exporter = ChromeTraceExporter(trace_moe_fb_overlap=True)
+
+    args = exporter._moe_fb_event_args(op, {"view": "detail"})
+
+    assert exporter._moe_fb_event_cat(op, "communication") == "communication.ep.moe_fb.hidden"
+    assert "moe_fb hidden dispatch" in exporter._moe_fb_event_name(op, "dispatch")
+    assert args["hidden"] is True
+    assert args["hidden_us"] == 12.0
+    assert args["exposed_us"] == 8.0
 
 
 def test_ep_wave_trace_starts_region_at_grouped_matmul():
@@ -212,6 +254,7 @@ def test_ep_wave_trace_starts_region_at_grouped_matmul():
                 category="compute",
                 phase="fwd",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.activation",
                 ep_wave_k=2,
             ),
             ScheduledOp(
@@ -225,6 +268,7 @@ def test_ep_wave_trace_starts_region_at_grouped_matmul():
                 category="compute",
                 phase="fwd",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.experts",
                 ep_wave_k=2,
             ),
             ScheduledOp(
@@ -239,6 +283,7 @@ def test_ep_wave_trace_starts_region_at_grouped_matmul():
                 phase="fwd",
                 parallelism_tag="ep",
                 comm_role="combine",
+                scope="transformer.layers.0.ffn.moe",
                 ep_wave_k=2,
             ),
         ]
@@ -284,6 +329,7 @@ def test_ep_wave_trace_splits_whole_expert_region_before_combine():
                 phase="fwd",
                 parallelism_tag="ep",
                 comm_role="dispatch",
+                scope="transformer.layers.0.ffn.moe",
                 ep_wave_k=2,
             ),
             ScheduledOp(
@@ -445,6 +491,7 @@ def test_ep_wave_trace_pipelines_later_dispatch_under_first_compute():
                 phase="fwd",
                 parallelism_tag="ep",
                 comm_role="dispatch",
+                scope="transformer.layers.0.ffn.moe",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -458,6 +505,7 @@ def test_ep_wave_trace_pipelines_later_dispatch_under_first_compute():
                 category="compute",
                 phase="fwd",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.experts",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -471,6 +519,7 @@ def test_ep_wave_trace_pipelines_later_dispatch_under_first_compute():
                 category="compute",
                 phase="fwd",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.experts",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -485,6 +534,7 @@ def test_ep_wave_trace_pipelines_later_dispatch_under_first_compute():
                 phase="fwd",
                 parallelism_tag="ep",
                 comm_role="combine",
+                scope="transformer.layers.0.ffn.moe",
                 ep_wave_k=4,
             ),
         ]
@@ -539,6 +589,7 @@ def test_ep_wave_trace_exposes_long_dispatch_when_compute_cannot_hide_it():
                 phase="fwd",
                 parallelism_tag="ep",
                 comm_role="dispatch",
+                scope="transformer.layers.0.ffn.moe",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -552,6 +603,7 @@ def test_ep_wave_trace_exposes_long_dispatch_when_compute_cannot_hide_it():
                 category="compute",
                 phase="fwd",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.experts",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -565,6 +617,7 @@ def test_ep_wave_trace_exposes_long_dispatch_when_compute_cannot_hide_it():
                 category="compute",
                 phase="fwd",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.experts",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -579,6 +632,7 @@ def test_ep_wave_trace_exposes_long_dispatch_when_compute_cannot_hide_it():
                 phase="fwd",
                 parallelism_tag="ep",
                 comm_role="combine",
+                scope="transformer.layers.0.ffn.moe",
                 ep_wave_k=4,
             ),
         ]
@@ -647,8 +701,8 @@ def test_ep_wave_trace_excludes_shared_expert_compute():
                 op_type="GroupedMatMul",
                 category="compute",
                 phase="fwd",
-                scope="transformer.layers.0.ffn.moe",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.experts",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -661,8 +715,8 @@ def test_ep_wave_trace_excludes_shared_expert_compute():
                 op_type="GroupedMatMul",
                 category="compute",
                 phase="fwd",
-                scope="transformer.layers.0.ffn.moe",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.experts",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -743,6 +797,7 @@ def test_ep_wave_trace_delays_following_compute_after_synthesized_waves():
                 phase="fwd",
                 parallelism_tag="ep",
                 comm_role="dispatch",
+                scope="transformer.layers.0.ffn.moe",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -756,6 +811,7 @@ def test_ep_wave_trace_delays_following_compute_after_synthesized_waves():
                 category="compute",
                 phase="fwd",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.experts",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -769,6 +825,7 @@ def test_ep_wave_trace_delays_following_compute_after_synthesized_waves():
                 category="compute",
                 phase="fwd",
                 component="routed_expert",
+                scope="transformer.layers.0.ffn.experts",
                 ep_wave_k=4,
             ),
             ScheduledOp(
@@ -783,6 +840,7 @@ def test_ep_wave_trace_delays_following_compute_after_synthesized_waves():
                 phase="fwd",
                 parallelism_tag="ep",
                 comm_role="combine",
+                scope="transformer.layers.0.ffn.moe",
                 ep_wave_k=4,
             ),
             ScheduledOp(

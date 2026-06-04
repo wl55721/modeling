@@ -916,7 +916,9 @@ def _phase_subgraph_for_training_export(graph, *, phase: str, name_suffix: str):
     phase_aliases = {
         "train_forward": {"fwd", "forward", "train_forward"},
         "train_backward": {"bwd", "backward", "train_backward"},
-    }[phase]
+    }.get(phase)
+    if phase_aliases is None:
+        return None
     node_ids = {
         node_id
         for node_id, node in graph.nodes.items()

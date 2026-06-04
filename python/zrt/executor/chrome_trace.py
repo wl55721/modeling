@@ -716,7 +716,7 @@ class ChromeTraceExporter:
 
     # ── internals ─────────────────────────────────────────────────────────
 
-    def _is_moe_fb_hidden_comm(self, op) -> bool:
+    def _is_moe_fb_comm(self, op) -> bool:
         return (
             self._trace_moe_fb_overlap
             and op.stream_type == "comm"
@@ -725,26 +725,47 @@ class ChromeTraceExporter:
             and op.comm_role in ("dispatch", "combine")
         )
 
+    def _is_moe_fb_hidden_comm(self, op) -> bool:
+        return self._is_moe_fb_comm(op) and self._moe_fb_hidden_us(op) > 0.0
+
+    @staticmethod
+    def _moe_fb_hidden_us(op) -> float:
+        return max(0.0, float(getattr(op, "overlap_hidden_us", 0.0) or 0.0))
+
+    @staticmethod
+    def _moe_fb_exposed_us(op) -> float:
+        explicit = float(getattr(op, "overlap_exposed_us", 0.0) or 0.0)
+        if explicit > 0.0:
+            return explicit
+        hidden = ChromeTraceExporter._moe_fb_hidden_us(op)
+        return max(0.0, float(getattr(op, "latency_us", 0.0) or 0.0) - hidden)
+
     def _moe_fb_event_name(self, op, name: str) -> str:
-        if not self._is_moe_fb_hidden_comm(op):
+        if not self._is_moe_fb_comm(op):
             return name
-        return f"{name} [moe_fb hidden {op.comm_role}]"
+        state = "hidden" if self._is_moe_fb_hidden_comm(op) else "exposed"
+        return f"{name} [moe_fb {state} {op.comm_role}]"
 
     def _moe_fb_event_cat(self, op, cat: str) -> str:
-        if not self._is_moe_fb_hidden_comm(op):
+        if not self._is_moe_fb_comm(op):
             return cat
-        return "communication.ep.moe_fb.hidden"
+        state = "hidden" if self._is_moe_fb_hidden_comm(op) else "exposed"
+        return f"communication.ep.moe_fb.{state}"
 
     def _moe_fb_event_args(self, op, args: dict) -> dict:
-        if not self._is_moe_fb_hidden_comm(op):
+        if not self._is_moe_fb_comm(op):
             return args
+        hidden_us = self._moe_fb_hidden_us(op)
+        exposed_us = self._moe_fb_exposed_us(op)
         enriched = dict(args)
         enriched.update({
             "view": args.get("view", "detail"),
             "parallelism": "ep",
             "overlap": "moe_fb",
             "role": op.comm_role,
-            "hidden": True,
+            "hidden": hidden_us > 0.0,
+            "hidden_us": hidden_us,
+            "exposed_us": exposed_us,
             "original_node": op.node_id,
             "stream_type": op.stream_type,
         })
@@ -879,7 +900,7 @@ class ChromeTraceExporter:
     @staticmethod
     def _same_ep_region_scope(dispatch_scope: str, op_scope: str) -> bool:
         if not dispatch_scope or not op_scope:
-            return True
+            return False
         if dispatch_scope == op_scope:
             return True
         marker = ".ffn."

@@ -149,3 +149,20 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys, tm
     assert {n.op_type for n in onnx_by_name["llama3_8b_train_backward_graph.onnx"].nodes.values()} == {
         "GroupedMatMul",
     }
+
+
+def test_phase_subgraph_for_training_export_unknown_phase_returns_none():
+    from python.zrt import cli
+
+    graph = OpGraph(name="transformed_unified", phase="train")
+    graph.add_node(OpNode(
+        id="comm_a2a_dispatch",
+        op_type="comm.all_to_all",
+        annotations={"phase": "fwd"},
+    ))
+
+    assert cli._phase_subgraph_for_training_export(
+        graph,
+        phase="optimizer",
+        name_suffix="optimizer",
+    ) is None

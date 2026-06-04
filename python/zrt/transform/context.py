@@ -267,7 +267,7 @@ class TrainingConfig:
     # Graph-capture MegaMoE controls
     mega_moe: bool = False
     mega_moe_waves: int = 0
-    moe_fb_overlap: bool = True
+    moe_fb_overlap: bool = False
 
     # Pipeline schedule
     pp_schedule: str = "1f1b"  # "1f1b", "interleaved", "dualpipe", "dualpipev", "zb"

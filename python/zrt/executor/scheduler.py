@@ -49,6 +49,8 @@ class ScheduledOp:
     scope: str = ""
     module_class: str = ""
     ep_wave_k: int = 0
+    overlap_hidden_us: float = 0.0
+    overlap_exposed_us: float = 0.0
 
     def __repr__(self) -> str:
         return (
@@ -223,6 +225,20 @@ class DAGScheduler:
                 scope = getattr(node, "scope", "") or "",
                 module_class = getattr(node, "module_class", "") or "",
                 ep_wave_k = int(node.attrs.get("ep_wave_k", 0)),
+                overlap_hidden_us = float(
+                    node.annotations.get(
+                        "moe_fb_hidden_us",
+                        node.annotations.get("overlap_hidden_us", 0.0),
+                    )
+                    or 0.0
+                ),
+                overlap_exposed_us = float(
+                    node.annotations.get(
+                        "moe_fb_exposed_us",
+                        node.annotations.get("overlap_exposed_us", 0.0),
+                    )
+                    or 0.0
+                ),
             ))
 
             for succ_id in graph.successors(node.id):

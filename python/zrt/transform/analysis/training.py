@@ -30,7 +30,7 @@ def _graph_moe_fb_overlap_us(
     """Estimate graph-path MoE F/B EP hiding from the PP schedule window."""
     if (
         ep_total_us <= 0.0
-        or not getattr(strategy, "moe_fb_overlap", True)
+        or not getattr(strategy, "moe_fb_overlap", False)
         or getattr(strategy, "ep", 1) <= 1
     ):
         return 0.0, max(0.0, ep_total_us)
@@ -49,6 +49,21 @@ def _graph_moe_fb_overlap_us(
     hidden = min(max(0.0, ep_total_us), compute_window_us * factor * steady)
     exposed = max(0.0, ep_total_us - hidden)
     return hidden, exposed
+
+
+def _apply_moe_fb_disabled_ep_accounting(per_strat):
+    """Clear MoE-FB detail fields while preserving non-FB EP hiding."""
+    per_strat.ep_exposed_us = max(
+        0.0,
+        per_strat.ep_total_us - per_strat.ep_hidden_us,
+    )
+    return (
+        per_strat.ep_total_us,
+        0.0,
+        per_strat.ep_total_us,
+        0.0,
+        0.0,
+    )
 
 
 # ── TrainingFlopsPass ───────────────────────────────────────────────────────────
@@ -1027,7 +1042,7 @@ class TrainingPipelinePass(GraphPass):
             setattr(per_strat, f"{tag}_hidden_us", merged_hidden)
             setattr(per_strat, f"{tag}_exposed_us", max(0.0, merged_total - merged_hidden))
 
-        moe_fb_enabled = bool(getattr(ctx.training, "moe_fb_overlap", True))
+        moe_fb_enabled = bool(getattr(ctx.training, "moe_fb_overlap", False))
         ep_fb_total_us = per_strat.ep_total_us
         ep_fb_hidden_us = 0.0
         ep_fb_exposed_us = ep_fb_total_us
@@ -1062,8 +1077,13 @@ class TrainingPipelinePass(GraphPass):
             ep_fb_exposed_us = per_strat.ep_exposed_us
             ep_fb_steady_hidden_us = ep_fb_hidden_us
         else:
-            per_strat.ep_hidden_us = 0.0
-            per_strat.ep_exposed_us = per_strat.ep_total_us
+            (
+                ep_fb_total_us,
+                ep_fb_hidden_us,
+                ep_fb_exposed_us,
+                ep_fb_steady_hidden_us,
+                ep_fb_boundary_hidden_us,
+            ) = _apply_moe_fb_disabled_ep_accounting(per_strat)
 
         total_comm_us = (
             per_strat.tp_total_us + per_strat.ep_total_us
