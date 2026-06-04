@@ -169,7 +169,7 @@ def test_enabled_rules_excludes_others():
 
     nodes, edges = _rms_norm_group(call_id=12)
     g = _graph(nodes, edges)
-    cfg = FusionConfig(enabled_rules={"linear"})  # rms_norm explicitly excluded
+    cfg = FusionConfig(enabled_rules={"cross_entropy"})  # rms_norm explicitly excluded
     out = FusionPass().run(g, _ctx_with_fusion(cfg))
 
     # No fusion happened — all 6 raw aten nodes survive.
@@ -224,7 +224,7 @@ def test_unmatched_ops_left_raw_no_collapse_fallback():
 
     nodes, edges = _attn_fragment_graph()
     g = _graph(nodes, edges)
-    cfg = FusionConfig()  # defaults: structural collapse OFF
+    cfg = FusionConfig(allow_structural_collapse=False)  # explicitly disable structural collapse
     out = FusionPass().run(g, _ctx_with_fusion(cfg))
 
     attn_nodes = [n for n in out.nodes.values()
@@ -804,7 +804,7 @@ def test_fixed_point_terminates_when_no_change():
         )
         g = _graph(nodes, edges)
 
-        cfg = FusionConfig()
+        cfg = FusionConfig(allow_structural_collapse=False)  # explicitly disable coarsening
         out = fuse(g, _ctx_no_autoload(cfg))
     finally:
         clear_rules()
@@ -812,3 +812,281 @@ def test_fixed_point_terminates_when_no_change():
     # No rule registered → no fusion → all 3 nodes survive.
     assert out.num_nodes() == 3
     assert all(not n.is_fused for n in out.nodes.values())
+
+
+# ── Coarsen functionality tests ─────────────────────────────────────────────
+
+def test_coarsen_rule_matching():
+    """Coarsen rules should match nodes by scope pattern and module_class."""
+    from python.zrt.transform.fusion.api import _match_coarsen_rule
+    from python.zrt.transform.fusion.loading import initialize_rules
+    from python.zrt.transform.fusion.registry import clear_rules
+    
+    clear_rules()
+    try:
+        initialize_rules("deepseek_v4")
+        
+        # Test RMSNorm matching
+        rule = _match_coarsen_rule("model.layers.0.input_layernorm", "RMSNorm", "deepseek_v4")
+        assert rule is not None
+        assert rule["spec_kind"] == "rmsnorm"
+        assert rule["op_type"] == "aten.rms_norm.default"
+        
+        # Test Linear matching
+        rule = _match_coarsen_rule("model.layers.0.self_attn.q_proj", "Linear", "deepseek_v4")
+        assert rule is not None
+        assert rule["spec_kind"] == "matmul"
+        
+        # Test no match for unknown scope
+        rule = _match_coarsen_rule("model.unknown.module", "Unknown", "deepseek_v4")
+        assert rule is None
+    finally:
+        clear_rules()
+
+
+def test_coarsen_v4_rules_integration():
+    """Coarsen should aggregate aten ops using V4 rules."""
+    from python.zrt.transform.context import FusionConfig
+    from python.zrt.transform.fusion.loading import initialize_rules
+    from python.zrt.transform.fusion.registry import clear_rules
+    
+    clear_rules()
+    try:
+        initialize_rules("deepseek_v4")
+        
+        # Create a simple graph with RMSNorm ops
+        nodes = [
+            _node("op_0", "aten.pow.Tensor_Scalar", "model.layers.0.input_layernorm", "0", "RMSNorm"),
+            _node("op_1", "aten.mean.dim", "model.layers.0.input_layernorm", "0", "RMSNorm"),
+            _node("op_2", "aten.add.Tensor", "model.layers.0.input_layernorm", "0", "RMSNorm"),
+            _node("op_3", "aten.rsqrt.default", "model.layers.0.input_layernorm", "0", "RMSNorm"),
+            _node("op_4", "aten.mul.Tensor", "model.layers.0.input_layernorm", "0", "RMSNorm"),
+            _node("op_5", "aten.mul.Tensor", "model.layers.0.input_layernorm", "0", "RMSNorm"),
+        ]
+        edges = [_edge(f"op_{i}", f"op_{i+1}") for i in range(5)]
+        g = _graph(nodes, edges)
+        
+        cfg = FusionConfig()  # Default: allow_structural_collapse=True
+        out = FusionPass().run(g, _ctx_with_fusion(cfg))
+        
+        # Should fuse into 1 RMSNorm node
+        assert out.num_nodes() == 1
+        fused = list(out.nodes.values())[0]
+        assert fused.op_type == "rms_norm"
+        assert fused.is_fused
+    finally:
+        clear_rules()
+
+
+def test_coarsen_skips_when_enabled_rules_set():
+    """Coarsen should skip when enabled_rules is set."""
+    from python.zrt.transform.context import FusionConfig
+    from python.zrt.transform.fusion.loading import initialize_rules
+    from python.zrt.transform.fusion.registry import clear_rules
+    
+    clear_rules()
+    try:
+        initialize_rules("deepseek_v4")
+        
+        nodes = [
+            _node("op_0", "aten.mm.default", "model.layers.0.self_attn.q_proj", "0", "Linear"),
+            _node("op_1", "aten.mm.default", "model.layers.0.self_attn.o_proj", "0", "Linear"),
+        ]
+        edges = [_edge("op_0", "op_1")]
+        g = _graph(nodes, edges)
+        
+        # Set enabled_rules to skip coarsen
+        cfg = FusionConfig(enabled_rules={"rms_norm"})
+        out = FusionPass().run(g, _ctx_with_fusion(cfg))
+        
+        # Nodes should not be coarsened
+        assert out.num_nodes() == 2
+        assert all(not n.is_fused for n in out.nodes.values())
+    finally:
+        clear_rules()
+
+
+def test_coarsen_skips_when_disabled_rules_set():
+    """Coarsen should skip when disabled_rules is set."""
+    from python.zrt.transform.context import FusionConfig
+    from python.zrt.transform.fusion.loading import initialize_rules
+    from python.zrt.transform.fusion.registry import clear_rules
+    
+    clear_rules()
+    try:
+        initialize_rules("deepseek_v4")
+        
+        nodes = [
+            _node("op_0", "aten.mm.default", "model.layers.0.self_attn.q_proj", "0", "Linear"),
+            _node("op_1", "aten.mm.default", "model.layers.0.self_attn.o_proj", "0", "Linear"),
+        ]
+        edges = [_edge("op_0", "op_1")]
+        g = _graph(nodes, edges)
+        
+        # Set disabled_rules to skip coarsen
+        cfg = FusionConfig(disabled_rules={"rms_norm"})
+        out = FusionPass().run(g, _ctx_with_fusion(cfg))
+        
+        # Nodes should not be coarsened
+        assert out.num_nodes() == 2
+        assert all(not n.is_fused for n in out.nodes.values())
+    finally:
+        clear_rules()
+
+
+def test_coarsen_fwd_bwd_phases():
+    """Coarsen should handle fwd/bwd phases correctly."""
+    from python.zrt.transform.context import FusionConfig
+    from python.zrt.transform.fusion.loading import initialize_rules
+    from python.zrt.transform.fusion.registry import clear_rules
+    
+    clear_rules()
+    try:
+        initialize_rules("deepseek_v4")
+        
+        # Create fwd and bwd nodes with different call_ids
+        nodes = [
+            _node("op_0", "aten.mm.default", "model.layers.0.self_attn.q_proj", "0", "Linear"),
+            _node("op_1", "aten.mm.default", "model.layers.0.self_attn.q_proj", "0", "Linear"),
+        ]
+        nodes[0].annotations["phase"] = "fwd"
+        nodes[0].call_id = 1
+        nodes[1].annotations["phase"] = "bwd"
+        nodes[1].call_id = 2
+        
+        edges = [_edge("op_0", "op_1")]
+        g = _graph(nodes, edges)
+        
+        cfg = FusionConfig()
+        out = FusionPass().run(g, _ctx_with_fusion(cfg))
+        
+        # Should create separate fwd and bwd nodes
+        assert out.num_nodes() == 2
+        node_ids = list(out.nodes.keys())
+        assert any("fwd" in nid or "L0" in nid for nid in node_ids)
+        assert any("bwd" in nid for nid in node_ids)
+    finally:
+        clear_rules()
+
+
+def test_coarsen_breaks_cycles():
+    """Coarsen should break cycles in the graph."""
+    from python.zrt.transform.fusion.api import _break_cycles
+    
+    # Create a graph with a cycle: A -> B -> C -> A
+    edges = [
+        Edge(src="A", src_idx=0, dst="B", dst_idx=0, tensor=_t("e1")),
+        Edge(src="B", src_idx=0, dst="C", dst_idx=0, tensor=_t("e2")),
+        Edge(src="C", src_idx=0, dst="A", dst_idx=0, tensor=_t("e3")),
+    ]
+    orig_order = {"A": 0, "B": 1, "C": 2}
+    nid_map = {"A": "A", "B": "B", "C": "C"}
+    
+    new_edges = _break_cycles(edges, orig_order, nid_map)
+    
+    # Should break at least one edge to break the cycle
+    assert len(new_edges) < len(edges)
+    
+    # Verify no cycles remain
+    from collections import defaultdict
+    adj = defaultdict(list)
+    for e in new_edges:
+        adj[e.src].append(e.dst)
+    
+    # Simple cycle detection
+    def has_cycle(graph):
+        visited = set()
+        rec_stack = set()
+        
+        def dfs(node):
+            visited.add(node)
+            rec_stack.add(node)
+            for neighbor in graph.get(node, []):
+                if neighbor not in visited:
+                    if dfs(neighbor):
+                        return True
+                elif neighbor in rec_stack:
+                    return True
+            rec_stack.remove(node)
+            return False
+        
+        for node in graph:
+            if node not in visited:
+                if dfs(node):
+                    return True
+        return False
+    
+    assert not has_cycle(adj)
+
+
+def test_coarsen_v4_moe_nodes():
+    """Coarsen should handle V4 MoE nodes correctly."""
+    from python.zrt.transform.context import FusionConfig
+    from python.zrt.transform.fusion.loading import initialize_rules
+    from python.zrt.transform.fusion.registry import clear_rules
+    
+    clear_rules()
+    try:
+        initialize_rules("deepseek_v4")
+        
+        # Create MoE nodes
+        nodes = [
+            _node("op_0", "aten.mm.default", "model.layers.0.ffn.experts.0.w1", "0", "Expert"),
+            _node("op_1", "aten.silu.default", "model.layers.0.ffn.experts.0.w1", "0", "Expert"),
+            _node("op_2", "aten.mm.default", "model.layers.0.ffn.experts.0.w2", "0", "Expert"),
+        ]
+        for i, n in enumerate(nodes):
+            n.call_id = i + 1
+        
+        edges = [_edge("op_0", "op_1"), _edge("op_1", "op_2")]
+        g = _graph(nodes, edges)
+        
+        cfg = FusionConfig()
+        out = FusionPass().run(g, _ctx_with_fusion(cfg))
+        
+        # Should coarsen expert nodes
+        assert out.num_nodes() >= 1
+        # Check that at least one node has expert-related spec_kind
+        spec_kinds = [n.attrs.get("spec_kind") for n in out.nodes.values()]
+        assert any("expert" in sk or "matmul" in sk for sk in spec_kinds if sk)
+    finally:
+        clear_rules()
+
+
+def test_coarsen_preserves_comm_nodes():
+    """Coarsen should preserve communication nodes."""
+    from python.zrt.transform.context import FusionConfig
+    from python.zrt.transform.fusion.loading import initialize_rules
+    from python.zrt.transform.fusion.registry import clear_rules
+    
+    clear_rules()
+    try:
+        initialize_rules("deepseek_v4")
+        
+        nodes = [
+            _node("op_0", "aten.mm.default", "model.layers.0.self_attn.q_proj", "0", "Linear"),
+            _node("comm_0", "comm.all_reduce", "model.layers.0", "0", "", "communication"),
+            _node("op_1", "aten.mm.default", "model.layers.0.self_attn.o_proj", "0", "Linear"),
+        ]
+        edges = [_edge("op_0", "comm_0"), _edge("comm_0", "op_1")]
+        g = _graph(nodes, edges)
+        
+        cfg = FusionConfig()
+        out = FusionPass().run(g, _ctx_with_fusion(cfg))
+        
+        # Comm node should be preserved
+        comm_nodes = [n for n in out.nodes.values() if n.category == "communication"]
+        assert len(comm_nodes) == 1
+        assert comm_nodes[0].op_type == "comm.all_reduce"
+    finally:
+        clear_rules()
+
+
+def test_coarsen_layer_id_extraction():
+    """Coarsen should extract layer_id correctly."""
+    from python.zrt.transform.fusion.api import _extract_layer_id
+    
+    assert _extract_layer_id("model.layers.0.self_attn.q_proj") == "0"
+    assert _extract_layer_id("model.layers.10.mlp.gate_proj") == "10"
+    assert _extract_layer_id("model.embed_tokens") == "-1"
+    assert _extract_layer_id("model.layers.0.self_attn.q_proj@fwd") == "0"

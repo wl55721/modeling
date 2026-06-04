@@ -37,6 +37,10 @@ def load_yaml_rules(path: Path):
 
     Returns an empty list when the file does not exist or is empty.
     Malformed entries are skipped with a warning.
+    
+    Supports two formats:
+    1. Top-level list of rules (legacy format)
+    2. Top-level dict with 'fusion_rules' key containing list of rules
     """
     from python.zrt.transform.fusion.core.rule import ModuleFusionRule  # noqa: F401
 
@@ -51,8 +55,12 @@ def load_yaml_rules(path: Path):
     if data is None:
         return []
 
+    # Support both legacy list format and new dict format
+    if isinstance(data, dict):
+        data = data.get("fusion_rules", [])
+    
     if not isinstance(data, list):
-        logger.error("YAML rules file must contain a list at top level: %s", path)
+        logger.error("YAML rules file must contain a list at top level or under 'fusion_rules' key: %s", path)
         return []
 
     rules: list = []

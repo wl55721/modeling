@@ -168,7 +168,11 @@ def _apply_partial_matches(graph, group, scanner, fusion_cfg, fuse_idx):
     if not matches:
         # No partial match either — leave bucket as raw aten unless the
         # legacy structural-collapse escape hatch is enabled.
-        if fusion_cfg.allow_structural_collapse:
+        # Also skip structural collapse if enabled_rules or disabled_rules is set
+        # (structural collapse should only run when fusion is doing full fusion).
+        if (fusion_cfg.allow_structural_collapse
+                and fusion_cfg.enabled_rules is None
+                and not fusion_cfg.disabled_rules):
             group_ids = {op.id for op in group.child_ops}
             replacement = _build_collapsed_node(group, graph, fuse_idx)
             fuse_idx += 1

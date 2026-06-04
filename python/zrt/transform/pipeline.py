@@ -95,7 +95,6 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
     from python.zrt.transform.training.recompute import RecomputePass
     from python.zrt.transform.training.optimizer import OptimizerPass
     from python.zrt.transform.training.offload import OffloadPass
-    from python.zrt.transform.passes.coarsen import GraphCoarsenPass
 
     is_train = lambda c: c.is_training
 
@@ -130,16 +129,10 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
              condition=lambda c: c.is_training and c.training.tp_coc)
     pipe.add("split", PipelineParallelPass(),
              condition=lambda c: c.parallel.pp > 1)
-    # GraphCoarsenPass and FusionPass are mutually exclusive:
-    # - GraphCoarsenPass: aggregates aten ops by scope into block-level nodes
-    # - FusionPass: fuses aten ops by module_class + rich rules
-    # When "coarsen" is in optim_flags, use GraphCoarsenPass; otherwise FusionPass.
-    pipe.add("split", GraphCoarsenPass(),
-             condition=lambda c: "coarsen" in c.optim_flags)
 
     # ── Stage 2: Fuse ─────────────────────────────────────────────────────────
-    pipe.add("fuse", FusionPass(),
-             condition=lambda c: "coarsen" not in c.optim_flags)
+    # FusionPass applies rich fusion rules and then coarsens remaining aten ops by scope.
+    pipe.add("fuse", FusionPass())
 
     # ── Stage 3: Optim ────────────────────────────────────────────────────────
     pipe.add("optim", QuantizationPass(),

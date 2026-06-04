@@ -379,7 +379,7 @@ class FusionConfig:
 
     enabled_rules: set[str] | None = None
     disabled_rules: set[str] = field(default_factory=set)
-    allow_structural_collapse: bool = False
+    allow_structural_collapse: bool = True
     merge_sibling_classes: set[str] = field(default_factory=set)
 
     @classmethod

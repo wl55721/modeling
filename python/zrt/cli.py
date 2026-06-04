@@ -630,11 +630,11 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     """Run graph-native training modelling on captured training graphs.
 
     .. deprecated::
-        此函数将在 GraphCoarsenPass 实现后被 ``_run_capture_estimate`` 替代。
+        此函数将在 FusionPass 完全支持 aten-level ops 聚合后被 ``_run_capture_estimate`` 替代。
         当前保留用于 --model-id --train --hw 的旧路径（路径 A 旧入口）。
         新入口 ``_run_capture_estimate`` 使用 ``estimate_via_pipeline(capture=...)``
-        走统一 Transform Pipeline，但需要 GraphCoarsenPass 将 aten-level ops
-        聚合为 block-level ops 后才能完全替代。
+        走统一 Transform Pipeline，FusionPass 已集成 coarsen 逻辑将 aten-level ops
+        聚合为 block-level ops。
     """
     from python.zrt.transform.analysis import estimate_training_from_graphs
     from python.zrt.transform.exporter import export_training_graphs
