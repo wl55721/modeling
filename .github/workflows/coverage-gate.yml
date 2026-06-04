@@ -1,0 +1,19 @@
+name: Coverage No-Regression
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage-regression:
+    name: Coverage No-Regression Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Legacy workflow shim
+        run: |
+          echo "Coverage no-regression moved into .github/workflows/ci.yml."
+          echo "This legacy workflow remains as a lightweight shim so existing required checks do not go pending."

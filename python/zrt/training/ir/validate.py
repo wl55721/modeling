@@ -1,0 +1,167 @@
+"""IR validation — check divisibility, balance, and placement constraints."""
+
+from __future__ import annotations
+
+from zrt.training.spec.model import LayerKind, ModelSpec
+from zrt.training.spec.strategy import CPKind, PPSched, Strategy, TPOverlap
+from zrt.training.spec.system import SystemSpec
+
+
+def validate(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> list[str]:
+    """Return list of warning/error strings. Empty list means valid."""
+    warnings: list[str] = []
+
+    n_layers = len(model.layers)
+
+    if strategy.pp > 1:
+        if strategy.pp_layer_assignment is not None:
+            if len(strategy.pp_layer_assignment) != n_layers:
+                warnings.append(
+                    f"pp_layer_assignment length ({len(strategy.pp_layer_assignment)}) "
+                    f"!= num_layers ({n_layers})"
+                )
+        else:
+            if n_layers % strategy.pp != 0:
+                warnings.append(
+                    f"num_layers ({n_layers}) not evenly divisible by PP ({strategy.pp}); "
+                    f"stages will be imbalanced"
+                )
+
+        num_mb = strategy.num_microbatches()
+        if num_mb < strategy.pp:
+            warnings.append(
+                f"num_microbatches ({num_mb}) < PP ({strategy.pp}); "
+                f"pipeline warmup needs at least PP microbatches to fill all stages "
+                f"(increase global_batch or reduce pp)"
+            )
+
+    if strategy.cp > 1:
+        if strategy.cp_kind == CPKind.NONE:
+            warnings.append(
+                f"CP ({strategy.cp}) > 1 but cp_kind is 'none'. "
+                f"CP will not be enabled. Consider setting cp_kind='ulysses' or 'ring'."
+            )
+        if strategy.cp_kind == CPKind.ULYSSES:
+            effective_heads = model.num_heads
+            if strategy.tp > 1:
+                effective_heads = model.num_heads // strategy.tp
+            if effective_heads % strategy.cp != 0:
+                warnings.append(
+                    f"Ulysses CP requires (num_heads // tp) % cp == 0, "
+                    f"got ({model.num_heads} // {strategy.tp}) % {strategy.cp} = "
+                    f"{effective_heads % strategy.cp}"
+                )
+            if strategy.tp > 1:
+                warnings.append(
+                    f"Ulysses CP + TP SP combination: sequence sharding pattern may conflict "
+                    f"(CP handles attention seq-sharding, TP SP handles FFN seq-sharding). "
+                    f"Verify communication pattern carefully."
+                )
+        if strategy.cp_kind == CPKind.RING:
+            block_size = 128
+            if model.seq_len % (strategy.cp * block_size) != 0:
+                warnings.append(
+                    f"Ring CP requires seq_len % (cp * block_size) == 0, "
+                    f"got {model.seq_len} % ({strategy.cp} * {block_size})"
+                )
+        if strategy.cp_kind == CPKind.COMPRESSED:
+            # DeepSeek-V4 compressed CP: requires seq_len divisible by cp
+            # Compression ratios are fixed (CSA=4, HCA=128) or model-specific
+            if model.seq_len % strategy.cp != 0:
+                warnings.append(
+                    f"Compressed CP requires seq_len % cp == 0, "
+                    f"got {model.seq_len} % {strategy.cp}"
+                )
+            # Additional check: compression ratio should be compatible
+            if hasattr(model, "attn_compression_ratio") and model.attn_compression_ratio < 1.0:
+                # Model uses compressed attention (DeepSeek-V4 style)
+                # No additional constraints beyond seq_len divisible by cp
+                pass
+        if strategy.cp_kind == CPKind.HYBRID:
+            try:
+                cp_ulysses, cp_ring = strategy.hybrid_cp_factors()
+            except ValueError as exc:
+                warnings.append(str(exc))
+                cp_ulysses, cp_ring = strategy.cp, strategy.cp
+            effective_heads = model.num_heads
+            if strategy.tp > 1:
+                effective_heads = model.num_heads // strategy.tp
+            if effective_heads % cp_ulysses != 0:
+                warnings.append(
+                    f"Hybrid CP requires (num_heads // tp) % cp_ulysses == 0, "
+                    f"got ({model.num_heads} // {strategy.tp}) % {cp_ulysses} = "
+                    f"{effective_heads % cp_ulysses}"
+                )
+            block_size = 128
+            if model.seq_len % (cp_ring * block_size) != 0:
+                warnings.append(
+                    f"Hybrid CP requires seq_len % (cp_ring * block_size) == 0, "
+                    f"got {model.seq_len} % ({cp_ring} * {block_size})"
+                )
+        if strategy.cp > system.gpus_per_node:
+            warnings.append(
+                f"CP ({strategy.cp}) > gpus_per_node ({system.gpus_per_node}); "
+                f"CP communication will cross node boundaries (inter-node bandwidth)"
+            )
+
+    if strategy.cp > 1 and strategy.ep > 1:
+        warnings.append(
+            f"CP ({strategy.cp}) + EP ({strategy.ep}) combination: "
+            f"both CP and EP perform sequence sharding via A2A. "
+            f"CP handles attention sequence sharding, EP handles MoE expert FFN routing. "
+            f"Verify that their A2A patterns do not conflict (different op kinds)."
+        )
+        if strategy.cp_kind != CPKind.RING:
+            warnings.append(
+                f"Ulysses/Hybrid CP + EP: both use A2A collectives. "
+                f"Ensure CP A2A (attention) and EP A2A (expert routing) are correctly ordered."
+            )
+
+    if strategy.ep > 1 and strategy.ep > system.gpus_per_node:
+        warnings.append(
+            f"EP ({strategy.ep}) > gpus_per_node ({system.gpus_per_node}); "
+            f"EP A2A will cross node boundaries (inter-node bandwidth)"
+        )
+
+    has_moe_layers = any(lk == LayerKind.MOE for lk in model.layers)
+    if has_moe_layers and model.n_shared_experts > 0 and model.moe_ffn == 0:
+        warnings.append(
+            f"moe_ffn=0 but n_shared_experts={model.n_shared_experts}>0 with MOE layers: "
+            "shared expert SwiGLU will have zero FLOPs and zero latency. "
+            "Set moe_ffn to the per-expert FFN hidden size."
+        )
+
+    if strategy.ep > 1 and strategy.dp % strategy.ep != 0:
+        warnings.append(
+            f"DP ({strategy.dp}) not divisible by EP ({strategy.ep}); "
+            f"Megatron requires EP groups to be subsets of DP groups (DP % EP == 0)"
+        )
+
+    if strategy.tp_overlap != TPOverlap.NONE and strategy.tp <= 1:
+        warnings.append(
+            f"tp_overlap={strategy.tp_overlap.value!r} is set but tp=1; "
+            f"no TP collectives are inserted (ir/shard.py:_insert_tp_collectives "
+            f"is gated on tp > 1), so this setting has no effect. "
+            f"Set tp >= 2 or set tp_overlap='none' to suppress this warning."
+        )
+
+    if strategy.tp > system.gpus_per_node:
+        warnings.append(
+            f"TP ({strategy.tp}) > gpus_per_node ({system.gpus_per_node}); "
+            f"TP communication will be inter-node (severe performance penalty)"
+        )
+
+    if strategy.vpp_chunks > 1:
+        if strategy.pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
+            warnings.append(
+                f"vpp_chunks ({strategy.vpp_chunks}) > 1 but schedule is "
+                f"{strategy.pp_schedule.value}; VPP chunks require i1f1b or dualpipev schedule"
+            )
+        if n_layers % (strategy.pp * strategy.vpp_chunks) != 0:
+            warnings.append(
+                f"VPP requires num_layers ({n_layers}) divisible by "
+                f"PP ({strategy.pp}) * vpp_chunks ({strategy.vpp_chunks}) = "
+                f"{strategy.pp * strategy.vpp_chunks}"
+            )
+
+    return warnings

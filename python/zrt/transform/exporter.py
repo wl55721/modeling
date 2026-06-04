@@ -1,0 +1,1869 @@
+"""Export transformed OpGraph to Excel, JSON, and ONNX with parallelism annotations."""
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+from python.zrt.ir.graph import OpGraph
+from python.zrt.ir.node import OpNode
+from python.zrt.ir.param_count import op_short
+from python.zrt.transform.context import TransformContext, ParallelConfig
+from python.zrt.transform.training.recompute import (
+    has_internal_recompute,
+    is_external_recompute_node,
+)
+
+logger = logging.getLogger(__name__)
+
+
+_PRE_LAYER_KEY = -1_000_000
+_POST_LAYER_KEY = 1_000_000
+_UNKNOWN_LAYER_BASE = 999_999
+
+
+def _parse_layer(layer: str) -> int | None:
+    if not layer:
+        return None
+    try:
+        return int(layer)
+    except (ValueError, TypeError):
+        return None
+
+
+def _build_layer_display_map(graph: OpGraph) -> dict[str, str]:
+    """Build layer → display-string map using LayerProfile typical-layer info.
+
+    For each layer type with a known typical index, every member layer gets a
+    display label.  When the layer indices form a uniform stride with count ≥ 3,
+    the step size is shown explicitly, e.g. ``"3 (3-59, step 2, 29层)"``.
+    Otherwise the label omits the step, e.g. ``"0 (0-1, 2层)"`` or ``"2 (2, 1层)"``.
+    Layers without a profile (or without a typical index) are left unmapped so
+    the caller can fall back to the raw ``node.layer`` value.
+    """
+    metadata = graph.metadata or {}
+    layer_profile = metadata.get("layer_profile")
+    typical_indices = metadata.get("typical_indices")
+    if layer_profile is None or not typical_indices:
+        return {}
+
+    layer_types = getattr(layer_profile, "layer_types", None)
+    if not layer_types:
+        return {}
+
+    groups: dict[int, list[int]] = {}
+    for idx, lt in enumerate(layer_types):
+        key = lt.value if hasattr(lt, "value") else str(lt)
+        typ_idx: int | None = None
+        for ti in typical_indices:
+            if ti < len(layer_types):
+                tlt = layer_types[ti]
+                tkey = tlt.value if hasattr(tlt, "value") else str(tlt)
+                if tkey == key:
+                    typ_idx = ti
+                    break
+        if typ_idx is None:
+            continue
+        groups.setdefault(typ_idx, []).append(idx)
+
+    result: dict[str, str] = {}
+    for typ_idx, indices in groups.items():
+        indices_sorted = sorted(indices)
+        count = len(indices_sorted)
+        if count == 1:
+            range_str = str(indices_sorted[0])
+        else:
+            range_str = f"{indices_sorted[0]}-{indices_sorted[-1]}"
+        if count >= 3:
+            diffs = [indices_sorted[i+1] - indices_sorted[i] for i in range(count - 1)]
+            if len(set(diffs)) == 1 and diffs[0] > 1:
+                display = f"{typ_idx} ({range_str}, step {diffs[0]}, {count}层)"
+            else:
+                display = f"{typ_idx} ({range_str}, {count}层)"
+        else:
+            display = f"{typ_idx} ({range_str}, {count}层)"
+        for idx in indices_sorted:
+            result[str(idx)] = display
+    return result
+
+
+def _effective_layer_map(graph, nodes: list) -> dict[str, float]:
+    """Assign each node a sortable float representing its execution-order layer.
+
+    Algorithm:
+
+    1. Numeric ``layer`` → that integer (seed).
+    2. Phase-aware predecessor BFS: untagged nodes inherit ``max(prev) + 0.5``
+       — only same-phase edges are followed.  Stitched fwd→bwd cross-edges
+       are ignored, otherwise a fwd head op would be pulled into the bwd
+       subgraph's layer range.
+    3. Phase-aware successor BFS: ``min(succ) - 0.5`` for the still-unseeded.
+    4. Scope-based fallback for fully isolated nodes (no same-phase edges
+       connect them to any tagged layer):
+         * scope contains ``embed`` → pre-layer bucket.
+         * top-level ``head`` / ``norm`` (not inside ``layers.N.*``) → post-layer.
+         * else → pre-layer bucket (capture-order fallback).
+    """
+    by_id = {n.id: n for n in nodes}
+
+    def _phase_of(node):
+        return node.annotations.get("phase", "") if node.annotations else ""
+
+    preds: dict[str, list[str]] = {n.id: [] for n in nodes}
+    succs: dict[str, list[str]] = {n.id: [] for n in nodes}
+    for e in graph.edges:
+        if e.src not in by_id or e.dst not in by_id:
+            continue
+        ps = _phase_of(by_id[e.src])
+        pd = _phase_of(by_id[e.dst])
+        # Drop cross-phase edges (fwd ↔ bwd) so the BFS stays within one phase.
+        if ps and pd and ps != pd:
+            continue
+        preds[e.dst].append(e.src)
+        succs[e.src].append(e.dst)
+
+    eff: dict[str, float] = {}
+    unknown_label: dict[str, str] = {}
+
+    # 1) seed with explicit numeric layer
+    for n in nodes:
+        v = _parse_layer(n.layer)
+        if v is not None:
+            eff[n.id] = float(v)
+        elif n.layer:
+            unknown_label[n.id] = n.layer  # non-numeric label, tail bucket
+
+    max_numeric = max(eff.values(), default=0.0)
+
+    # 2) backward BFS: pull from max predecessor (+0.5)
+    changed = True
+    while changed:
+        changed = False
+        for n in nodes:
+            if n.id in eff:
+                continue
+            prev_vals = [eff[p] for p in preds[n.id] if p in eff]
+            if prev_vals:
+                eff[n.id] = max(prev_vals) + 0.5
+                changed = True
+
+    # 3) forward BFS: pull from min successor (-0.5) for nodes still unseeded
+    changed = True
+    while changed:
+        changed = False
+        for n in nodes:
+            if n.id in eff or n.id in unknown_label:
+                continue
+            succ_vals = [eff[s] for s in succs[n.id] if s in eff]
+            if succ_vals:
+                eff[n.id] = min(succ_vals) - 0.5
+                changed = True
+
+    # 4) isolated nodes: classify by scope.
+    post_layer_default = max_numeric + 1.0
+    for n in nodes:
+        if n.id in eff or n.id in unknown_label:
+            continue
+        scope = (n.scope or "").lower()
+        is_per_layer = "layers." in scope
+        if "embed" in scope and not is_per_layer:
+            eff[n.id] = float(_PRE_LAYER_KEY)
+        elif not is_per_layer and any(kw in scope for kw in (".head", "head_module", ".norm")):
+            eff[n.id] = post_layer_default
+        elif not is_per_layer and scope.endswith("norm"):
+            eff[n.id] = post_layer_default
+        else:
+            eff[n.id] = float(_PRE_LAYER_KEY)
+    return eff
+
+
+def layer_stable_sort(nodes: list, graph: OpGraph | None = None) -> list:
+    """Sort nodes for readable Excel output.
+
+    Primary key is the *effective* layer (numeric ``layer`` for tagged ops,
+    propagated from neighbors otherwise — see :func:`_effective_layer_map`).
+    Secondary key is the original topo index so order within a layer is
+    preserved.  When ``graph`` is omitted, falls back to a pure topo sort
+    using only the ``layer`` field (legacy behaviour).
+    """
+    topo_index = {n.id: i for i, n in enumerate(nodes)}
+
+    if graph is None:
+        # Legacy path: numeric layer only, non-numeric → tail bucket.
+        def _legacy_key(node: OpNode) -> tuple[float, int]:
+            v = _parse_layer(node.layer)
+            if v is not None:
+                return (float(v), topo_index[node.id])
+            return (float(_UNKNOWN_LAYER_BASE), topo_index[node.id])
+        return sorted(nodes, key=_legacy_key)
+
+    eff = _effective_layer_map(graph, nodes)
+    tail_bucket = float(_UNKNOWN_LAYER_BASE)
+
+    def _key(node: OpNode) -> tuple[float, int]:
+        if node.id in eff:
+            return (eff[node.id], topo_index[node.id])
+        # non-numeric layer label → tail
+        return (tail_bucket, topo_index[node.id])
+
+    return sorted(nodes, key=_key)
+
+
+def infer_pipeline_stage(node: OpNode, layer_to_stage: Optional[Dict[str, int]] = None) -> str:
+    """Infer pipeline stage from layer index.
+
+    In pipeline parallelism, consecutive layers are grouped into stages.
+    For now, if layer info is available, use layer number; otherwise infer from scope.
+    """
+    if layer_to_stage and node.layer in layer_to_stage:
+        return f"stage_{layer_to_stage[node.layer]}"
+
+    # Try to extract layer number from scope (e.g., "layers.0.mlp" → layer "0")
+    if node.layer:
+        try:
+            stage_num = int(node.layer) // 4  # assume 4 layers per stage as default
+            return f"stage_{stage_num}"
+        except (ValueError, TypeError):
+            pass
+
+    return "stage_0"
+
+
+def get_parallelism_info(node: OpNode, parallel_config: ParallelConfig) -> Dict[str, str]:
+    """Extract parallelism information from node annotations and attributes."""
+    result = {
+        "strategy": parallel_config.describe(),
+        "collective": "",
+        "group_size": "",
+        "role": "",
+    }
+
+    # Check if this is a communication node
+    if node.is_comm:
+        result["collective"] = node.attrs.get("collective", "")
+        result["group_size"] = str(node.attrs.get("group_size", ""))
+        result["role"] = node.attrs.get("role", "")
+
+        # Infer which parallel dimension this comm belongs to
+        collective = result["collective"]
+        group_size = node.attrs.get("group_size", 1)
+
+        if collective == "all_reduce":
+            result["parallel_type"] = "TP"  # Tensor Parallel
+        elif collective == "all_to_all":
+            result["parallel_type"] = "EP"  # Expert Parallel
+        else:
+            result["parallel_type"] = ""
+    else:
+        # Check if node has parallel annotations from Split passes
+        tp_split = node.annotations.get("tp_split", {})
+        ep_annot = node.annotations.get("ep_needs_a2a")
+
+        parallel_types = []
+        if tp_split:
+            parallel_types.append("TP")
+        if ep_annot:
+            parallel_types.append("EP")
+
+        result["parallel_type"] = "/".join(parallel_types) or ""
+
+    return result
+
+
+class TransformedGraphExcelWriter:
+    """Write transformed OpGraph to Excel with parallelism, communication, and stream info."""
+
+    def __init__(self):
+        if not HAS_OPENPYXL:
+            raise ImportError("openpyxl is required for Excel export. Install with: pip install openpyxl")
+        self._header_fill = PatternFill(start_color="1a237e", end_color="1a237e", fill_type="solid")
+        self._header_font = Font(bold=True, color="FFFFFF", size=11)
+        self._comm_fill = PatternFill(start_color="ffebee", end_color="ffebee", fill_type="solid")
+        self._compute_fill = PatternFill(start_color="e8f5e9", end_color="e8f5e9", fill_type="solid")
+        self._memory_fill = PatternFill(start_color="fff3e0", end_color="fff3e0", fill_type="solid")
+        self._thin_border = Border(bottom=Side(style="thin", color="BDBDBD"))
+
+    def write(self, graph: OpGraph, ctx: TransformContext, output_path: Path) -> None:
+        """Write transformed graph to Excel with all annotations."""
+        wb = openpyxl.Workbook()
+
+        self._write_metadata_sheet(wb, graph, ctx)
+        self._write_transformed_ops_sheet(wb, graph, ctx)
+        self._write_communication_sheet(wb, graph, ctx)
+
+        wb.save(output_path)
+        logger.info(f"Exported transformed graph to {output_path}")
+
+    def _write_metadata_sheet(self, wb: openpyxl.Workbook,
+                              graph: OpGraph, ctx: TransformContext) -> None:
+        """Write graph metadata and configuration."""
+        ws = wb.active
+        ws.title = "Metadata"
+
+        ws.append(["Graph Metadata"])
+        ws["A1"].font = Font(bold=True, size=12)
+
+        metadata = [
+            ("Graph Name", graph.name),
+            ("Phase", graph.phase),
+            ("Total Nodes", len(graph.nodes)),
+            ("Total Edges", len(graph.edges)),
+            ("", ""),
+            ("Parallelism Config", ""),
+            ("  TP (Tensor Parallel)", ctx.parallel.tp),
+            ("  EP (Expert Parallel)", ctx.parallel.ep),
+            ("  PP (Pipeline Parallel)", ctx.parallel.pp),
+            ("  DP (Data Parallel)", ctx.parallel.dp),
+            ("  CP (Context Parallel)", ctx.parallel.cp),
+            ("  Sequence Parallel", "Yes" if ctx.parallel.sp else "No"),
+            ("  Strategy Description", ctx.parallel.describe()),
+            ("", ""),
+            ("Stream Config", ""),
+            ("  Compute Streams", ctx.stream_config.num_compute_streams),
+            ("  Comm Streams", ctx.stream_config.num_comm_streams),
+        ]
+
+        for key, value in metadata:
+            ws.append([key, value])
+
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value:
+                    cell.border = self._thin_border
+
+    def _write_transformed_ops_sheet(self, wb: openpyxl.Workbook,
+                                     graph: OpGraph, ctx: TransformContext,
+                                     sheet_name: str = "Transformed Operators",
+                                     layer_display_map: dict[str, str] | None = None) -> None:
+        """Write all transformed operators with detailed annotations."""
+        from python.zrt.simulator.backends.roofline import get_op_formulas
+        ws = wb.create_sheet(sheet_name)
+
+        columns = [
+            ("Node ID", 12),
+            ("Op Name", 18),
+            ("Op Type", 25),
+            ("Category", 12),
+            ("Scope", 45),
+            ("Layer", 25),
+            ("Component", 18),
+            ("Parallelism Strategy", 18),
+            ("Collective Op", 15),
+            ("Group Size", 10),
+            ("Role", 10),
+            ("Pipeline Stage", 14),
+            ("Stream Type", 15),
+            ("Stream ID", 10),
+            ("Input Shapes", 50),
+            ("Output Shapes", 50),
+            ("Input Dtypes", 20),
+            ("Output Dtypes", 20),
+            # ── compute ──────────────────────────────────────────────────────
+            ("FLOPs", 14),
+            ("Effective FLOPs (with recompute)", 26),
+            ("FLOPs Formula (sym)", 24),
+            ("FLOPs Formula (num)", 32),
+            # ── memory access ─────────────────────────────────────────────────
+            ("Read Bytes (B)", 14),
+            ("Read Formula (sym)", 24),
+            ("Read Formula (num)", 32),
+            ("Write Bytes (B)", 14),
+            ("Write Formula (sym)", 24),
+            ("Write Formula (num)", 32),
+            ("Activation (B)", 16),
+            ("Activation Memory (µs)", 20),
+            # ── comm volume ───────────────────────────────────────────────────
+            ("Comm Volume (B)", 14),
+            # ── timing & bound ────────────────────────────────────────────────
+            ("Compute (µs)", 12),
+            ("Memory (µs)", 12),
+            ("Total Latency (µs)", 14),
+            ("Final Latency (µs)", 14),
+            ("Bound", 10),
+            ("Arith Intensity", 14),
+            ("Annotations", 60),
+        ]
+
+        self._write_header(ws, columns)
+
+        layer_to_stage = {}
+        if ctx.parallel.pp > 1:
+            layers = set(n.layer for n in graph.nodes.values() if n.layer)
+            sorted_layers = sorted(layers, key=lambda x: int(x) if x.isdigit() else 0)
+            for i, layer in enumerate(sorted_layers):
+                layer_to_stage[layer] = i % ctx.parallel.pp
+
+        nodes_to_write = list(layer_stable_sort(graph.topo_sort(), graph=graph))
+        if graph.phase == "train" or graph.metadata.get("fwd_bwd_stitched"):
+            nodes_to_write = [n for n in nodes_to_write if n.annotations.get("phase") != "bwd"]
+
+        for row_idx, node in enumerate(nodes_to_write, 2):
+            parallelism = get_parallelism_info(node, ctx.parallel)
+            formulas = get_op_formulas(node)
+
+            input_shapes = ", ".join(str(t.shape) for t in node.inputs)
+            output_shapes = ", ".join(str(t.shape) for t in node.outputs)
+            input_dtypes = ", ".join(str(t.dtype) for t in node.inputs)
+            output_dtypes = ", ".join(str(t.dtype) for t in node.outputs)
+
+            # Comm volume for comm nodes. EP A2A carries semantic msg_bytes
+            # which may differ from the placeholder tensor shape size.
+            comm_vol = ""
+            if node.is_comm:
+                comm_vol = node.attrs.get("msg_bytes")
+                if comm_vol is None:
+                    comm_vol = node.attrs.get("bytes")
+                if comm_vol is None:
+                    comm_vol = sum(t.mem_bytes for t in node.outputs)
+
+            # Build annotations string (exclude columns that have dedicated cells)
+            annotations_list = []
+            for key, val in node.annotations.items():
+                if key not in ("stream_id", "stream_type", "flops", "compute_us",
+                               "memory_us", "latency_us", "arithmetic_intensity", "bound",
+                               "read_bytes", "write_bytes", "saved_activation_bytes",
+                               "activation_memory_us"):
+                    if isinstance(val, dict):
+                        annotations_list.append(f"{key}={str(val)[:30]}")
+                    else:
+                        annotations_list.append(f"{key}={val}")
+            annotations_str = "; ".join(annotations_list) if annotations_list else ""
+
+            layer_val = node.layer or ""
+            if layer_display_map and layer_val in layer_display_map:
+                layer_val = layer_display_map[layer_val]
+
+            values = [
+                node.id,
+                node.name or (node.scope.rsplit(".", 1)[-1] if node.scope else ""),
+                node.op_type,
+                node.category,
+                node.scope,
+                layer_val,
+                node.component,
+                parallelism["strategy"],
+                parallelism.get("collective", ""),
+                parallelism.get("group_size", ""),
+                parallelism.get("role", ""),
+                infer_pipeline_stage(node, layer_to_stage),
+                node.annotations.get("stream_type", ""),
+                node.annotations.get("stream_id", ""),
+                input_shapes,
+                output_shapes,
+                input_dtypes,
+                output_dtypes,
+                # compute
+                node.annotations.get("flops", ""),
+                node.annotations.get("flops_fwd", node.annotations.get("flops", "")),
+                formulas["flops_sym"],
+                formulas["flops_num"],
+                # memory access
+                node.annotations.get("read_bytes", ""),
+                formulas["read_sym"],
+                formulas["read_num"],
+                node.annotations.get("write_bytes", ""),
+                formulas["write_sym"],
+                formulas["write_num"],
+                node.annotations.get("saved_activation_bytes", 0),
+                round(node.annotations.get("activation_memory_us", 0), 3) if node.annotations.get("activation_memory_us") else "",
+                # comm
+                comm_vol,
+                # timing & bound
+                round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
+                round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
+                round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
+                round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
+                node.annotations.get("bound", ""),
+                round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
+                annotations_str,
+            ]
+
+            # Choose fill color based on category
+            if node.is_comm:
+                fill = self._comm_fill
+            elif node.annotations.get("recompute"):
+                fill = PatternFill(start_color="fce4ec", end_color="fce4ec", fill_type="solid")
+            elif node.category == "memory":
+                fill = self._memory_fill
+            else:
+                fill = self._compute_fill
+
+            self._write_row(ws, row_idx, values, fill)
+
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(graph.nodes) + 1}"
+        ws.freeze_panes = "A2"
+
+    def _write_communication_sheet(self, wb: openpyxl.Workbook,
+                                   graph: OpGraph, ctx: TransformContext) -> None:
+        """Write communication operators with collective details."""
+        ws = wb.create_sheet("Communication Ops")
+
+        comm_nodes = [n for n in graph.nodes.values() if n.is_comm]
+        if not comm_nodes:
+            ws.append(["No communication operators found"])
+            return
+
+        columns = [
+            ("Node ID", 12),
+            ("Collective Op", 15),
+            ("Role", 10),
+            ("Group Size", 10),
+            ("Scope", 45),
+            ("Layer", 7),
+            ("Stream Type", 15),
+            ("Stream ID", 10),
+            ("Input Shapes", 50),
+            ("Output Shapes", 50),
+            ("Inserted By", 15),
+            ("Data Volume (bytes)", 18),
+        ]
+
+        self._write_header(ws, columns)
+
+        for row_idx, node in enumerate(comm_nodes, 2):
+            collective = node.attrs.get("collective", "")
+            group_size = node.attrs.get("group_size", "")
+            role = node.attrs.get("role", "")
+
+            # Estimate data volume. Prefer explicit semantic volume when present.
+            data_volume = node.attrs.get("msg_bytes")
+            if data_volume is None:
+                data_volume = node.attrs.get("bytes")
+            if data_volume is None:
+                data_volume = sum(t.mem_bytes for t in node.outputs)
+
+            input_shapes = ", ".join(str(t.shape) for t in node.inputs)
+            output_shapes = ", ".join(str(t.shape) for t in node.outputs)
+
+            values = [
+                node.id,
+                collective,
+                role,
+                group_size,
+                node.scope,
+                node.layer or "",
+                node.annotations.get("stream_type", ""),
+                node.annotations.get("stream_id", ""),
+                input_shapes,
+                output_shapes,
+                node.annotations.get("inserted_by", ""),
+                data_volume,
+            ]
+
+            self._write_row(ws, row_idx, values, self._comm_fill)
+
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(comm_nodes) + 1}"
+        ws.freeze_panes = "A2"
+        logger.info(f"Found {len(comm_nodes)} communication operators")
+
+    def _write_header(self, ws, columns: List[tuple[str, int]]) -> None:
+        """Write header row with styling."""
+        for col_idx, (name, width) in enumerate(columns, 1):
+            cell = ws.cell(row=1, column=col_idx, value=name)
+            cell.font = self._header_font
+            cell.fill = self._header_fill
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    def _write_row(self, ws, row_idx: int, values: List[Any],
+                   fill: Optional[PatternFill] = None,
+                   center_cols: Optional[set] = None) -> None:
+        """Write data row with optional fill and center-aligned columns."""
+        center_cols = center_cols or set()
+        for col_idx, val in enumerate(values, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.border = self._thin_border
+            if fill:
+                cell.fill = fill
+            if col_idx in center_cols:
+                cell.alignment = Alignment(horizontal="center")
+            elif col_idx > 10:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # ── Step 1: Raw capture sheets (ported from graph/excel_writer.py) ────────
+
+    def _write_raw_operators_sheet(self, wb: openpyxl.Workbook,
+                                   records: List[Dict[str, Any]],
+                                   label: str = "") -> None:
+        """Write raw aten operator sequence (Step 1)."""
+        from python.zrt.graph.classifier import get_fill
+        sheet_name = f"Raw Operators ({label})" if label else "Raw Operators"
+        ws = wb.create_sheet(sheet_name)
+        columns = [
+            ("Node ID", 8), ("Op Short", 12), ("Aten Op", 35),
+            ("Input Shapes", 50), ("Input Dtypes", 30),
+            ("Output Shapes", 50), ("Output Dtypes", 30),
+            ("Module Path", 55), ("Layer", 7), ("Component", 25),
+            ("Source File", 28), ("Line", 6), ("Code", 60), ("Func", 22),
+            ("Extra Args", 55),
+        ]
+        self._write_header(ws, columns)
+        for row_idx, rec in enumerate(records, 2):
+            values = [
+                rec["node_id"], rec.get("op_short", ""), rec["aten_op"],
+                rec["input_shapes"], rec["input_dtypes"],
+                rec["output_shapes"], rec["output_dtypes"],
+                rec["module_path"], rec["layer"], rec["component"],
+                rec.get("src_file", ""), rec.get("src_line", ""),
+                rec.get("src_code", ""), rec.get("src_func", ""),
+                rec.get("extra_args", ""),
+            ]
+            self._write_row(ws, row_idx, values, get_fill(rec["component"]),
+                            center_cols={1, 12})
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(records) + 1}"
+        ws.freeze_panes = "A2"
+
+    def _write_fused_operators_sheet(self, wb: openpyxl.Workbook,
+                                     fused: List[Dict[str, Any]],
+                                     label: str = "") -> None:
+        """Write fused operators (Step 1)."""
+        from python.zrt.graph.classifier import get_fill
+        sheet_name = f"Fused Operators ({label})" if label else "Fused Operators"
+        ws = wb.create_sheet(sheet_name)
+        columns = [
+            ("Node ID", 8), ("Op Name", 18), ("Rule Name", 22),
+            ("Fused Operator", 38),
+            ("Constituent Aten Ops", 70),
+            ("Sub-ops", 9), ("Raw Op IDs", 28), ("Layer", 7),
+            ("Fused Input Shapes", 55), ("Fused Input Dtypes", 30), ("Input Sources", 60),
+            ("Fused Output Shapes", 55), ("Fused Output Dtypes", 30), ("Output Sources", 60),
+        ]
+        self._write_header(ws, columns)
+        for row_idx, rec in enumerate(fused, 2):
+            values = [
+                rec["node_id"],
+                rec.get("op_name", ""),
+                rec.get("rule_name", ""),
+                rec["fused_op"],
+                rec["aten_ops"],
+                rec["num_sub_ops"],
+                rec.get("raw_op_ids", ""),
+                rec["layer"],
+                rec.get("fused_input_shapes", rec["input_shapes"]),
+                rec.get("fused_input_dtypes", rec["input_dtypes"]),
+                rec.get("fused_input_sources", ""),
+                rec.get("fused_output_shapes", rec["output_shapes"]),
+                rec.get("fused_output_dtypes", rec["output_dtypes"]),
+                rec.get("fused_output_sources", ""),
+            ]
+            self._write_row(ws, row_idx, values, get_fill(rec["fused_op"]),
+                            center_cols={1, 6})
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(fused) + 1}"
+        ws.freeze_panes = "A2"
+
+def export_transformed_graph(graph: OpGraph, ctx: TransformContext,
+                            output_dir: Path) -> Dict[str, Path]:
+    """Export transformed graph to Excel, JSON, and optionally ONNX.
+
+    Parameters
+    ----------
+    graph : OpGraph
+        The transformed computation graph
+    ctx : TransformContext
+        Transformation context with parallel config and stream config
+    output_dir : Path
+        Output directory for exported files
+
+    Returns
+    -------
+    dict[str, Path]
+        Paths to generated files: {format: path}
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine output filename
+    base_name = graph.name.replace("/", "_").replace(":", "_")
+
+    # Excel export
+    excel_path = output_dir / f"{base_name}_transformed_ops.xlsx"
+    writer = TransformedGraphExcelWriter()
+    writer.write(graph, ctx, excel_path)
+
+    # JSON export (simplified)
+    json_path = output_dir / f"{base_name}_transformed_graph.json"
+    _export_json(graph, ctx, json_path)
+
+    return {
+        "excel": excel_path,
+        "json": json_path,
+    }
+
+
+def _export_json(graph: OpGraph, ctx: TransformContext, output_path: Path) -> None:
+    """Export transformed graph to JSON format."""
+    # Serialize metadata (convert dataclass objects to dict)
+    metadata_serialized = {}
+    for k, v in graph.metadata.items():
+        if hasattr(v, 'to_dict'):
+            metadata_serialized[k] = v.to_dict()
+        elif hasattr(v, '__dataclass_fields__'):
+            # Generic dataclass serialization
+            import dataclasses
+            metadata_serialized[k] = dataclasses.asdict(v)
+        else:
+            metadata_serialized[k] = v
+    
+    data = {
+        "graph": {
+            "name": graph.name,
+            "phase": graph.phase,
+            "num_nodes": len(graph.nodes),
+            "num_edges": len(graph.edges),
+        },
+        "metadata": metadata_serialized,
+        "parallelism": {
+            "strategy": ctx.parallel.describe(),
+            "tp": ctx.parallel.tp,
+            "ep": ctx.parallel.ep,
+            "pp": ctx.parallel.pp,
+            "dp": ctx.parallel.dp,
+            "sp": ctx.parallel.sp,
+        },
+        "stream_config": {
+            "compute_streams": ctx.stream_config.num_compute_streams,
+            "comm_streams": ctx.stream_config.num_comm_streams,
+        },
+        "nodes": [],
+        "edges": [],
+    }
+
+    # Convert nodes
+    for node in graph.topo_sort():
+        node_data = {
+            "id": node.id,
+            "op_type": node.op_type,
+            "name": node.name,
+            "module_class": node.module_class,
+            "category": node.category,
+            "scope": node.scope,
+            "layer": node.layer,
+            "fused_from": list(node.fused_from),
+            "num_sub_ops": node.num_sub_ops,
+            "fusion_level": node.fusion_level,
+            "attrs": node.attrs,
+            "annotations": node.annotations,
+            "input_shapes": [list(t.shape) for t in node.inputs],
+            "output_shapes": [list(t.shape) for t in node.outputs],
+            "input_dtypes": [t.dtype.value for t in node.inputs],
+            "output_dtypes": [t.dtype.value for t in node.outputs],
+        }
+        data["nodes"].append(node_data)
+
+    # Convert edges
+    for edge in graph.edges:
+        edge_data = {
+            "src": edge.src,
+            "dst": edge.dst,
+            "src_idx": edge.src_idx,
+            "dst_idx": edge.dst_idx,
+        }
+        data["edges"].append(edge_data)
+
+    output_path.write_text(json.dumps(data, indent=2, default=str))
+    logger.info(f"Exported transformed graph JSON to {output_path}")
+
+
+# ── Training export ───────────────────────────────────────────────────────────
+
+class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
+    """Write forward + backward OpGraphs to a single Excel workbook.
+
+    Adds two training-specific sheets on top of the standard 5:
+      - Training Summary: step-level metrics from TrainingSummary
+      - Recompute Ops:    backward-graph ops flagged as activation-checkpoint recompute
+    """
+
+    def write_training(
+        self,
+        fwd_graph: OpGraph,
+        bwd_graph: OpGraph | None,
+        ctx: TransformContext,
+        output_path: Path,
+        training_summary=None,
+        fwd_records: List[Dict[str, Any]] | None = None,
+        bwd_records: List[Dict[str, Any]] | None = None,
+    ) -> None:
+        """Write training workbook (fwd + bwd graphs + summary sheet).
+
+        Sheet order:
+          1. Metadata
+          2. Operators (fwd+bwd)   — merged forward/backward operators
+          3. Communication Ops
+          4. Recompute Ops
+          5. Optimizer Ops
+          6. Training Summary
+          7. Layer Cost Detail
+          8. Raw Operators (fwd)
+          9. Fused Operators (fwd)
+         10. Raw Operators (bwd)
+         11. Fused Operators (bwd)
+        """
+        wb = openpyxl.Workbook()
+
+        self._write_metadata_sheet(wb, fwd_graph, ctx)
+
+        # Merged Forward + Backward operators (right after Metadata).
+        self._write_fwd_bwd_ops_sheet(wb, fwd_graph, bwd_graph, ctx)
+
+        self._write_communication_sheet(wb, fwd_graph, ctx)
+
+        if bwd_graph is not None:
+            self._write_optimizer_sheet(wb, bwd_graph, ctx)
+            self._write_recompute_sheet(wb, bwd_graph)
+        if training_summary is not None:
+            self._write_training_summary_sheet(
+                wb, training_summary, bwd_graph or fwd_graph, ctx
+            )
+
+        # Layer Cost Detail sheet
+        self._write_layer_cost_detail_sheet(wb, fwd_graph, ctx)
+
+        # Pre-fusion vs post-fusion comparison sheets at the end.
+        if fwd_records:
+            self._write_raw_operators_sheet(wb, fwd_records, "fwd")
+            self._write_fused_operators_sheet(
+                wb, _graph_to_fused_records(fwd_graph, phase_filter="fwd"), "fwd")
+        if bwd_records:
+            self._write_raw_operators_sheet(wb, bwd_records, "bwd")
+            if bwd_graph is not None:
+                self._write_fused_operators_sheet(
+                    wb, _graph_to_fused_records(bwd_graph, phase_filter="bwd"), "bwd")
+
+        wb.save(output_path)
+        logger.info(f"Exported training graphs to {output_path}")
+
+    def _write_fwd_bwd_ops_sheet(
+        self,
+        wb: openpyxl.Workbook,
+        fwd_graph: OpGraph,
+        bwd_graph: OpGraph | None,
+        ctx: TransformContext,
+    ) -> None:
+        """Merged Forward + Backward operators sheet.
+
+        Combines the former ``Forward Operators`` and ``Backward Operators``
+        sheets into a single page with a leading ``Phase`` column.  The
+        ``Layer`` column uses the typical-layer display map built from
+        ``LayerProfile`` (e.g. ``"0 (0-1, 2层)"``).
+        """
+        from python.zrt.simulator.backends.roofline import get_op_formulas
+        ws = wb.create_sheet("Operators (fwd+bwd)")
+
+        columns = [
+            ("Phase", 8),
+            ("Node ID", 12),
+            ("Op Name", 18),
+            ("Op Type", 25),
+            ("Category", 12),
+            ("Scope", 45),
+            ("Layer", 25),
+            ("Component", 18),
+            ("Recompute", 10),
+            ("Input Shapes", 50),
+            ("Output Shapes", 50),
+            # ── compute ──────────────────────────────────────────────────────
+            ("FLOPs", 14),
+            ("Effective FLOPs (with recompute)", 26),
+            ("FLOPs Formula (sym)", 24),
+            ("FLOPs Formula (num)", 32),
+            # ── memory access ─────────────────────────────────────────────────
+            ("Read Bytes (B)", 14),
+            ("Read Formula (sym)", 24),
+            ("Read Formula (num)", 32),
+            ("Write Bytes (B)", 14),
+            ("Write Formula (sym)", 24),
+            ("Write Formula (num)", 32),
+            ("Activation (B)", 16),
+            ("Activation Memory (µs)", 20),
+            # ── comm & timing ─────────────────────────────────────────────────
+            ("Comm Volume (B)", 14),
+            ("Compute (µs)", 12),
+            ("Memory (µs)", 12),
+            ("Total Latency (µs)", 14),
+            ("Recompute Replay (µs)", 18),
+            ("Final Latency (µs)", 14),
+            ("Bound", 10),
+            ("Arith Intensity", 14),
+        ]
+        self._write_header(ws, columns)
+
+        _recompute_fill = PatternFill(start_color="fce4ec", end_color="fce4ec", fill_type="solid")
+
+        fwd_layer_map = _build_layer_display_map(fwd_graph)
+        bwd_layer_map = _build_layer_display_map(bwd_graph) if bwd_graph is not None else {}
+
+        def _phase_nodes(graph, phase_filter):
+            nodes = list(layer_stable_sort(graph.topo_sort(), graph=graph))
+            if graph.phase == "train" or graph.metadata.get("fwd_bwd_stitched"):
+                nodes = [n for n in nodes if n.annotations.get("phase") == phase_filter]
+            return nodes
+
+        def _comm_vol(node):
+            if not node.is_comm:
+                return ""
+            v = node.attrs.get("msg_bytes")
+            if v is None:
+                v = node.attrs.get("bytes")
+            if v is None:
+                v = sum(t.mem_bytes for t in node.outputs)
+            return v
+
+        row_idx = 2
+
+        # ── Forward rows ─────────────────────────────────────────────────────
+        for node in _phase_nodes(fwd_graph, "fwd"):
+            formulas = get_op_formulas(node)
+            layer_val = node.layer or ""
+            if layer_val in fwd_layer_map:
+                layer_val = fwd_layer_map[layer_val]
+            values = [
+                "fwd",
+                node.id,
+                node.name or (node.scope.rsplit(".", 1)[-1] if node.scope else ""),
+                node.op_type,
+                node.category,
+                node.scope,
+                layer_val,
+                node.component,
+                "",
+                ", ".join(str(t.shape) for t in node.inputs),
+                ", ".join(str(t.shape) for t in node.outputs),
+                node.annotations.get("flops", ""),
+                node.annotations.get("flops_fwd", node.annotations.get("flops", "")),
+                formulas["flops_sym"],
+                formulas["flops_num"],
+                node.annotations.get("read_bytes", ""),
+                formulas["read_sym"],
+                formulas["read_num"],
+                node.annotations.get("write_bytes", ""),
+                formulas["write_sym"],
+                formulas["write_num"],
+                node.annotations.get("saved_activation_bytes", 0),
+                round(node.annotations.get("activation_memory_us", 0), 3) if node.annotations.get("activation_memory_us") else "",
+                _comm_vol(node),
+                round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
+                round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
+                round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
+                "",
+                round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
+                node.annotations.get("bound", ""),
+                round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
+            ]
+            fill = self._comm_fill if node.is_comm else self._compute_fill
+            self._write_row(ws, row_idx, values, fill)
+            row_idx += 1
+
+        # ── Backward rows ────────────────────────────────────────────────────
+        if bwd_graph is not None:
+            for node in _phase_nodes(bwd_graph, "bwd"):
+                formulas = get_op_formulas(node)
+                replay_us = node.annotations.get("recompute_latency_us", 0.0) or 0.0
+                is_recompute = (
+                    replay_us > 0
+                    or node.annotations.get("recompute", False)
+                    or node.attrs.get("recompute", False)
+                )
+                fill = _recompute_fill if is_recompute else (
+                    self._comm_fill if node.is_comm else self._compute_fill
+                )
+                layer_val = node.layer or ""
+                if layer_val in bwd_layer_map:
+                    layer_val = bwd_layer_map[layer_val]
+                values = [
+                    "bwd",
+                    node.id,
+                    node.name or (node.scope.rsplit(".", 1)[-1] if node.scope else ""),
+                    node.op_type,
+                    node.category,
+                    node.scope,
+                    layer_val,
+                    node.component,
+                    "YES" if is_recompute else "",
+                    ", ".join(str(t.shape) for t in node.inputs),
+                    ", ".join(str(t.shape) for t in node.outputs),
+                    node.annotations.get("flops", ""),
+                    node.annotations.get("flops_fwd", node.annotations.get("flops", "")),
+                    formulas["flops_sym"],
+                    formulas["flops_num"],
+                    node.annotations.get("read_bytes", ""),
+                    formulas["read_sym"],
+                    formulas["read_num"],
+                    node.annotations.get("write_bytes", ""),
+                    formulas["write_sym"],
+                    formulas["write_num"],
+                    "",
+                    "",
+                    _comm_vol(node),
+                    round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
+                    round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
+                    round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
+                    round(replay_us, 3) if replay_us else "",
+                    round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
+                    node.annotations.get("bound", ""),
+                    round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
+                ]
+                self._write_row(ws, row_idx, values, fill)
+                row_idx += 1
+
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{row_idx - 1}"
+        ws.freeze_panes = "A2"
+
+    def _write_recompute_sheet(self, wb: openpyxl.Workbook, bwd_graph: OpGraph) -> None:
+        """Summarize ops flagged as activation-checkpoint recompute."""
+        ws = wb.create_sheet("Recompute Ops")
+
+        recompute_nodes = [
+            n for n in bwd_graph.nodes.values()
+            if is_external_recompute_node(n)
+            or (
+                # Legacy/imported graphs may carry recompute only in attrs.
+                # Keep those visible while still excluding kernels with
+                # internal replay such as FlashAttention/SDPA.
+                n.attrs.get("recompute", False)
+                and not n.annotations.get("recompute")
+                and not has_internal_recompute(n)
+            )
+        ]
+
+        if not recompute_nodes:
+            ws.append(["No recompute ops detected (activation checkpointing not active)"])
+            return
+
+        columns = [
+            ("Node ID", 14),
+            ("Op Type", 25),
+            ("Scope", 45),
+            ("Layer", 7),
+            ("FLOPs", 12),
+            ("Latency (µs)", 14),
+            ("Bound", 10),
+            ("Input Shapes", 50),
+        ]
+        self._write_header(ws, columns)
+
+        _fill = PatternFill(start_color="fce4ec", end_color="fce4ec", fill_type="solid")
+        total_lat = 0.0
+        total_flops = 0
+
+        for row_idx, node in enumerate(recompute_nodes, 2):
+            lat = (
+                node.annotations.get("recompute_latency_us", 0)
+                or node.annotations.get("base_latency_us", 0)
+                or node.annotations.get("latency_us", 0)
+                or 0
+            )
+            flops = node.annotations.get("flops", 0) or 0
+            total_lat   += lat
+            total_flops += flops
+            values = [
+                node.id,
+                node.op_type,
+                node.scope,
+                node.layer or "",
+                flops,
+                round(lat, 3),
+                node.annotations.get("bound", ""),
+                ", ".join(str(t.shape) for t in node.inputs),
+            ]
+            self._write_row(ws, row_idx, values, _fill)
+
+        # Summary footer
+        footer_row = len(recompute_nodes) + 2
+        ws.cell(row=footer_row, column=1, value="TOTAL")
+        ws.cell(row=footer_row, column=5, value=total_flops)
+        ws.cell(row=footer_row, column=6, value=round(total_lat, 3))
+        for col in range(1, 9):
+            ws.cell(row=footer_row, column=col).font = Font(bold=True)
+
+        ws.freeze_panes = "A2"
+
+    def _write_optimizer_sheet(
+        self, wb: openpyxl.Workbook, graph: OpGraph, ctx: TransformContext
+    ) -> None:
+        """Write optimizer nodes (muon_ag, optimizer_step, muon_rs) with detailed breakdown."""
+        opt_nodes = [
+            n for n in graph.nodes.values()
+            if n.id in ("muon_ag", "optimizer_step", "muon_rs")
+            or "optimizer" in n.id
+        ]
+
+        if not opt_nodes:
+            return
+
+        ws = wb.create_sheet("Optimizer Ops")
+        logger.info(f"Created Optimizer Ops sheet with {len(opt_nodes)} nodes")
+
+        columns = [
+            ("Node ID", 16),
+            ("Op Type", 22),
+            ("Category", 14),
+            ("Stage ID", 10),
+            ("", 0),
+            ("=== Attributes ===", 0),
+            ("Optimizer", 12),
+            ("Params Total", 14),
+            ("Params Muon", 14),
+            ("Params Adam", 14),
+            ("NS Steps", 10),
+            ("NS Rotation", 12),
+            ("", 0),
+            ("=== Memory ===", 0),
+            ("State Bytes (B)", 16),
+            ("State Bytes (GB)", 16),
+            ("AG Bytes (B)", 14),
+            ("AG Bytes (GB)", 14),
+            ("Comm Volume (B)", 16),
+            ("Comm Volume (GB)", 16),
+            ("", 0),
+            ("=== FLOPs ===", 0),
+            ("Step FLOPs", 18),
+            ("Step FLOPs (TF)", 16),
+            ("", 0),
+            ("=== Timing ===", 0),
+            ("Group Size", 12),
+            ("Compute Time (us)", 18),
+            ("Compute Time (ms)", 18),
+            ("Comm Time (us)", 16),
+            ("Comm Time (ms)", 16),
+            ("Total Time (ms)", 16),
+            ("% of Step", 12),
+            ("", 0),
+            ("=== Overlap ===", 0),
+            ("Overlap Type", 14),
+            ("Overlap Target", 20),
+            ("Exposed Time (us)", 16),
+            ("Hidden Time (us)", 16),
+        ]
+        self._write_header(ws, columns)
+
+        _opt_fill = PatternFill(start_color="e3f2fd", end_color="e3f2fd", fill_type="solid")
+        _comm_fill = PatternFill(start_color="fff3e0", end_color="fff3e0", fill_type="solid")
+
+        step_time_ms = 0.0
+        pm = graph.metadata.get("step_result")
+        if isinstance(pm, dict):
+            step_time_ms = float(pm.get("step_time_ms", 0.0))
+
+        hw = getattr(ctx, 'hw_spec', None)
+
+        for row_idx, node in enumerate(opt_nodes, 2):
+            attrs = node.attrs
+            is_comm = node.category == "communication"
+            fill = _comm_fill if is_comm else _opt_fill
+
+            state_bytes = float(attrs.get("state_bytes", 0) or 0)
+            ag_bytes = float(attrs.get("muon_ag_bytes", 0) or attrs.get("bytes", 0) or 0)
+            comm_bytes = float(attrs.get("bytes", 0) or 0)
+            step_flops = float(attrs.get("step_flops", 0) or 0)
+            group_size = int(attrs.get("group_size", 0) or 0)
+
+            # Read timing from annotations (set by TrainingPipelinePass)
+            latency_us = float(node.annotations.get("latency_us", 0) or 0)
+            compute_us = float(node.annotations.get("compute_us", 0) or 0)
+            comm_time_us = float(node.annotations.get("comm_time_us", 0) or 0)
+            
+            # Fallback: compute from attrs if annotations not set
+            if compute_us == 0 and hw and node.id == "optimizer_step" and step_flops > 0:
+                from python.zrt.ir.types import DType
+                peak_flops = hw.peak_flops(DType.BF16)
+                compute_us = (step_flops / peak_flops) * 1e6 if peak_flops > 0 else 0.0
+            
+            # For comm nodes, use latency as comm_time
+            if is_comm and latency_us > 0:
+                comm_time_us = latency_us
+
+            compute_ms = compute_us / 1000 if compute_us else 0.0
+            comm_ms = comm_time_us / 1000 if comm_time_us else 0.0
+            total_ms = compute_ms + comm_ms
+            pct_of_step = (total_ms / step_time_ms * 100) if step_time_ms > 0 else 0.0
+
+            # Overlap info from annotations
+            overlap_type = node.annotations.get("overlap_type", "none")
+            overlap_target = node.annotations.get("overlap_target", "")
+            overlap_exposed_ann = node.annotations.get("overlap_exposed_us")
+            overlap_hidden_ann = node.annotations.get("overlap_hidden_us")
+
+            # Priority: use annotation values if set, else calculate
+            if overlap_exposed_ann is not None:
+                exposed_us = float(overlap_exposed_ann)
+            else:
+                exposed_us = latency_us
+
+            if overlap_hidden_ann is not None:
+                hidden_us = float(overlap_hidden_ann)
+            elif overlap_type == "moonshot_ag":
+                hidden_us = latency_us - exposed_us
+            elif overlap_type == "moonshot_rs":
+                hidden_us = latency_us - exposed_us
+            else:
+                hidden_us = 0.0
+
+            values = [
+                node.id,
+                node.op_type,
+                node.category,
+                node.annotations.get("stage_id", ""),
+                "",
+                "",
+                attrs.get("optimizer", ""),
+                attrs.get("params_total", ""),
+                attrs.get("params_muon", ""),
+                attrs.get("params_adam", ""),
+                attrs.get("ns_steps", ""),
+                "Yes" if attrs.get("ns_rotation", False) else "No",
+                "",
+                "",
+                state_bytes,
+                round(state_bytes / 1e9, 3) if state_bytes else "",
+                ag_bytes,
+                round(ag_bytes / 1e9, 3) if ag_bytes else "",
+                comm_bytes,
+                round(comm_bytes / 1e9, 3) if comm_bytes else "",
+                "",
+                "",
+                step_flops,
+                round(step_flops / 1e12, 3) if step_flops else "",
+                "",
+                "",
+                group_size,
+                round(compute_us, 3) if compute_us else "",
+                round(compute_ms, 3) if compute_ms else "",
+                round(comm_time_us, 3) if comm_time_us else "",
+                round(comm_ms, 3) if comm_ms else "",
+                round(total_ms, 3),
+                f"{pct_of_step:.1f}%" if pct_of_step else "",
+                "",
+                "",
+                overlap_type if overlap_type else "none",
+                overlap_target if overlap_target else "",
+                round(exposed_us, 3) if exposed_us is not None else "",
+                round(hidden_us, 3) if hidden_us is not None else "",
+            ]
+            self._write_row(ws, row_idx, values, fill)
+
+        ws.freeze_panes = "A2"
+
+    def _write_training_summary_sheet(
+        self,
+        wb: openpyxl.Workbook,
+        ts,
+        graph: OpGraph | None = None,
+        ctx: TransformContext | None = None,
+    ) -> None:
+        """Write TrainingSummary metrics as a key-value sheet."""
+        if hasattr(ts, "step_time_ms"):
+            self._write_training_report_sheet(wb, ts, graph, ctx)
+            return
+
+        ws = wb.create_sheet("Training Summary")
+
+        ws.append(["Training Step Summary"])
+        ws["A1"].font = Font(bold=True, size=13)
+
+        fwd_pct = ts.forward_ms / ts.step_ms * 100 if ts.step_ms > 0 else 0.0
+        bwd_pct = ts.backward_ms / ts.step_ms * 100 if ts.step_ms > 0 else 0.0
+
+        rows: list[tuple[str, Any]] = [
+            ("Model",          ts.model),
+            ("Hardware",       ts.hardware),
+            ("Parallelism",    ts.parallel_desc),
+            ("Batch size",     ts.batch_size),
+            ("Sequence length", ts.seq_len),
+            ("", ""),
+            ("=== Step Timing ===", ""),
+            ("Step latency (ms)",   round(ts.step_ms, 3)),
+            ("Forward (ms)",        f"{round(ts.forward_ms, 3)}  ({fwd_pct:.1f}%)"),
+            ("Backward (ms)",       f"{round(ts.backward_ms, 3)}  ({bwd_pct:.1f}%)"),
+            ("", ""),
+            ("=== Throughput ===", ""),
+            ("Samples / sec",   round(ts.samples_per_sec, 2)),
+            ("Tokens / sec",    round(ts.tokens_per_sec, 1)),
+            ("", ""),
+            ("=== HW Efficiency ===", ""),
+            ("MFU",                   f"{ts.mfu:.2%}"),
+            ("HBM BW util",           f"{ts.hbm_bw_util:.2%}"),
+            ("Arithmetic Intensity",  f"{ts.arithmetic_intensity:.2f} ops/byte"),
+            ("Total FLOPs (T)",       round(ts.total_flops / 1e12, 3)),
+            ("  Forward FLOPs (T)",   round(ts.fwd_flops   / 1e12, 3)),
+            ("  Backward FLOPs (T)",  round(ts.bwd_flops   / 1e12, 3)),
+            ("", ""),
+            ("=== Memory Access (Read+Write) ===", ""),
+            ("Fwd Read (GB)",    round(ts.fwd_read_bytes  / 1e9, 3)),
+            ("Fwd Write (GB)",   round(ts.fwd_write_bytes / 1e9, 3)),
+            ("Fwd Total (GB)",   round(ts.fwd_bytes       / 1e9, 3)),
+            ("Bwd Read (GB)",    round(ts.bwd_read_bytes  / 1e9, 3)),
+            ("Bwd Write (GB)",   round(ts.bwd_write_bytes / 1e9, 3)),
+            ("Bwd Total (GB)",   round(ts.bwd_bytes       / 1e9, 3)),
+            ("", ""),
+            ("=== Compute / Comm Breakdown ===", ""),
+            ("Fwd compute (ms)",      round(ts.fwd_compute_ms, 3)),
+            ("Fwd comm (ms)",         round(ts.fwd_comm_ms, 3)),
+            ("Fwd exposed comm (ms)", round(ts.fwd_exposed_comm_ms, 3)),
+            ("Fwd overlap ratio",     f"{ts.fwd_overlap_ratio:.1%}"),
+            ("Bwd compute (ms)",      round(ts.bwd_compute_ms, 3)),
+            ("Bwd comm (ms)",         round(ts.bwd_comm_ms, 3)),
+            ("Bwd exposed comm (ms)", round(ts.bwd_exposed_comm_ms, 3)),
+            ("Bwd overlap ratio",     f"{ts.bwd_overlap_ratio:.1%}"),
+            ("", ""),
+            ("=== Activation Checkpointing ===", ""),
+            ("Recompute op count", ts.recompute_op_count),
+            ("Recompute overhead", f"{ts.recompute_ratio:.1%}"),
+        ]
+
+        if ts.memory_breakdown is not None:
+            mb = ts.memory_breakdown
+            rows += [
+                ("", ""),
+                ("=== Memory (per GPU) ===", ""),
+                ("Weights (GB)",     round(mb.weights      / 1e9, 3)),
+                ("Gradients (GB)",   round(mb.grads        / 1e9, 3)),
+                ("Opt states (GB)",  round(mb.opt_state    / 1e9, 3)),
+                ("Activations (GB)", round(mb.activations  / 1e9, 3)),
+                ("Comm buffers (GB)", round(mb.comm_buffers / 1e9, 3)),
+                ("Total (GB)",       round(mb.total        / 1e9, 3)),
+            ]
+
+        if ts.top_bottleneck_ops:
+            rows += [("", ""), ("=== Top Bottleneck Ops ===", "")]
+            for op_desc, lat_us in ts.top_bottleneck_ops:
+                rows.append((op_desc, f"{lat_us:.1f} µs"))
+
+        for key, val in rows:
+            ws.append([key, val])
+            if str(key).startswith("==="):
+                row_num = ws.max_row
+                ws.cell(row=row_num, column=1).font = Font(bold=True)
+
+        ws.column_dimensions["A"].width = 32
+        ws.column_dimensions["B"].width = 28
+
+    def _write_training_report_sheet(
+        self,
+        wb: openpyxl.Workbook,
+        report,
+        graph: OpGraph | None = None,
+        ctx: TransformContext | None = None,
+    ) -> None:
+        """Write graph-native TrainingReport metrics as a key-value sheet."""
+        ws = wb.create_sheet("Training Summary")
+        ws.append(["Training Step Summary"])
+        ws["A1"].font = Font(bold=True, size=13)
+        recompute_compute_ms = (
+            getattr(report, "recompute_compute_ms", 0.0)
+            or (graph.metadata.get("recompute_compute_ms", 0.0) if graph is not None else 0.0)
+        )
+        metadata = graph.metadata if graph is not None else {}
+        model_name = getattr(ctx, "model_id", "") if ctx is not None else ""
+        hardware_name = (
+            getattr(getattr(ctx, "hw_spec", None), "name", "")
+            if ctx is not None else ""
+        )
+        batch_size = metadata.get("batch_size", "")
+        seq_len = metadata.get("seq_len", getattr(getattr(ctx, "training", None), "seq_len", ""))
+
+        rows = [
+            ("Model", model_name),
+            ("Hardware", hardware_name),
+            ("Parallelism", report.config_summary),
+            ("Batch size", batch_size),
+            ("Sequence length", seq_len),
+            ("", ""),
+            ("=== Step Timing ===", ""),
+            ("Step latency (ms)", round(report.step_time_ms, 3)),
+            ("Pipeline time (ms)", round(report.pipeline_time_ms, 3)),
+            ("Compute time (ms)", round(report.compute_time_ms, 3)),
+            ("Forward compute (ms)", round(report.fwd_compute_ms, 3)),
+            ("Backward compute (ms)", round(report.bwd_compute_ms, 3)),
+            ("Recompute compute (ms)", round(recompute_compute_ms, 3)),
+            (
+                "Compute time note",
+                "Compute time already includes forward, backward base, and activation recompute replay compute.",
+            ),
+            ("Exposed comm (ms)", round(report.exposed_comm_ms, 3)),
+            ("", ""),
+            ("=== HW Efficiency ===", ""),
+            ("MFU", f"{report.mfu:.2%}"),
+            ("HFU", f"{report.hfu:.2%}"),
+            ("Total FLOPs (T)", round(report.training_flops / 1e12, 3)),
+            ("Forward FLOPs (T)", round(report.forward_flops / 1e12, 3)),
+            ("Backward FLOPs (T)", round(report.backward_flops / 1e12, 3)),
+            ("", ""),
+            ("=== Communication ===", ""),
+            ("TP exposed (ms)", round(report.tp_exposed_ms, 3)),
+            ("CP exposed (ms)", round(report.cp_exposed_ms, 3)),
+            ("EP exposed (ms)", round(report.ep_exposed_ms, 3)),
+            ("EP hidden (ms)", round(report.ep_hidden_ms, 3)),
+            ("Total comm volume (ms)", round(report.total_comm_volume_ms, 3)),
+        ]
+
+        memory = report.memory_breakdown or {}
+        if memory:
+            rows += [
+                ("", ""),
+                ("=== Memory (per GPU) ===", ""),
+                ("Weights (GB)", round(memory.get("weights", 0) / 1e9, 3)),
+                ("Gradients (GB)", round(memory.get("grads", 0) / 1e9, 3)),
+                ("Opt states (GB)", round(memory.get("opt_state", 0) / 1e9, 3)),
+                ("Activations (GB)", round(memory.get("activations", 0) / 1e9, 3)),
+                ("Comm buffers (GB)", round(memory.get("comm_buffers", 0) / 1e9, 3)),
+                ("Total (GB)", round(memory.get("total", 0) / 1e9, 3)),
+            ]
+
+        for key, val in rows:
+            ws.append([key, val])
+            if str(key).startswith("==="):
+                row_num = ws.max_row
+                ws.cell(row=row_num, column=1).font = Font(bold=True)
+
+        ws.column_dimensions["A"].width = 32
+        ws.column_dimensions["B"].width = 28
+
+    def _write_layer_cost_detail_sheet(
+        self,
+        wb: openpyxl.Workbook,
+        graph: OpGraph | None,
+        ctx: TransformContext | None,
+    ) -> None:
+        """Write layer cost detail sheet with per-layer timing breakdown.
+
+        PP=1: Shows typical layer costs and total calculation formula.
+        PP>1: Shows per-stage layer composition and cost formula.
+        """
+        if graph is None:
+            return
+
+        metadata = graph.metadata
+        layer_profile = metadata.get("layer_profile", None)
+        typical_indices = metadata.get("typical_indices", None)
+
+        if layer_profile is None or typical_indices is None:
+            return
+
+        pp = ctx.parallel.pp if ctx is not None and ctx.parallel else 1
+
+        ws = wb.create_sheet("Layer Cost Detail")
+        ws.append(["Layer Cost Breakdown"])
+        ws["A1"].font = Font(bold=True, size=13)
+        ws.append([])
+
+        # Extract typical layer costs from graph nodes
+        _BWD_PHASES = {"bwd", "bwd_dx", "bwd_dw"}
+        typical_fwd: dict[str, float] = {}
+        typical_bwd: dict[str, float] = {}
+
+        for node in graph.nodes.values():
+            layer = node.annotations.get("layer") or getattr(node, "layer", "")
+            if not layer:
+                continue
+            try:
+                layer_idx = int(layer)
+            except (ValueError, TypeError):
+                continue
+
+            if layer_idx not in typical_indices:
+                continue
+
+            if layer_idx >= len(layer_profile.layer_types):
+                continue
+
+            layer_type_raw = layer_profile.layer_types[layer_idx]
+            # Convert to string (handle both enum and string)
+            layer_type = layer_type_raw.value if hasattr(layer_type_raw, "value") else str(layer_type_raw)
+            latency_us = node.annotations.get("latency_us", 0.0)
+
+            if node.category == "communication":
+                continue
+            if node.annotations.get("optimizer_step"):
+                continue
+
+            phase = node.annotations.get("phase", "fwd")
+            if phase in _BWD_PHASES:
+                typical_bwd[layer_type] = typical_bwd.get(layer_type, 0.0) + latency_us
+            else:
+                typical_fwd[layer_type] = typical_fwd.get(layer_type, 0.0) + latency_us
+
+        # Convert to ms
+        typical_fwd_ms = {k: v / 1000.0 for k, v in typical_fwd.items()}
+        typical_bwd_ms = {k: v / 1000.0 for k, v in typical_bwd.items()}
+
+        # Layer counts from layer_profile
+        layer_counts = {
+            "dense": getattr(layer_profile, "num_dense", 0),
+            "moe": getattr(layer_profile, "num_moe", 0),
+            "hca_hash": getattr(layer_profile, "num_hca_hash", 0),
+            "hca_topk": getattr(layer_profile, "num_hca_topk", 0),
+            "csa_hash": getattr(layer_profile, "num_csa_hash", 0),
+            "csa_topk": getattr(layer_profile, "num_csa_topk", 0),
+            "swa_hash": getattr(layer_profile, "num_swa_hash", 0),
+            "swa_topk": getattr(layer_profile, "num_swa_topk", 0),
+        }
+
+        if pp == 1:
+            # PP=1: Show total layer cost formula
+            ws.append(["=== Typical Layer Costs ===", "", "", "", ""])
+            ws.append(["Layer Type", "Typical Index", "FWD Cost (ms)", "BWD Cost (ms)", "Total Cost (ms)"])
+
+            for layer_type, count in layer_counts.items():
+                if count == 0:
+                    continue
+
+                # Find typical index for this layer type
+                typical_idx = None
+                for idx in typical_indices:
+                    if idx < len(layer_profile.layer_types):
+                        lt_raw = layer_profile.layer_types[idx]
+                        lt = lt_raw.value if hasattr(lt_raw, "value") else str(lt_raw)
+                        if lt == layer_type:
+                            typical_idx = idx
+                            break
+
+                fwd_cost = typical_fwd_ms.get(layer_type, 0.0)
+                bwd_cost = typical_bwd_ms.get(layer_type, 0.0)
+                total_cost = fwd_cost + bwd_cost
+
+                ws.append([
+                    layer_type,
+                    str(typical_idx) if typical_idx is not None else "N/A",
+                    round(fwd_cost, 3),
+                    round(bwd_cost, 3),
+                    round(total_cost, 3),
+                ])
+
+            ws.append([])
+            ws.append(["=== Total Model Cost Formula ===", "", "", "", ""])
+            ws.append(["Formula: total_fwd = sum(typical_fwd[layer_type] * num_layers[layer_type])", "", "", "", ""])
+            ws.append(["Formula: total_bwd = sum(typical_bwd[layer_type] * num_layers[layer_type])", "", "", "", ""])
+            ws.append([])
+            ws.append(["Layer Type", "Count", "FWD Formula", "FWD Result (ms)", ""])
+
+            total_fwd_ms = 0.0
+            for layer_type, count in layer_counts.items():
+                if count == 0:
+                    continue
+                fwd_cost = typical_fwd_ms.get(layer_type, 0.0)
+                fwd_result = fwd_cost * count
+                total_fwd_ms += fwd_result
+                ws.append([
+                    layer_type,
+                    count,
+                    f"{fwd_cost:.3f} * {count}",
+                    round(fwd_result, 3),
+                    "",
+                ])
+
+            ws.append(["Total FWD", "", "", round(total_fwd_ms, 3), "ms"])
+            ws.append([])
+
+            ws.append(["Layer Type", "Count", "BWD Formula", "BWD Result (ms)", ""])
+            total_bwd_ms = 0.0
+            for layer_type, count in layer_counts.items():
+                if count == 0:
+                    continue
+                bwd_cost = typical_bwd_ms.get(layer_type, 0.0)
+                bwd_result = bwd_cost * count
+                total_bwd_ms += bwd_result
+                ws.append([
+                    layer_type,
+                    count,
+                    f"{bwd_cost:.3f} * {count}",
+                    round(bwd_result, 3),
+                    "",
+                ])
+
+            ws.append(["Total BWD", "", "", round(total_bwd_ms, 3), "ms"])
+            ws.append([])
+            ws.append(["Total Compute", "", "", round(total_fwd_ms + total_bwd_ms, 3), "ms"])
+
+        else:
+            # PP>1: Show per-stage layer composition and cost
+            ws.append(["=== Layer Distribution ===", "", "", "", ""])
+            ws.append(["Total Layers", layer_profile.total_layers, "", "", ""])
+            ws.append(["PP", pp, "", "", ""])
+            ws.append([])
+
+            # Determine which layer types actually exist
+            active_layer_types = [lt for lt, cnt in layer_counts.items() if cnt > 0]
+
+            # Get stage layer assignment
+            total_layers = layer_profile.total_layers
+            stage_size = total_layers // pp
+
+            ws.append(["=== Per-Stage Layer Composition ===", "", "", "", ""])
+
+            # Stage header - only show active layer types
+            header = ["Stage", "Layer Range"] + [lt.upper() for lt in active_layer_types]
+            ws.append(header)
+
+            stage_layer_counts: dict[int, dict[str, int]] = {}
+            for s in range(pp):
+                start_layer = s * stage_size
+                end_layer = (s + 1) * stage_size if s < pp - 1 else total_layers
+
+                counts = {
+                    "dense": 0, "moe": 0,
+                    "hca_hash": 0, "hca_topk": 0,
+                    "csa_hash": 0, "csa_topk": 0,
+                    "swa_hash": 0, "swa_topk": 0,
+                }
+                for idx in range(start_layer, end_layer):
+                    if idx < len(layer_profile.layer_types):
+                        lt_raw = layer_profile.layer_types[idx]
+                        lt = lt_raw.value if hasattr(lt_raw, "value") else str(lt_raw)
+                        counts[lt] = counts.get(lt, 0) + 1
+
+                stage_layer_counts[s] = counts
+                # Only show counts for active layer types
+                row = [f"Stage {s}", f"L{start_layer}-L{end_layer-1}"]
+                row.extend([counts[lt] for lt in active_layer_types])
+                ws.append(row)
+
+            ws.append([])
+            ws.append(["=== Per-Stage Cost Calculation ===", "", "", "", ""])
+            ws.append(["Formula: stage_fwd = sum(typical_fwd[layer_type] * count_in_stage)", "", "", "", ""])
+            ws.append(["Formula: stage_bwd = sum(typical_bwd[layer_type] * count_in_stage)", "", "", "", ""])
+            ws.append([])
+
+            # Calculate per-stage costs
+            ws.append(["Stage", "FWD Formula", "FWD (ms)", "BWD Formula", "BWD (ms)", "Total (ms)"])
+
+            bottleneck_stage = 0
+            bottleneck_total = 0.0
+
+            for s in range(pp):
+                counts = stage_layer_counts[s]
+                fwd_formula_parts = []
+                bwd_formula_parts = []
+                fwd_total = 0.0
+                bwd_total = 0.0
+
+                for layer_type in active_layer_types:
+                    cnt = counts.get(layer_type, 0)
+                    if cnt == 0:
+                        continue
+                    fwd_cost = typical_fwd_ms.get(layer_type, 0.0)
+                    bwd_cost = typical_bwd_ms.get(layer_type, 0.0)
+                    fwd_result = fwd_cost * cnt
+                    bwd_result = bwd_cost * cnt
+                    fwd_total += fwd_result
+                    bwd_total += bwd_result
+
+                    if fwd_cost > 0:
+                        fwd_formula_parts.append(f"{fwd_cost:.3f}*{cnt}")
+                    if bwd_cost > 0:
+                        bwd_formula_parts.append(f"{bwd_cost:.3f}*{cnt}")
+
+                stage_total = fwd_total + bwd_total
+                if stage_total > bottleneck_total:
+                    bottleneck_total = stage_total
+                    bottleneck_stage = s
+
+                ws.append([
+                    f"Stage {s}",
+                    " + ".join(fwd_formula_parts) if fwd_formula_parts else "0",
+                    round(fwd_total, 3),
+                    " + ".join(bwd_formula_parts) if bwd_formula_parts else "0",
+                    round(bwd_total, 3),
+                    round(stage_total, 3),
+                ])
+
+            ws.append([])
+            ws.append(["Bottleneck Stage", f"Stage {bottleneck_stage}", "", "", round(bottleneck_total, 3), "ms"])
+            ws.append([])
+            ws.append(["Note: Pipeline step_time uses bottleneck stage time (max across stages)", "", "", "", ""])
+
+        # Set column widths
+        ws.column_dimensions["A"].width = 20
+        ws.column_dimensions["B"].width = 25
+        ws.column_dimensions["C"].width = 18
+        ws.column_dimensions["D"].width = 18
+        ws.column_dimensions["E"].width = 18
+        ws.column_dimensions["F"].width = 18
+        ws.column_dimensions["G"].width = 12
+
+
+def _get_fused_shapes_from_sem_io(node: OpNode, direction: str) -> str:
+    """Get fused shapes from sem_io annotation (includes CP split).
+    
+    Args:
+        node: OpNode to extract shapes from
+        direction: "input" or "output"
+        
+    Returns:
+        Comma-separated string of shapes
+    """
+    sem_io = node.annotations.get("sem_io", {})
+    
+    if direction == "input":
+        # Priority: activation, then all non-output roles
+        if "activation" in sem_io:
+            return str(sem_io["activation"].get("shape", ""))
+        shapes = [str(v.get("shape", "")) for k, v in sem_io.items() 
+                  if k not in ("output",)]
+        return ", ".join(shapes) if shapes else ", ".join(str(t.shape) for t in node.inputs)
+    else:
+        # Output direction
+        if "output" in sem_io:
+            return str(sem_io["output"].get("shape", ""))
+        shapes = [str(v.get("shape", "")) for k, v in sem_io.items() 
+                  if k == "output"]
+        return ", ".join(shapes) if shapes else ", ".join(str(t.shape) for t in node.outputs)
+
+
+def _get_fused_dtypes_from_sem_io(node: OpNode, direction: str) -> str:
+    """Get fused dtypes from sem_io annotation (includes CP split).
+    
+    Args:
+        node: OpNode to extract dtypes from
+        direction: "input" or "output"
+        
+    Returns:
+        Comma-separated string of dtypes
+    """
+    sem_io = node.annotations.get("sem_io", {})
+    sem_dtype = node.annotations.get("sem_dtype", "")
+    
+    if direction == "input":
+        if "activation" in sem_io:
+            dtype = sem_io["activation"].get("dtype", sem_dtype)
+            return str(dtype) if dtype else ""
+        dtypes = [str(v.get("dtype", "")) for k, v in sem_io.items() 
+                  if k not in ("output",)]
+        return ", ".join(dtypes) if dtypes else ", ".join(str(t.dtype) for t in node.inputs)
+    else:
+        if "output" in sem_io:
+            dtype = sem_io["output"].get("dtype", sem_dtype)
+            return str(dtype) if dtype else ""
+        dtypes = [str(v.get("dtype", "")) for k, v in sem_io.items() 
+                  if k == "output"]
+        return ", ".join(dtypes) if dtypes else ", ".join(str(t.dtype) for t in node.outputs)
+
+
+def _graph_to_fused_records(graph: OpGraph,
+                            phase_filter: str | None = None) -> List[Dict[str, Any]]:
+    """Build fused-record dicts from an OpGraph for the Fused Operators sheet.
+
+    When the graph is a stitched fwd+bwd unified graph, ``phase_filter``
+    keeps only nodes whose ``annotations["phase"]`` matches.
+    """
+    arrow = " → "
+    records: List[Dict[str, Any]] = []
+    nodes = layer_stable_sort(graph.topo_sort(), graph=graph)
+    if phase_filter is not None and (graph.phase == "train"
+                                     or graph.metadata.get("fwd_bwd_stitched")):
+        nodes = [n for n in nodes if n.annotations.get("phase") == phase_filter]
+    for idx, node in enumerate(nodes):
+        constituents = node.fused_from or [node.op_type]
+        # Recover the "raw Node IDs that fused into this node".  Strip the
+        # ``op_`` / ``bwd_op_`` prefix so the value lines up with the Node ID
+        # column in the Raw Operators sheet.
+        src_ids_raw = node.annotations.get("source_op_ids") or [node.id]
+        def _strip(idstr: str) -> str:
+            s = str(idstr)
+            for pre in ("bwd_op_", "op_"):
+                if s.startswith(pre):
+                    return s[len(pre):]
+            return s
+        raw_ids_str = ",".join(_strip(s) for s in src_ids_raw)
+        # When a node was never fused (single raw op carried over), the scope
+        # tail (e.g. "norm", "attn") is meaningless as a per-op identifier.
+        # Surface the operator's own short name (e.g. "add", "rsqrt") so the
+        # row is self-describing.  Fused nodes keep their semantic op_name
+        # (the leaf attr / wrapper module name).
+        is_unfused_single = (
+            (node.num_sub_ops or 1) <= 1
+            and not node.annotations.get("fused_by_rule")
+            and (node.op_type.startswith("aten.") or node.op_type.startswith("comm."))
+        )
+        if is_unfused_single:
+            op_name_value = op_short(node.op_type)
+        else:
+            op_name_value = (
+                node.name or (node.scope.rsplit(".", 1)[-1] if node.scope else "")
+            )
+        records.append({
+            "node_id": idx,
+            "op_name": op_name_value,
+            "rule_name": node.annotations.get("fused_by_rule", "") or "",
+            "fused_op": node.op_type,
+            "aten_ops": arrow.join(constituents),
+            "num_sub_ops": node.num_sub_ops or 1,
+            "raw_op_ids": raw_ids_str,
+            "layer": node.layer or "",
+            "module_class": node.module_class,
+            "module_path": node.scope,
+            "fusion_level": node.fusion_level or ("leaf" if (node.num_sub_ops or 0) <= 1 else "parent"),
+            "input_shapes": ", ".join(str(t.shape) for t in node.inputs),
+            "input_dtypes": ", ".join(str(t.dtype) for t in node.inputs),
+            "output_shapes": ", ".join(str(t.shape) for t in node.outputs),
+            "output_dtypes": ", ".join(str(t.dtype) for t in node.outputs),
+            # Use sem_io shapes (includes CP split) if available
+            "fused_input_shapes": _get_fused_shapes_from_sem_io(node, "input"),
+            "fused_input_dtypes": _get_fused_dtypes_from_sem_io(node, "input"),
+            "fused_output_shapes": _get_fused_shapes_from_sem_io(node, "output"),
+            "fused_output_dtypes": _get_fused_dtypes_from_sem_io(node, "output"),
+            "fused_input_sources": "",
+            "fused_output_sources": "",
+        })
+    return records
+
+
+def export_training_graphs(
+    fwd_graph: OpGraph,
+    bwd_graph: OpGraph | None,
+    ctx: TransformContext,
+    output_dir: Path,
+    training_summary=None,
+    fwd_records: List[Dict[str, Any]] | None = None,
+    bwd_records: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Path]:
+    """Export forward + backward training graphs to Excel and JSON.
+
+    Parameters
+    ----------
+    fwd_graph
+        Transformed train_forward graph, or unified graph (phase="train").
+    bwd_graph
+        Transformed train_backward graph, or None if fwd_graph is unified.
+    ctx
+        Transform context (shared between phases).
+    output_dir
+        Output directory.
+    training_summary
+        Optional ``TrainingSummary`` — written as a dedicated Excel sheet.
+
+    Returns
+    -------
+    dict[str, Path]
+        {"excel": ..., "json_fwd": ..., "json_bwd": ...}
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    base = fwd_graph.name.replace("/", "_").replace(":", "_")
+    for suffix in ("_train_forward", "_train_backward", "_train"):
+        base = base.replace(suffix, "")
+
+    excel_path = output_dir / f"{base}_training.xlsx"
+    writer = TrainingGraphExcelWriter()
+    writer.write_training(
+        fwd_graph, bwd_graph, ctx, excel_path, training_summary,
+        fwd_records=fwd_records, bwd_records=bwd_records,
+    )
+
+    json_fwd = output_dir / f"{base}_train_forward.json"
+    _export_json(fwd_graph, ctx, json_fwd)
+
+    if bwd_graph is not None and bwd_graph != fwd_graph:
+        json_bwd = output_dir / f"{base}_train_backward.json"
+        _export_json(bwd_graph, ctx, json_bwd)
+        return {"excel": excel_path, "json_fwd": json_fwd, "json_bwd": json_bwd}
+
+    return {"excel": excel_path, "json_fwd": json_fwd}

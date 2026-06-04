@@ -1,0 +1,50 @@
+name: "Ascend 910C"
+vendor: "huawei"
+device_type: "npu"
+
+compute:
+  # compute_efficiency: 0.5   # uncomment to override the achieved-FLOPs heuristic
+  # Estimated ~2x 910B; exact specs not fully public as of mid-2025
+  fp16_tflops: 640
+  bf16_tflops: 640
+  fp32_tflops: 320
+  int8_tops: 1280
+  int4_tops: 2560
+  fp8_tops: 1280
+  fp4_tops: 0       # 910C has no native FP4; falls back to FP8 peak at runtime
+
+  # Heterogeneous-core (DaVinci Cube/Vector split, ~2x 910B)
+  cube_bf16_tflops: 560
+  vector_bf16_tflops: 80
+  sram_kb_per_sm: 192  # DaVinci AI Core L1 unified buffer (~192 KB)
+  overlap_ratio:
+    attn_core: 0.6   # ~60% pipeline overlap for fused attention
+
+memory:
+  # mem_bw_efficiency: 0.7    # uncomment to override the achieved-bandwidth heuristic
+  capacity_gb: 96
+  hbm_bandwidth_gbps: 3200
+  l2_cache_mb: 96
+  tiers:
+    - { name: "L2",  bandwidth_gbps: 12800, capacity_mb: 96 }
+    - { name: "HBM", bandwidth_gbps: 3200,  capacity_mb: 0  }
+
+interconnect:
+  intra_node:
+    type: "HCCS"
+    # 7 HCCS links per card, ~112 GB/s unidirectional each (2x 910B)
+    # Registry computes bidirectional total: 7 * 112 * 2 = 1568 GB/s
+    unidirectional_bw_gbps: 112
+    num_links: 7
+    latency_us: 2
+    topology: "full_mesh"
+    kb_efficiency: 0.7        # bandwidth utilization (effective/peak)
+    num_devices: 8
+  inter_node:
+    type: "RoCE"
+    bandwidth_gbps: 400
+    latency_us: 4
+    topology: "fat_tree"
+    kb_efficiency: 0.7       # bandwidth utilization (effective/peak)
+    # oversubscription: 4.0  # uncomment for an over-subscribed spine (non-clos)
+    num_devices: 0

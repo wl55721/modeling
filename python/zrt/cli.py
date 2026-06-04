@@ -1,0 +1,1048 @@
+"""Top-level CLI entry point for ZRT-Sim.
+
+Usage::
+
+    python -m python.zrt --model-id Qwen/Qwen2.5-7B-Instruct --layers 4
+    python -m python.zrt --model-id deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sxm --tp 8
+    python -m python.zrt --model-id hf_models/llama3_8b --train --layers 2
+    python -m python.zrt --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml
+    python -m python.zrt --search-config python/zrt/training/configs/llama3_70b_3d.yaml
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+from typing import List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Lazy imports to avoid requiring torch at module load time
+# These are imported only when needed:
+#   from python.zrt.pipeline import run_trace_phases, _make_model_slug, _MODEL_DIRS, _PHASE_ALIASES
+
+
+def _get_model_dirs():
+    """Lazy import of _MODEL_DIRS to avoid requiring torch at module load time."""
+    from python.zrt.pipeline import _MODEL_DIRS
+    return _MODEL_DIRS
+
+
+def _make_model_slug(model_id: str) -> str:
+    """Lazy import of _make_model_slug to avoid requiring torch at module load time."""
+    from python.zrt.pipeline import _make_model_slug as _impl
+    return _impl(model_id)
+
+
+def _run_trace_phases(**kwargs):
+    """Lazy import of run_trace_phases to avoid requiring torch at module load time."""
+    from python.zrt.pipeline import run_trace_phases
+    return run_trace_phases(**kwargs)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Trace LLM operator sequences and write Excel + computation graph.")
+
+    # ── Mode flags (mutually exclusive) ──────────────────────────────────────
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--estimate-config",
+        metavar="YAML",
+        help="Run spec-based training estimation from a YAML config (no graph capture). "
+             "Example: --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml",
+    )
+    mode_group.add_argument(
+        "--search-config",
+        metavar="YAML",
+        help="Grid-search parallel strategies for a training config. "
+             "Example: --search-config python/zrt/training/configs/llama3_70b_3d.yaml",
+    )
+    parser.add_argument(
+        "--breakdown",
+        action="store_true",
+        default=False,
+        help="Print a structured per-component time breakdown alongside the estimate. "
+             "Shows compute, comm (by group), bubble, optimizer, and hidden comm.",
+    )
+    parser.add_argument(
+        "--output",
+        metavar="FILE",
+        help="Write output files. If omitted: writes both .xlsx and .html to output/estimate/<config>_<timestamp>. "
+             "If a directory or filename without extension is given: writes both .xlsx and .html to that location. "
+             "If a filename with .xlsx/.html extension is given: writes both .xlsx and .html to the same directory with the same base name.",
+    )
+
+    # ── Model ─────────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--model-id",
+        metavar="MODEL",
+        default=None,
+        help="HF Hub model ID or local directory (e.g. deepseek-ai/DeepSeek-V3-0324). "
+             "Required for graph capture modes.",
+    )
+    parser.add_argument(
+        "--model",
+        choices=_get_model_dirs().keys(),
+        default=None,
+        help="Shorthand for local DeepSeek model: v3 or v3.2 (maps to hf_models/).",
+    )
+
+    # ── Input & layers ────────────────────────────────────────────────────────
+    parser.add_argument("--layers", type=int, default=4,
+                        help="Number of transformer layers to trace (default: 4)")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Dummy input batch size (default: 1)")
+    parser.add_argument("--seq-len", type=int, default=128,
+                        help="Prefill sequence length (default: 128)")
+
+    _layer_group = parser.add_mutually_exclusive_group()
+    _layer_group.add_argument(
+        "--target-layers",
+        metavar="IDX",
+        help="Comma-separated layer indices to trace, e.g. '0,3'.",
+    )
+    _layer_group.add_argument(
+        "--auto-layers",
+        action="store_true",
+        default=False,
+        help="Automatically select the first dense and first sparse (MoE) layer.",
+    )
+
+    # ── Phases ────────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--phases", nargs="+", default=None,
+        choices=["prefill", "decode", "forward",
+                 "train_forward", "train_backward", "train"],
+        metavar="PHASE",
+        help="Phases to trace (default: prefill decode). "
+             "Inference: prefill, decode. Training: train_forward, train_backward. "
+             "'forward'/'train' are aliases for 'prefill'/'train_forward'.",
+    )
+    parser.add_argument(
+        "--train", action="store_true", default=False,
+        help="Trace training phases (train_forward + train_backward). "
+             "Equivalent to --phases train_forward train_backward.",
+    )
+
+    # ── Capture mode ──────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--platform",
+        default="generic",
+        choices=["cuda", "ascend_npu", "cpu", "generic"],
+        help="Target inference platform for fusion labelling (default: generic).",
+    )
+    parser.add_argument(
+        "--graph-mode",
+        action="store_true",
+        default=False,
+        help="Use torch.compile graph capture instead of TorchDispatchMode eager tracing.",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        default=False,
+        help="Enable activation checkpointing during training phases.",
+    )
+    parser.add_argument(
+        "--recompute-policy",
+        default=None,
+        choices=["none", "full", "selective"],
+        help="Activation recompute policy (default: none unless configured elsewhere). "
+             "full = all forward ops recomputed; "
+             "selective = attention ops only.",
+    )
+    parser.add_argument(
+        "--mega-moe",
+        action="store_true",
+        default=False,
+        help="Fuse captured forward routed MoE expert compute into one MegaMoE op "
+             "with internal dispatch/compute/combine modelling.",
+    )
+    parser.add_argument(
+        "--mega-moe-waves",
+        type=int,
+        default=0,
+        help="Requested MegaMoE wave count for internal EP overlap (0 = hardware/default).",
+    )
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    parser.add_argument("--output-dir", "-o",
+                        help="Output directory (default: output/<model_slug>)")
+
+    # ── Parallel strategy (applies to both inference transforms and training modelling) ──
+    parser.add_argument(
+        "--tp", type=int, default=1,
+        help="Tensor-parallel degree (default: 1).",
+    )
+    parser.add_argument(
+        "--pp", type=int, default=1,
+        help="Pipeline-parallel degree (default: 1).",
+    )
+    parser.add_argument(
+        "--ep", type=int, default=1,
+        help="Expert-parallel degree (default: 1).",
+    )
+    parser.add_argument(
+        "--dp", type=int, default=1,
+        help="Data-parallel degree (default: 1).",
+    )
+    parser.add_argument(
+        "--cp", type=int, default=1,
+        help="Context-parallel degree (default: 1).",
+    )
+    parser.add_argument(
+        "--cp-kind",
+        default="none",
+        choices=["none", "ulysses", "ring", "hybrid", "compressed"],
+        metavar="KIND",
+        help="Context parallel strategy (default: auto-select by model type). "
+             "DSV4: 'compressed' only. "
+             "Other models: 'ulysses' (default), 'ring', or 'hybrid'.",
+    )
+    parser.add_argument(
+        "--quant", default=None,
+        metavar="DTYPE",
+        help="Weight quantization dtype for analysis: int4, int8, fp8 (default: no quantization)",
+    )
+
+    # ── Fusion config ─────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--fusion-config",
+        metavar="YAML",
+        default=None,
+        help="Override fusion rule selection with a YAML file. "
+             "Without this, the loader looks up "
+             "python/zrt/transform/fusion/configs/<model_slug>[_<phase>].yaml "
+             "and falls back to <phase>_default.yaml.",
+    )
+    parser.add_argument(
+        "--list-fusion-rules",
+        action="store_true",
+        default=False,
+        help="Print all registered fusion rule names + descriptions then exit. "
+             "Use this to look up names for --fusion-config YAML files.",
+    )
+
+    # ── Hardware (triggers perf report / modelling) ───────────────────────────
+    parser.add_argument(
+        "--hw",
+        metavar="HW",
+        default=None,
+        help="Hardware spec name for performance report (e.g. nvidia_h100_sxm). "
+             f"Available: {', '.join(__import__('python.zrt.hardware.registry', fromlist=['list_available']).list_available())}",
+    )
+
+    # ── Training modelling extras (used with --train --hw or --estimate-config) ──
+    parser.add_argument(
+        "--zero-stage", type=int, default=1,
+        help="ZeRO optimization stage 0-3 (training, default: 1).",
+    )
+    parser.add_argument(
+        "--optimizer", default="adam",
+        choices=["adam", "adamw", "muon"],
+        help="Optimizer for training estimation (default: adam).",
+    )
+    parser.add_argument(
+        "--muon-rotation", action="store_true", default=True,
+        help="Enable Moonshot rotation optimization for Muon (default: True).",
+    )
+    parser.add_argument(
+        "--muon-ns-steps", type=int, default=None,
+        help="Newton-Schulz iteration steps for Muon (default: 5, DSV4: 10).",
+    )
+    parser.add_argument(
+        "--micro-batch", type=int, default=1,
+        help="Micro-batch size per GPU (training, default: 1).",
+    )
+    parser.add_argument(
+        "--global-batch", type=int, default=32,
+        help="Global batch size across DP ranks (training, default: 32).",
+    )
+    parser.add_argument(
+        "--dp-bucket-cap-mb", type=float, default=None,
+        help="DDP gradient bucket cap in MiB when --dp-ddp-buckets is enabled "
+             "(training, default: 25.0).",
+    )
+    parser.add_argument(
+        "--dp-overlap",
+        dest="dp_overlap",
+        action="store_true",
+        default=None,
+        help="Explicitly reaffirm original DP hidden/exposed overlap accounting "
+             "(training default: enabled).",
+    )
+    parser.add_argument(
+        "--no-dp-overlap",
+        dest="dp_overlap",
+        action="store_false",
+        help="Disable DP overlap and model gradient reduction as fully exposed pure DP.",
+    )
+    parser.add_argument(
+        "--dp-ddp-buckets",
+        action="store_true",
+        default=False,
+        help="Use DDP-style cap-based DP gradient buckets for trace-level overlap. "
+             "Without this flag, the original layer DP hidden/exposed path is used.",
+    )
+    parser.add_argument(
+        "--total-params", type=float, default=None,
+        help="Full model param count, e.g. 671e9 (for scaling traced layers).",
+    )
+    parser.add_argument(
+        "--hidden", type=int, default=7168,
+        help="Hidden dimension for memory estimation (default: 7168).",
+    )
+    parser.add_argument(
+        "--num-layers-full", type=int, default=None,
+        help="Total layers in full model (defaults to --layers if not set).",
+    )
+
+    # ── Pipeline-parallel scheduling ─────────────────────────────────────────
+    parser.add_argument(
+        "--pp-schedule", default="1f1b",
+        choices=["1f1b", "interleaved", "dualpipe", "dualpipev", "zb"],
+        help="Pipeline parallel schedule (default: 1f1b).",
+    )
+    parser.add_argument(
+        "--vpp-chunks", type=int, default=1,
+        help="Virtual pipeline chunks for interleaved/dualpipev schedules.",
+    )
+    parser.add_argument(
+        "--tp-coc", action="store_true", default=False,
+        help="Enable CoC (Communication-over-Computation) overlap for TP "
+             "all_reduce.  Comm starts after 1/K of the predecessor compute "
+             "instead of waiting for it to finish (K=4).",
+    )
+
+    args = parser.parse_args()
+    dp_overlap = True if args.dp_overlap is None else args.dp_overlap
+    dp_bucket_cap_mb = 25.0 if args.dp_bucket_cap_mb is None else args.dp_bucket_cap_mb
+    if args.dp_ddp_buckets and not dp_overlap:
+        parser.error(
+            "--dp-ddp-buckets requires DP overlap to be enabled. "
+            "Use --no-dp-overlap without --dp-ddp-buckets for pure DP."
+        )
+    args.dp_overlap = dp_overlap
+    args.dp_bucket_cap_mb = dp_bucket_cap_mb
+
+    # ── --list-fusion-rules: print and exit ──────────────────────────────────
+    if args.list_fusion_rules:
+        _list_fusion_rules()
+        return
+
+    # ── Three independent modes ───────────────────────────────────────────────
+    # 1. Spec-based estimation (--estimate-config)
+    # 2. Grid search (--search-config)
+    # 3. Graph capture + modelling (--model-id or --model)
+    if args.estimate_config:
+        _run_estimate(args.estimate_config, args.output, breakdown=args.breakdown)
+        return
+
+    if args.search_config:
+        _run_search(args.search_config, args.output)
+        return
+
+    # ── Resolve model_id ──────────────────────────────────────────────────────
+    if args.model_id:
+        model_id = args.model_id
+    elif args.model:
+        model_dir_name = _get_model_dirs()[args.model]
+        model_id = str(
+            Path(__file__).parent.parent.parent / "hf_models" / model_dir_name)
+    else:
+        parser.error("Provide --model-id or --model v3/v3.2")
+
+    output_dir = Path(args.output_dir) if args.output_dir else None
+
+    # ── Phase resolution: --train > --phases > default ────────────────────────
+    if args.train:
+        phases = ["train_forward", "train_backward"]
+    elif args.phases is not None:
+        phases = args.phases
+    else:
+        phases = ["prefill", "decode"]
+
+    target_layers: Optional[List[int]] = None
+    if args.target_layers:
+        try:
+            target_layers = [int(x.strip()) for x in args.target_layers.split(",")]
+        except ValueError:
+            parser.error(
+                f"--target-layers must be comma-separated integers, "
+                f"got: {args.target_layers!r}"
+            )
+
+    effective_auto_layers = args.auto_layers or (target_layers is None)
+
+    effective_platform = args.platform
+    if effective_platform == "generic" and args.hw:
+        import python.zrt.hardware.registry as hw_registry
+        _hw = hw_registry.load(args.hw)
+        _vendor = getattr(_hw, "vendor", "").lower()
+        _device_type = getattr(_hw, "device_type", "").lower()
+        if "nvidia" in _vendor or "cuda" in _vendor:
+            effective_platform = "cuda"
+        elif "huawei" in _vendor or "ascend" in _vendor or _device_type == "npu":
+            effective_platform = "ascend_npu"
+
+    # Use infer_profile for training mode to enable efficient capture
+    infer_profile = args.train if "infer_profile" not in dir(args) else getattr(args, 'infer_profile', False)
+    
+    result = _run_trace_phases(
+        model_id=model_id,
+        num_layers=args.layers,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        output_dir=output_dir,
+        phases=tuple(phases),
+        target_layers=target_layers,
+        auto_layers=effective_auto_layers,
+        platform=effective_platform,
+        graph_mode=args.graph_mode,
+        gradient_checkpointing=args.gradient_checkpointing,
+        infer_profile=infer_profile,
+    )
+
+    if args.cp_kind != "none" or args.cp > 1:
+        resolved_cp_kind = _validate_cp_kind(model_id, args.cp_kind, args.cp)
+        args.cp_kind = resolved_cp_kind
+
+    if args.hw:
+        import python.zrt.hardware.registry as hw_registry
+        hw = hw_registry.load(args.hw)
+
+        if args.train:
+            _run_training_modelling(args, model_id, hw, result)
+        else:
+            _run_inference_pipeline(args, model_id, hw, result)
+
+
+def _build_model_profile(model_id: str, args) -> "SimpleNamespace":
+    """Build a model profile with layer architecture info for report generation.
+
+    Used by both inference and training pipelines so that the HTML report
+    correctly distinguishes dense vs. MoE layers.
+    """
+    from types import SimpleNamespace
+
+    _dense_indices: list[int] = []
+    _sparse_indices: list[int] = []
+    _n_exp = 0
+    _topk = 0
+
+    def _set_from_config_json(_raw: dict) -> bool:
+        """Try to infer architecture from config.json fields.
+
+        Returns True if successful, False if fields are missing.
+        """
+        nonlocal _dense_indices, _sparse_indices, _n_exp, _topk
+
+        _first_k = _raw.get("first_k_dense_replace")
+        _freq = _raw.get("moe_layer_freq")
+
+        # V4-style config: no first_k_dense_replace/moe_layer_freq fields.
+        # Don't compute — let the transformer API handle it.
+        if _first_k is None and _freq is None:
+            return False
+
+        _first_k = _first_k or 0
+        _freq = _freq or 1
+        _total_layers = _raw.get("num_hidden_layers", 61)
+        for i in range(_total_layers):
+            if i < _first_k:
+                _dense_indices.append(i)
+            elif (i - _first_k) % _freq == 0:
+                _sparse_indices.append(i)
+            else:
+                _dense_indices.append(i)
+        _n_exp = _raw.get("n_routed_experts", 0) or _raw.get(
+            "num_local_experts", 0)
+        _topk = _raw.get("num_experts_per_tok", 0) or _raw.get(
+            "moe_topk", 0) or _raw.get("top_k", 0)
+        return True
+
+    try:
+        import json as _json2
+        _cfg_path = Path(model_id) / "config.json"
+        if not _cfg_path.is_absolute():
+            _cfg_path = Path.cwd() / _cfg_path
+
+        if _cfg_path.exists():
+            with open(_cfg_path) as _f:
+                _raw = _json2.load(_f)
+
+            if not _set_from_config_json(_raw):
+                # config.json lacks first_k_dense_replace / moe_layer_freq.
+                # Fall through to transformer API below.
+                _n_exp = _raw.get("n_routed_experts", 0) or _raw.get(
+                    "num_local_experts", 0)
+                _topk = _raw.get("num_experts_per_tok", 0) or _raw.get(
+                    "moe_topk", 0) or _raw.get("top_k", 0)
+                _dense_indices = []
+                _sparse_indices = []
+                # Continue to transformer API fallback below.
+            else:
+                logger.info(
+                    "Architecture (from config.json): %d dense + %d sparse "
+                    "layers (total %d), experts=%d, topk=%d",
+                    len(_dense_indices), len(_sparse_indices),
+                    _raw.get("num_hidden_layers", 61), _n_exp, _topk,
+                )
+    except Exception as _exc:
+        logger.warning("Could not read config.json: %s", _exc)
+
+    # Fallback: use transformers config API (handles V4, Mixtral, etc.)
+    if not _dense_indices and not _sparse_indices:
+        try:
+            from python.zrt.graph.model_loader import infer_layer_types, _load_config
+            _cfg, _ = _load_config(model_id)
+            _types = infer_layer_types(_cfg)
+            _dense_indices = _types["dense"]
+            _sparse_indices = _types["sparse"]
+            if not _n_exp:
+                _n_exp = getattr(_cfg, "n_routed_experts", 0) or getattr(
+                    _cfg, "num_local_experts", 0)
+            if not _topk:
+                _topk = getattr(_cfg, "num_experts_per_tok", 0) or getattr(
+                    _cfg, "moe_topk", 0) or getattr(_cfg, "top_k", 0)
+            logger.info(
+                "Architecture (from transformers API): %d dense + %d sparse "
+                "layers (total %d), experts=%d, topk=%d",
+                len(_dense_indices), len(_sparse_indices),
+                getattr(_cfg, "num_hidden_layers", 0), _n_exp, _topk,
+            )
+        except Exception as _exc:
+            logger.warning("Could not infer layer architecture: %s", _exc)
+
+    return SimpleNamespace(
+        num_layers=getattr(args, "num_layers_full", None) or getattr(args, "layers", 0) or 0,
+        total_param_count=getattr(args, "total_params", 0) or 0,
+        hidden_size=getattr(args, "hidden", 7168) or 7168,
+        is_moe=len(_sparse_indices) > 0,
+        num_experts=_n_exp,
+        moe_topk=_topk,
+        dense_layer_indices=_dense_indices,
+        sparse_layer_indices=_sparse_indices,
+    )
+
+
+def _validate_cp_kind(model_id: str, cp_kind: str, cp: int) -> str:
+    """Validate and resolve cp_kind based on model type and CLI input.
+    
+    Args:
+        model_id: Model identifier (HF Hub ID or local path)
+        cp_kind: User-specified cp_kind from CLI
+        cp: Context parallel degree
+    
+    Returns:
+        Resolved cp_kind string
+    
+    Raises:
+        ValueError: On constraint violation
+    """
+    if cp <= 1:
+        return "none"
+    
+    model_slug = _make_model_slug(model_id).lower()
+    is_dsv4 = any(x in model_slug for x in ["deepseek_v4", "dsv4"])
+    
+    if is_dsv4:
+        if cp_kind not in ("none", "compressed"):
+            raise ValueError(
+                f"Model '{model_id}' only supports cp_kind='compressed'. "
+                f"Got '{cp_kind}'. Use --cp-kind compressed or remove flag."
+            )
+        return "compressed" if cp_kind == "none" else cp_kind
+    
+    if cp_kind == "compressed":
+        raise ValueError(
+            f"cp_kind='compressed' is reserved for DeepSeek-V4. "
+            f"Model '{model_id}' should use 'ulysses', 'ring', or 'hybrid'."
+        )
+    
+    return "ulysses" if cp_kind == "none" else cp_kind
+
+
+def _list_fusion_rules() -> None:
+    """Print every registered fusion rule and exit.
+
+    Walks every YAML under ``rules/`` (including ``_common.yaml``) so the
+    printed list is the union across all model packs we ship.
+    """
+    from pathlib import Path
+    from python.zrt.transform.fusion.registry import (
+        all_rules, clear_rules, register_rule,
+    )
+    from python.zrt.transform.fusion.loading.yaml_rule_loader import load_yaml_rules
+
+    clear_rules()
+    rules_dir = Path(__file__).parent / "transform" / "fusion" / "rules"
+    if rules_dir.exists():
+        for yaml_path in sorted(rules_dir.glob("*.yaml")):
+            for rule in load_yaml_rules(yaml_path):
+                try:
+                    register_rule(rule)
+                except ValueError:
+                    pass  # Duplicate name across model packs is OK for listing.
+
+    rules = all_rules()
+    if not rules:
+        print("No fusion rules registered.")
+        return
+    width_name = max(len(r.name) for r in rules)
+    print(f"{'rule name'.ljust(width_name)}  op_type                  default_phases  description")
+    print("-" * 110)
+    for r in sorted(rules, key=lambda x: x.name):
+        phases = ",".join(r.default_phases)
+        op_t = r.op_type or "-"
+        desc = r.description or "(no description)"
+        print(f"{r.name.ljust(width_name)}  {op_t.ljust(24)} {phases.ljust(15)} {desc}")
+
+
+def _resolve_fusion_config(args, model_id: str, phase: str):
+    """Build a FusionConfig for the current run."""
+    from python.zrt.transform.fusion.yaml_loader import resolve_fusion_config
+    explicit = getattr(args, "fusion_config", None)
+    return resolve_fusion_config(model_id, phase, explicit_path=explicit)
+
+
+def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
+    """Run the inference transform + simulate + report pipeline."""
+    from python.zrt.transform import (
+        build_default_pipeline, TransformContext,
+        ParallelConfig, StreamConfig,
+    )
+    from python.zrt.transform.context import QuantConfig
+    from python.zrt.report import export_reports
+
+    quant = QuantConfig(weight=args.quant, activation=args.quant) if args.quant else None
+    fusion_cfg = _resolve_fusion_config(args, model_id, phase="inference")
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(
+            tp=args.tp, pp=args.pp, ep=args.ep, dp=args.dp, cp=args.cp,
+        ),
+        stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+        quant=quant,
+        fusion=fusion_cfg,
+        model_id=model_id,
+    )
+    pipe = build_default_pipeline()
+
+    slug = _make_model_slug(model_id)
+
+    profile = _build_model_profile(model_id, args)
+
+    for phase, raw_graph in result.graphs.items():
+        g = pipe.run(raw_graph, ctx)
+
+        # Single call: schedule + simulate + all exports
+        try:
+            report_dir = result.output_dir / "reports"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            rc, flat = export_reports(
+                model=model_id, hardware=args.hw, phase=phase,
+                batch_size=args.batch_size, seq_len=args.seq_len,
+                graph=g, hw_spec=hw, ctx=ctx,
+                output_dir=report_dir, slug=slug,
+                flat_summary=True,
+                profile=profile,
+            )
+        except Exception as exc:
+            logger.warning("Report export failed: %s", exc)
+            continue
+
+        # Print console summary
+        if flat is not None:
+            try:
+                print(f"\n{flat}")
+            except UnicodeEncodeError:
+                logger.info("Performance summary: %s", flat)
+
+
+def _run_training_modelling(args, model_id: str, hw, result) -> None:
+    """Run graph-native training modelling on captured training graphs.
+
+    .. deprecated::
+        此函数将在 GraphCoarsenPass 实现后被 ``_run_capture_estimate`` 替代。
+        当前保留用于 --model-id --train --hw 的旧路径（路径 A 旧入口）。
+        新入口 ``_run_capture_estimate`` 使用 ``estimate_via_pipeline(capture=...)``
+        走统一 Transform Pipeline，但需要 GraphCoarsenPass 将 aten-level ops
+        聚合为 block-level ops 后才能完全替代。
+    """
+    from python.zrt.transform.analysis import estimate_training_from_graphs
+    from python.zrt.transform.exporter import export_training_graphs
+
+    raw_fwd = result.graphs.get("train_forward")
+    if raw_fwd is None:
+        logger.error("--train --hw requires train_forward phase but none was captured.")
+        return
+
+    raw_bwd = result.graphs.get("train_backward")
+
+    if raw_bwd is None:
+        logger.warning("No train_backward graph captured; backward metrics will use forward-only fallback.")
+
+    # Load model config for MoE sizing (active experts, total experts)
+    _moe_active = 1
+    _moe_total = 0
+    try:
+        import json as _json3
+        _cfg_path = Path(model_id) / "config.json"
+        if not _cfg_path.is_absolute():
+            _cfg_path = Path.cwd() / _cfg_path
+        if _cfg_path.exists():
+            with open(_cfg_path) as _f:
+                _raw_cfg = _json3.load(_f)
+            _moe_active = _raw_cfg.get("num_experts_per_tok", 0) or _raw_cfg.get(
+                "moe_topk", 0) or _raw_cfg.get("top_k", 0) or 1
+            _moe_total = _raw_cfg.get("n_routed_experts", 0) or _raw_cfg.get(
+                "num_local_experts", 0) or 0
+            if _moe_active > 1:
+                logger.info(
+                    "MoE config: %d total experts, %d active per token",
+                    _moe_total, _moe_active)
+    except Exception as _exc:
+        logger.warning("Could not read MoE config: %s", _exc)
+
+    fusion_cfg = _resolve_fusion_config(args, model_id, phase="training")
+    
+    # Extract LayerProfile from graph metadata if available
+    layer_profile = raw_fwd.metadata.get("layer_profile", None)
+    
+    report, ctx, transformed = estimate_training_from_graphs(
+        forward_graph=raw_fwd,
+        backward_graph=raw_bwd,
+        output_dir=result.output_dir,
+        hw_spec=hw,
+        total_params=args.total_params,
+        hidden=args.hidden,
+        num_layers=args.layers,
+        num_layers_full=args.num_layers_full,
+        seq_len=args.seq_len,
+        batch_size=args.batch_size,
+        tp=args.tp,
+        pp=args.pp,
+        ep=args.ep,
+        dp=args.dp,
+        cp=args.cp,
+        cp_kind=getattr(args, "cp_kind", "ulysses"),
+        zero_stage=args.zero_stage,
+        optimizer=args.optimizer,
+        muon_rotation=args.muon_rotation,
+        muon_ns_steps=args.muon_ns_steps,
+        micro_batch=args.micro_batch,
+        global_batch=args.global_batch,
+        recompute_policy=(
+            args.recompute_policy
+            or ("full" if args.gradient_checkpointing else "none")
+        ),
+        mega_moe=getattr(args, "mega_moe", False),
+        mega_moe_waves=getattr(args, "mega_moe_waves", 0),
+        pp_schedule=args.pp_schedule,
+        vpp_chunks=args.vpp_chunks,
+        pp_mode=getattr(args, "pp_mode", "trace"),
+        dp_overlap_in_bubble=True if args.dp_overlap is None else args.dp_overlap,
+        dp_bucket_mode="ddp" if getattr(args, "dp_ddp_buckets", False) else "layer",
+        dp_bucket_cap_mb=args.dp_bucket_cap_mb if args.dp_bucket_cap_mb is not None else 25.0,
+        tp_coc=args.tp_coc,
+        return_transformed=True,
+        quant=args.quant,
+        moe_total_experts=_moe_total,
+        moe_active_experts=_moe_active,
+        model_id=model_id,
+        fusion_config=fusion_cfg,
+        layer_profile=layer_profile,
+    )
+
+    try:
+        print(f"\n{report.summary()}")
+    except UnicodeEncodeError:
+        logger.info("Training summary:\n%s", report.summary())
+
+    slug = _make_model_slug(model_id)
+    output_dir = result.output_dir
+
+    # Export training Excel
+    try:
+        if "unified" in transformed:
+            g = transformed["unified"]
+            fwd_for_export = g
+            bwd_for_export = g
+        else:
+            fwd_for_export = transformed.get("train_forward")
+            bwd_for_export = None
+
+        if fwd_for_export:
+            fwd_records = result.phase_records.get("train_forward")
+            bwd_records = result.phase_records.get("train_backward")
+            export_training_graphs(
+                fwd_graph=fwd_for_export,
+                bwd_graph=bwd_for_export,
+                ctx=ctx,
+                output_dir=output_dir,
+                training_summary=report,
+                fwd_records=fwd_records,
+                bwd_records=bwd_records,
+            )
+            logger.info("Training Excel exported to %s", output_dir / f"{slug}_training.xlsx")
+    except Exception as exc:
+        logger.warning("Training Excel export failed: %s", exc)
+
+    # Export training report JSON + hierarchical HTML
+    try:
+        import json as _json
+        report_dir = output_dir / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        # JSON dump
+        json_path = report_dir / f"{slug}_training_report.json"
+        json_path.write_text(_json.dumps(report.to_dict(), indent=2))
+        logger.info("Training report written to %s", json_path)
+
+        # Hierarchical HTML + Chrome Trace (single export_reports call)
+        train_graph = transformed.get("unified") or transformed.get("train_forward")
+        if train_graph is not None:
+            from python.zrt.report import export_reports
+
+            cli_profile = _build_model_profile(model_id, args)
+            export_reports(
+                model=model_id, hardware=args.hw, phase="train",
+                batch_size=args.batch_size, seq_len=args.seq_len,
+                graph=train_graph, hw_spec=hw, ctx=ctx,
+                output_dir=report_dir, slug=slug,
+                flat_summary=False,
+                profile=cli_profile,
+            )
+    except Exception as exc:
+        logger.warning("Training report export failed: %s", exc)
+
+
+def _run_capture_estimate(args, model_id: str, hw) -> None:
+    """CLI --model-id --train --hw 的统一入口（路径 A）。
+
+    构造 CaptureConfig + ModelSpec + SystemSpec + Strategy，
+    调用 estimate_via_pipeline(capture=cfg)。
+    """
+    from python.zrt.training.spec.capture_config import CaptureConfig
+    from python.zrt.training.search.estimator import estimate_via_pipeline
+    from python.zrt.training.spec.model import ModelSpec, LayerKind
+    from python.zrt.training.spec.system import GPU, SystemSpec
+    from python.zrt.training.spec.strategy import Strategy
+    from python.zrt.training.spec.dtype import Dtype
+
+    capture = CaptureConfig(
+        model_id=model_id,
+        num_layers=args.layers,
+        seq_len=args.seq_len,
+        batch_size=args.batch_size,
+        gradient_checkpointing=args.gradient_checkpointing,
+        graph_mode=getattr(args, "graph_mode", False),
+    )
+
+    model = _model_spec_from_hf(model_id, args)
+    gpu = GPU(
+        name=hw.name,
+        flops_bf16=hw.compute.bf16_tflops,
+        flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
+        flops_fp4=hw.compute.fp4_tops,
+        hbm_gb=hw.memory.capacity_gb,
+        hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
+        cube_tflops=hw.compute.cube_bf16_tflops,
+        vector_tflops=hw.compute.vector_bf16_tflops,
+        overlap_ratio=dict(hw.compute.overlap_ratio),
+        sram_kb_per_sm=hw.compute.sram_kb_per_sm,
+        ep_overlap_waves=hw.compute.ep_overlap_waves,
+        compute_efficiency=hw.compute.compute_efficiency,
+        mem_bw_efficiency=hw.memory.mem_bw_efficiency,
+    )
+    system = SystemSpec(
+        gpu=gpu,
+        host_mem_gb=256.0,
+        interconnect=hw.interconnect,
+        nodes=1,
+        gpus_per_node=8,
+    )
+
+    strategy = Strategy(
+        tp=args.tp, cp=args.cp, pp=args.pp, ep=args.ep, dp=args.dp,
+        micro_batch=args.micro_batch, global_batch=args.global_batch,
+        zero_stage=args.zero_stage,
+    )
+
+    report = estimate_via_pipeline(model, system, strategy, capture=capture)
+
+    try:
+        print(f"\n{report.summary()}")
+    except UnicodeEncodeError:
+        logger.info("Training summary:\n%s", report.summary())
+
+    logger.info("Capture estimate complete for %s", model_id)
+
+
+def _model_spec_from_hf(model_id: str, args) -> "ModelSpec":
+    """Construct ModelSpec from HF model config.json + CLI args.
+
+    Reads the model's config.json to extract architecture parameters,
+    falls back to CLI args for missing fields.
+    """
+    import json
+    from python.zrt.training.spec.model import ModelSpec, LayerKind
+    from python.zrt.training.spec.dtype import Dtype
+
+    cfg_path = Path(model_id) / "config.json"
+    if not cfg_path.is_absolute():
+        cfg_path = Path.cwd() / cfg_path
+
+    cfg = {}
+    if cfg_path.exists():
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+
+    hidden = cfg.get("hidden_size", args.hidden)
+    num_heads = cfg.get("num_attention_heads", 32)
+    num_kv_heads = cfg.get("num_key_value_heads", num_heads)
+    head_dim = cfg.get("head_dim", hidden // num_heads)
+    ffn = cfg.get("intermediate_size", hidden * 4)
+    vocab = cfg.get("vocab_size", 32000)
+    seq_len = args.seq_len
+
+    num_layers = args.layers
+    num_experts = cfg.get("num_local_experts", 0) or cfg.get("n_routed_experts", 0)
+    top_k = cfg.get("num_experts_per_tok", 0) or cfg.get("moe_topk", 0) or cfg.get("top_k", 0)
+    moe_ffn = cfg.get("moe_intermediate_size", 0) or cfg.get("route_expert_hidden", 0)
+
+    if num_experts > 0:
+        layers = [LayerKind.DENSE] * min(3, num_layers) + [LayerKind.MOE] * max(0, num_layers - 3)
+    else:
+        layers = [LayerKind.DENSE] * num_layers
+
+    return ModelSpec(
+        hidden=hidden, ffn=ffn, num_heads=num_heads, num_kv_heads=num_kv_heads,
+        head_dim=head_dim, vocab=vocab, seq_len=seq_len, layers=layers,
+        num_experts=num_experts, top_k=top_k, moe_ffn=moe_ffn,
+        act_dtype=Dtype.BF16,
+    )
+
+
+def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool = False) -> None:
+    """Run spec-based training estimation from a YAML config."""
+    from python.zrt.training.io.config_loader import load_specs, load_anchor_config
+    from python.zrt.training.search.estimator import estimate
+    from python.zrt.training.search.report import report_summary, report_to_json
+    from python.zrt.training.ir.opgraph_builder import build_opgraph
+    from python.zrt.training.models.flops import op_cost_from_node, total_training_flops
+    from python.zrt.training.io.excel_exporter import export_estimate_excel
+    from python.zrt.training.io.html_exporter import export_estimate_html
+
+    try:
+        model, system, strategy, capture = load_specs(config_path)
+    except (KeyError, TypeError):
+        model, system, strategy, capture = load_anchor_config(config_path)
+
+    # Build OpGraph for op-level details, then reuse it in estimate()
+    # to avoid duplicate build_opgraph() calls.
+    graph = build_opgraph(model, strategy)
+    op_costs: dict[str, object] = {}
+    for node in graph.nodes.values():
+        if not node.is_comm:
+            op_costs[node.id] = op_cost_from_node(node, model, system)
+
+    report = estimate(model, system, strategy, graph=graph, capture=capture)
+
+    if output_path:
+        # If output_path is a directory or ends with a filename without extension,
+        # use it as the base directory/name. If it ends with .xlsx/.html/.json,
+        # extract the directory and base name, then output both Excel and HTML there.
+        from pathlib import Path as _Path
+        p = _Path(output_path)
+        if p.suffix.lower() in (".xlsx", ".xls", ".html", ".json"):
+            base_dir = p.parent
+            base_name = p.stem
+        elif output_path.endswith("/") or p.is_dir():
+            base_dir = p
+            _slug = config_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            base_name = _slug
+        else:
+            base_dir = p.parent if p.parent.name else _Path(".")
+            base_name = p.name
+
+        excel_path = str(base_dir / f"{base_name}.xlsx")
+        html_path = str(base_dir / f"{base_name}.html")
+
+        export_estimate_excel(
+            report=report, graph=graph, model=model,
+            system=system, strategy=strategy,
+            op_costs=op_costs, output_path=excel_path,
+        )
+        print(f"Excel report written to {excel_path}")
+
+        export_estimate_html(
+            report=report, graph=graph, model=model,
+            system=system, strategy=strategy,
+            op_costs=op_costs, output_path=html_path,
+        )
+        print(f"HTML report written to {html_path}")
+
+        if breakdown:
+            print()
+            print(report_summary(report))
+    else:
+        # Default: write both Excel and HTML to output/estimate with timestamp
+        from datetime import datetime
+        _slug = config_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _default_base = Path("output") / "estimate" / f"{_slug}_{_ts}"
+        export_estimate_excel(
+            report=report, graph=graph, model=model,
+            system=system, strategy=strategy,
+            op_costs=op_costs, output_path=f"{_default_base}.xlsx",
+        )
+        export_estimate_html(
+            report=report, graph=graph, model=model,
+            system=system, strategy=strategy,
+            op_costs=op_costs, output_path=f"{_default_base}.html",
+        )
+        print(f"Excel report written to {_default_base}.xlsx")
+        print(f"HTML report written to {_default_base}.html")
+        print()
+        print(report_summary(report))
+
+
+def _run_search(config_path: str, output_path: str | None) -> None:
+    """Grid-search parallel strategies for a training config."""
+    from python.zrt.training.io.config_loader import load_specs
+    from python.zrt.training.search.estimator import grid_search, pareto_frontier
+    from python.zrt.training.search.space import SearchSpace
+    from python.zrt.training.search.report import report_summary, report_to_dict
+
+    model, system, strategy, _capture = load_specs(config_path)
+
+    # Preserve config-level batch settings in search space
+    space = SearchSpace(
+        micro_batch=strategy.micro_batch,
+        global_batch=strategy.global_batch,
+    )
+
+    print(f"Searching {len(space.strategies(system.world_size))} strategies...")
+    reports = grid_search(model, system, space)
+    print(f"Found {len(reports)} valid configurations.\n")
+
+    frontier = pareto_frontier(reports)
+    print(f"Pareto frontier: {len(frontier)} configurations\n")
+
+    for i, r in enumerate(frontier, 1):
+        print(f"--- Frontier config {i} ---")
+        print(report_summary(r))
+        print()
+
+    if output_path and frontier:
+        import json as _json
+        frontier_data = [report_to_dict(r) for r in frontier]
+        Path(output_path).write_text(_json.dumps(frontier_data, indent=2))
+        print(f"Pareto frontier written to {output_path}")
+
+
+if __name__ == "__main__":
+    main()
