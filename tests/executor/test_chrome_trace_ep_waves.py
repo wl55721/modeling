@@ -109,7 +109,7 @@ def test_ep_wave_trace_segments_dispatch_compute_and_combine_on_original_streams
     )
 
 
-def test_moe_fb_trace_draws_hidden_overlay_without_ep_waves():
+def test_moe_fb_trace_marks_original_all_to_all_without_overlay():
     stitched = PPStitchedTimeline(
         tasks=[
             GridTask(
@@ -168,14 +168,19 @@ def test_moe_fb_trace_draws_hidden_overlay_without_ep_waves():
     ).export_stitched_detailed(stitched, [timeline])
     events = json.loads(doc)["traceEvents"]
     names = [e.get("name", "") for e in events]
-    fb_events = [e for e in events if "moe_fb" in e.get("name", "")]
+    fb_events = [
+        e for e in events
+        if e.get("args", {}).get("overlap") == "moe_fb"
+    ]
 
     assert not any("wave" in name for name in names)
     assert len(fb_events) == 2
     assert {e["cat"] for e in fb_events} == {"communication.ep.moe_fb.hidden"}
     assert {e["tid"] for e in fb_events} == {3}
+    assert {e["args"]["op_type"] for e in fb_events} == {"comm.all_to_all"}
     assert {e["args"]["role"] for e in fb_events} == {"dispatch", "combine"}
-    assert all(e["args"]["overlap"] == "moe_fb" for e in fb_events)
+    assert all("comm.all_to_all" in e["name"] for e in fb_events)
+    assert all("moe_fb hidden" in e["name"] for e in fb_events)
 
 
 def test_ep_wave_trace_starts_region_at_grouped_matmul():

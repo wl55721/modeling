@@ -435,47 +435,19 @@ class ChromeTraceExporter:
                             continue
 
                     events.append(ChromeTraceEvent(
-                        name=name,
-                        cat=cat,
+                        name=self._moe_fb_event_name(op, name),
+                        cat=self._moe_fb_event_cat(op, cat),
                         pid=s,
                         tid=op.stream_id,
                         ts=(base + rel_start) * self._mult,
                         dur=dur_us * self._mult,
-                        args={
+                        args=self._moe_fb_event_args(op, {
                             "phase": op.phase,
                             "op_type": op.op_type,
                             "stream_type": op.stream_type,
                             "mb": m,
-                        },
+                        }),
                     ).to_dict())
-
-        if self._trace_moe_fb_overlap:
-            for s, tl in enumerate(timelines):
-                fwd_lat = tl.phase_latency("fwd")
-                bwd_lat = tl.phase_latency("bwd")
-                if fwd_lat == 0.0 and bwd_lat == 0.0:
-                    fwd_lat = tl.total_latency_us
-                stage_total = fwd_lat + bwd_lat
-                num_replicas = M if replicate else 1
-                for m in range(num_replicas):
-                    fwd_base = grid_slot.get((s, m, "fwd"), m * stage_total)
-                    bwd_base = grid_slot.get(
-                        (s, m, "bwd"),
-                        grid_slot.get((s, m, "bwd_dx"), m * stage_total + fwd_lat),
-                    )
-                    events.extend(self._moe_fb_overlap_events(
-                        tl.scheduled_ops,
-                        pid=s,
-                        detail_base=0,
-                        base=fwd_base if replicate else 0.0,
-                        mb=m if replicate else None,
-                        name_prefix=f"m{m}:" if replicate else "",
-                        rel_start=lambda candidate, bwd_base=bwd_base, fwd_base=fwd_base: (
-                            candidate.start_us
-                            if candidate.phase == "fwd" or not candidate.phase
-                            else bwd_base - fwd_base + candidate.start_us - fwd_lat
-                        ),
-                    ))
 
         events = self._deduplicate(events)
         doc = self._build_doc(events)
@@ -538,29 +510,19 @@ class ChromeTraceExporter:
                 name = f"{op.phase}:{op.op_type}" if op.phase else op.op_type
                 dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
                 events.append(ChromeTraceEvent(
-                    name=name,
-                    cat=cat,
+                    name=self._moe_fb_event_name(op, name),
+                    cat=self._moe_fb_event_cat(op, cat),
                     pid=d,
                     tid=detail_base + op.stream_id,
                     ts=op.start_us * self._mult,
                     dur=dur_us * self._mult,
-                    args={
+                    args=self._moe_fb_event_args(op, {
                         "phase": op.phase,
                         "op_type": op.op_type,
                         "stream_type": op.stream_type,
                         "view": "detail",
-                    },
+                    }),
                 ).to_dict())
-            if self._trace_moe_fb_overlap:
-                events.extend(self._moe_fb_overlap_events(
-                    tl.scheduled_ops,
-                    pid=d,
-                    detail_base=detail_base,
-                    base=0.0,
-                    mb=None,
-                    name_prefix="",
-                    rel_start=lambda candidate: candidate.start_us,
-                ))
 
         events = self._deduplicate(events)
         doc = self._build_doc(events)
@@ -660,18 +622,24 @@ class ChromeTraceExporter:
                                 )
                                 continue
                         events.append(ChromeTraceEvent(
-                            name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
-                            cat="compute" if op.stream_type != "comm" else "communication",
+                            name=self._moe_fb_event_name(
+                                op,
+                                f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
+                            ),
+                            cat=self._moe_fb_event_cat(
+                                op,
+                                "compute" if op.stream_type != "comm" else "communication",
+                            ),
                             pid=d,
                             tid=detail_base + op.stream_id,
                             ts=ts,
                             dur=dur_us * self._mult,
-                            args={
+                            args=self._moe_fb_event_args(op, {
                                 "phase": "fwd",
                                 "mb": m,
                                 "op_type": op.op_type,
                                 "view": "detail",
-                            },
+                            }),
                         ).to_dict())
 
                 bwd_base = grid_index.get((d, m, "bwd"), grid_index.get((d, m, "bwd_dx"), 0.0))
@@ -721,42 +689,25 @@ class ChromeTraceExporter:
                                 )
                                 continue
                         events.append(ChromeTraceEvent(
-                            name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
-                            cat="compute" if op.stream_type != "comm" else "communication",
+                            name=self._moe_fb_event_name(
+                                op,
+                                f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
+                            ),
+                            cat=self._moe_fb_event_cat(
+                                op,
+                                "compute" if op.stream_type != "comm" else "communication",
+                            ),
                             pid=d,
                             tid=detail_base + op.stream_id,
                             ts=ts,
                             dur=dur_us * self._mult,
-                            args={
+                            args=self._moe_fb_event_args(op, {
                                 "phase": "bwd",
                                 "mb": m,
                                 "op_type": op.op_type,
                                 "view": "detail",
-                            },
+                            }),
                         ).to_dict())
-
-        if self._trace_moe_fb_overlap:
-            for d, tl in enumerate(timelines):
-                fwd_lat = tl.phase_latency("fwd")
-                for m in range(stitched.M):
-                    fwd_base = grid_index.get((d, m, "fwd"), 0.0)
-                    bwd_base = grid_index.get(
-                        (d, m, "bwd"),
-                        grid_index.get((d, m, "bwd_dx"), 0.0),
-                    )
-                    events.extend(self._moe_fb_overlap_events(
-                        tl.scheduled_ops,
-                        pid=d,
-                        detail_base=detail_base,
-                        base=fwd_base,
-                        mb=m,
-                        name_prefix=f"m{m}:",
-                        rel_start=lambda candidate, bwd_base=bwd_base, fwd_base=fwd_base: (
-                            candidate.start_us
-                            if candidate.phase == "fwd" or not candidate.phase
-                            else bwd_base - fwd_base + candidate.start_us - fwd_lat
-                        ),
-                    ))
 
         doc = self._build_doc(events)
         if path:
@@ -765,50 +716,39 @@ class ChromeTraceExporter:
 
     # ── internals ─────────────────────────────────────────────────────────
 
-    def _moe_fb_overlap_events(
-        self,
-        ops,
-        *,
-        pid: int,
-        detail_base: int,
-        base: float,
-        mb: int | None,
-        name_prefix: str,
-        rel_start,
-    ) -> list[dict]:
-        events: list[dict] = []
-        for op in ops:
-            if not (
-                op.stream_type == "comm"
-                and op.parallelism_tag == "ep"
-                and op.op_type == "comm.all_to_all"
-                and op.comm_role in ("dispatch", "combine")
-            ):
-                continue
-            phase = op.phase or "fwd"
-            role = op.comm_role
-            events.append(ChromeTraceEvent(
-                name=f"{name_prefix}{phase}:moe_fb-hidden-{role}",
-                cat="communication.ep.moe_fb.hidden",
-                pid=pid,
-                tid=detail_base + op.stream_id,
-                ts=(base + rel_start(op)) * self._mult,
-                dur=max(op.latency_us, self._MIN_VISIBLE_US) * self._mult,
-                args={
-                    "phase": phase,
-                    "mb": mb,
-                    "op_type": op.op_type,
-                    "view": "moe_fb_overlap",
-                    "parallelism": "ep",
-                    "overlap": "moe_fb",
-                    "role": role,
-                    "hidden": True,
-                    "original_node": op.node_id,
-                    "stream_type": op.stream_type,
-                },
-                color="cq_build_passed",
-            ).to_dict())
-        return events
+    def _is_moe_fb_hidden_comm(self, op) -> bool:
+        return (
+            self._trace_moe_fb_overlap
+            and op.stream_type == "comm"
+            and op.parallelism_tag == "ep"
+            and op.op_type == "comm.all_to_all"
+            and op.comm_role in ("dispatch", "combine")
+        )
+
+    def _moe_fb_event_name(self, op, name: str) -> str:
+        if not self._is_moe_fb_hidden_comm(op):
+            return name
+        return f"{name} [moe_fb hidden {op.comm_role}]"
+
+    def _moe_fb_event_cat(self, op, cat: str) -> str:
+        if not self._is_moe_fb_hidden_comm(op):
+            return cat
+        return "communication.ep.moe_fb.hidden"
+
+    def _moe_fb_event_args(self, op, args: dict) -> dict:
+        if not self._is_moe_fb_hidden_comm(op):
+            return args
+        enriched = dict(args)
+        enriched.update({
+            "view": args.get("view", "detail"),
+            "parallelism": "ep",
+            "overlap": "moe_fb",
+            "role": op.comm_role,
+            "hidden": True,
+            "original_node": op.node_id,
+            "stream_type": op.stream_type,
+        })
+        return enriched
 
     @staticmethod
     def _is_ep_dispatch(op) -> bool:
