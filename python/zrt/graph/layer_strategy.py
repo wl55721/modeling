@@ -73,6 +73,24 @@ class LayerProfile:
     def total_layers(self) -> int:
         return len(self.layer_types)
     
+    def get_type_counts(self) -> Dict[LayerType, int]:
+        """Return a dictionary mapping LayerType to count.
+        
+        Returns:
+            Dict mapping each LayerType to the number of layers of that type.
+            Only includes types with count > 0.
+        """
+        return {
+            LayerType.DENSE: self.num_dense,
+            LayerType.MOE: self.num_moe,
+            LayerType.HCA_HASH: self.num_hca_hash,
+            LayerType.HCA_TOPK: self.num_hca_topk,
+            LayerType.CSA_HASH: self.num_csa_hash,
+            LayerType.CSA_TOPK: self.num_csa_topk,
+            LayerType.SWA_HASH: self.num_swa_hash,
+            LayerType.SWA_TOPK: self.num_swa_topk,
+        }
+    
     
 
 

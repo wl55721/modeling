@@ -878,9 +878,21 @@ class TestStructureComparison:
         result = p.run(g, _ctx())
 
         valid_prefixes = ("aten.", "spec.", "comm.")
+        valid_fusion_ops = {
+            "linear", "column_parallel_linear", "row_parallel_linear",
+            "rms_norm", "rms_norm_inline", "rms_coef",
+            "parallel_embedding", "rotary_emb",
+            "kv_compressor", "sparse_indexer", "mla_sparse_attn",
+            "moe_gate", "moe_expert_swiglu",
+            "hc_pre", "hc_post", "hc_head",
+            "swiglu", "cross_entropy", "dropout",
+        }
         for node in result.nodes.values():
-            assert any(node.op_type.startswith(p) for p in valid_prefixes), \
-                f"Invalid op_type {node.op_type} on {node.id}"
+            is_valid = (
+                any(node.op_type.startswith(p) for p in valid_prefixes)
+                or node.op_type in valid_fusion_ops
+            )
+            assert is_valid, f"Invalid op_type {node.op_type} on {node.id}"
 
 
 # ---------------------------------------------------------------------------

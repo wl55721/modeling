@@ -17,9 +17,14 @@ structural no-op (graph is already at module granularity).
 """
 from __future__ import annotations
 
+import fnmatch
+import math
+import os
 import re
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
+
+import yaml
 
 from python.zrt.ir.edge import Edge
 from python.zrt.ir.node import OpNode, infer_category
@@ -29,6 +34,128 @@ from python.zrt.transform.base import GraphPass
 if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
     from python.zrt.transform.context import TransformContext
+
+
+# ---------------------------------------------------------------------------
+# YAML rule loader
+# ---------------------------------------------------------------------------
+
+_COARSEN_RULES: list[dict[str, Any]] = []
+_RULES_LOADED = False
+
+
+def _load_coarsen_rules() -> list[dict[str, Any]]:
+    """Load coarsen rules from coarsen_rules.yaml (cached at module level)."""
+    global _COARSEN_RULES, _RULES_LOADED
+    if _RULES_LOADED:
+        return _COARSEN_RULES
+
+    rules_path = os.path.join(os.path.dirname(__file__), "coarsen_rules.yaml")
+    if os.path.exists(rules_path):
+        with open(rules_path, "r", encoding="utf-8") as f:
+            _COARSEN_RULES = yaml.safe_load(f) or []
+    else:
+        _COARSEN_RULES = []
+    _RULES_LOADED = True
+    return _COARSEN_RULES
+
+
+def _match_rule(scope: str, module_class: str, rules: list[dict]) -> dict | None:
+    """Find the highest-priority rule matching the given scope and module_class."""
+    base_scope = scope.split("@")[0] if "@" in scope else scope
+    candidates = []
+    for rule in rules:
+        pattern = rule.get("scope_pattern", "")
+        if not fnmatch.fnmatch(base_scope, pattern):
+            continue
+        rule_classes = rule.get("module_classes", [])
+        if rule_classes and module_class and module_class not in rule_classes:
+            continue
+        candidates.append(rule)
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: r.get("priority", 0))
+
+
+def _extract_shape_vars(inputs: list, outputs: list, graph: "OpGraph") -> dict[str, float]:
+    """Extract shape variables (B, S, H, Ho, Hi, T) from tensor lists."""
+    vars_: dict[str, float] = {}
+
+    all_tensors = list(inputs or []) + list(outputs or [])
+
+    for t in all_tensors:
+        s = t.shape if hasattr(t, "shape") else t
+        if len(s) >= 4:
+            if "B" not in vars_:
+                vars_["B"] = s[0]
+                vars_["S"] = s[1]
+            H_candidate = 1
+            for d in s[2:]:
+                H_candidate *= d
+            if H_candidate > vars_.get("H", 0):
+                vars_["H"] = H_candidate
+        elif len(s) >= 3:
+            if "B" not in vars_:
+                vars_["B"] = s[0]
+                vars_["S"] = s[1]
+            if s[-1] > vars_.get("H", 0):
+                vars_["H"] = s[-1]
+        elif len(s) == 2:
+            if "B" not in vars_:
+                vars_["B"] = 1
+                vars_["S"] = s[0]
+            if s[-1] > vars_.get("H", 0):
+                vars_["H"] = s[-1]
+            if s[0] > s[1]:
+                vars_["Hi"] = max(vars_.get("Hi", 0), s[0])
+
+    if outputs:
+        last_out = outputs[-1]
+        shape = last_out.shape if hasattr(last_out, "shape") else last_out
+        if shape:
+            if len(shape) >= 4:
+                vars_["Ho"] = 1
+                for d in shape[2:]:
+                    vars_["Ho"] *= d
+            else:
+                vars_["Ho"] = shape[-1]
+            if len(shape) >= 2:
+                vars_["Hc"] = shape[-1]
+
+    vars_["T"] = vars_.get("B", 1) * vars_.get("S", 1)
+
+    meta = graph.metadata
+    H = vars_.get("H", 7168)
+    vars_["E"] = meta.get("moe_total_experts", meta.get("num_experts", 384))
+    vars_["K"] = meta.get("moe_active_experts", meta.get("top_k", 6))
+    vars_["V"] = meta.get("vocab_size", 129280)
+    vars_["D"] = meta.get("head_dim", 128)
+    vars_["N"] = meta.get("num_heads", max(1, int(H // vars_["D"])))
+    vars_["R"] = meta.get("compress_ratio", 4)
+    vars_["Hi"] = vars_.get("Hi", meta.get("ffn_hidden", meta.get("moe_ffn", H * 4)))
+
+    for key in ("B", "S", "H", "Ho", "Hi", "T", "E", "K", "V", "N", "D", "R", "Hc"):
+        vars_.setdefault(key, 1)
+
+    return vars_
+
+
+def _eval_formula(formula: str, vars_: dict[str, float]) -> float:
+    """Safely evaluate a formula string with the given variables."""
+    if not formula:
+        return 0.0
+    try:
+        safe_dict = {
+            "max": max, "min": min, "abs": abs,
+            "log2": lambda x: math.log2(max(x, 1)),
+            "sqrt": math.sqrt,
+            **vars_,
+        }
+        result = eval(formula, {"__builtins__": {}}, safe_dict)
+        return float(result) if result is not None else 0.0
+    except Exception:
+        return 0.0
 
 
 class GraphCoarsenPass(GraphPass):
@@ -52,8 +179,8 @@ class GraphCoarsenPass(GraphPass):
         if _is_block_level(graph):
             return graph
 
-        if _has_backward_nodes(graph):
-            return graph
+        # if _has_backward_nodes(graph):
+        #     return graph
 
         g = graph.clone()
 
@@ -418,38 +545,64 @@ def _is_moe_context(scope: str, component: str) -> bool:
     return False
 
 
-def _spec_kind_to_op_type(spec_kind: str) -> str:
-    """Map ``spec_kind`` to a canonical ``op_type`` string."""
+_MODULE_CLASS_TO_OP_TYPE: dict[str, str] = {
+    "Linear": "linear",
+    "ColumnParallelLinear": "column_parallel_linear",
+    "RowParallelLinear": "row_parallel_linear",
+    "RMSNorm": "rms_norm",
+    "LlamaRMSNorm": "rms_norm",
+    "Qwen2RMSNorm": "rms_norm",
+    "DeepseekV3RMSNorm": "rms_norm",
+    "LayerNorm": "rms_norm",
+    "ParallelEmbedding": "parallel_embedding",
+    "Embedding": "parallel_embedding",
+    "RotaryEmbedding": "rotary_emb",
+    "LlamaRotaryEmbedding": "rotary_emb",
+    "Compressor": "kv_compressor",
+    "Indexer": "sparse_indexer",
+    "Attention": "mla_sparse_attn",
+    "Gate": "moe_gate",
+    "Expert": "moe_expert_swiglu",
+    "HCPreAttn": "hc_pre",
+    "HCPreFfn": "hc_pre",
+    "HCPostAttn": "hc_post",
+    "HCPostFfn": "hc_post",
+    "HCHead": "hc_head",
+    "SiLU": "swiglu",
+    "SwiGLU": "swiglu",
+    "ParallelHead": "linear",
+}
+
+
+def _module_class_to_op_type(module_class: str, spec_kind: str) -> str:
+    """Map module_class to FusionPass-compatible op_type.
+
+    Falls back to spec_kind-based mapping for unknown module classes.
+    """
+    if module_class and module_class in _MODULE_CLASS_TO_OP_TYPE:
+        return _MODULE_CLASS_TO_OP_TYPE[module_class]
     _KIND_TO_OP = {
-        "matmul": "aten.mm.default",
-        "attn_core": "aten.scaled_dot_product_attention.default",
-        "sparse_attn": "aten.scaled_dot_product_attention.default",
-        "hca_attn": "aten.scaled_dot_product_attention.default",
-        "swa_attn": "aten.scaled_dot_product_attention.default",
-        "rmsnorm": "aten.rms_norm.default",
-        "ln": "aten.native_layer_norm.default",
-        "rope": "aten.rope.default",
-        "swiglu": "aten.silu.default",
-        "add": "aten.add.Tensor",
-        "softmax": "aten._softmax.default",
-        "embed": "aten.embedding.default",
-        "lm_head": "aten.mm.default",
-        "router": "aten.mm.default",
-        "expert": "spec.expert",
-        "shared_expert": "spec.shared_expert",
-        "indexer": "spec.indexer",
-        "compressor": "spec.compressor",
-        "compressor_pool": "spec.compressor_pool",
-        "mhc_pre": "spec.mhc_pre",
-        "mhc_post": "spec.mhc_post",
-        "mhc_head": "spec.mhc_head",
-        "hc_pre": "spec.hc_pre",
-        "hc_post": "spec.hc_post",
-        "hash_route": "spec.hash_route",
-        "indexer_topk": "spec.indexer_topk",
-        "cast": "spec.cast",
+        "matmul": "linear",
+        "attn_core": "mla_sparse_attn",
+        "sparse_attn": "mla_sparse_attn",
+        "hca_attn": "mla_sparse_attn",
+        "swa_attn": "mla_sparse_attn",
+        "rmsnorm": "rms_norm",
+        "ln": "rms_norm",
+        "rope": "rotary_emb",
+        "swiglu": "swiglu",
+        "embed": "parallel_embedding",
+        "lm_head": "linear",
+        "router": "moe_gate",
+        "expert": "moe_expert_swiglu",
+        "shared_expert": "moe_expert_swiglu",
+        "indexer": "sparse_indexer",
+        "compressor": "kv_compressor",
+        "mhc_pre": "hc_pre",
+        "mhc_post": "hc_post",
+        "mhc_head": "hc_head",
     }
-    return _KIND_TO_OP.get(spec_kind, f"spec.{spec_kind}")
+    return _KIND_TO_OP.get(spec_kind, spec_kind)
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +719,30 @@ def _build_aggregated_node(
             elif k not in annotations:
                 annotations[k] = v
 
-    op_type = _spec_kind_to_op_type(spec_kind)
+    rules = _load_coarsen_rules()
+    rule = _match_rule(scope, module_class, rules)
+    if rule and not annotations.get("flops"):
+        coarsened_inputs = list(first.inputs)
+        coarsened_outputs = list(last.outputs)
+        shape_vars = _extract_shape_vars(coarsened_inputs, coarsened_outputs, graph)
+        fwd_flops = _eval_formula(rule.get("flops_formula", ""), shape_vars)
+        mem_bytes = _eval_formula(rule.get("memory_formula", ""), shape_vars)
+        grad_ratio = rule.get("grad_ratio", {})
+        dx_ratio = grad_ratio.get("dx", 0)
+        dw_ratio = grad_ratio.get("dw", 0)
+
+        annotations["flops"] = int(fwd_flops)
+        annotations["read_bytes"] = int(mem_bytes * 0.6)
+        annotations["write_bytes"] = int(mem_bytes * 0.4)
+        annotations["flops_fwd"] = int(fwd_flops)
+        annotations["flops_dx"] = int(fwd_flops * dx_ratio)
+        annotations["flops_dw"] = int(fwd_flops * dw_ratio)
+
+        rule_annots = rule.get("annotations", {})
+        for k, v in rule_annots.items():
+            annotations.setdefault(f"coarsen.{k}", v)
+
+    op_type = _module_class_to_op_type(module_class, spec_kind)
     category = infer_category(op_type, component)
 
     fused_from = [n.op_type for n in nodes]

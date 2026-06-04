@@ -20,6 +20,73 @@ logger = logging.getLogger(__name__)
 _BWD_PHASES = {"bwd", "backward", "train_backward"}
 
 
+def _aggregate_by_layer_type(
+    graph: "OpGraph",
+    layer_profile: Any,
+    typical_indices: list[int],
+    value_getter: callable,
+    aggregator: str = "sum",
+) -> dict[Any, float]:
+    """Aggregate node values by layer type from typical layers.
+    
+    Shared utility for both FLOPs and latency scaling.
+    
+    Args:
+        graph: OpGraph with node annotations
+        layer_profile: LayerProfile with layer_types
+        typical_indices: List of typical layer indices (one per unique layer type)
+        value_getter: Function(node) -> float to extract value from each node
+        aggregator: "sum" or "avg" - how to aggregate across typical layers of same type
+    
+    Returns:
+        dict[LayerType, float] mapping layer type to aggregated value
+    """
+    from python.zrt.graph.layer_strategy import LayerType
+    from collections import defaultdict
+    
+    # Group nodes by layer index
+    layer_values: dict[int, float] = defaultdict(float)
+    
+    for node in graph.nodes.values():
+        layer = node.annotations.get("layer") or getattr(node, "layer", "")
+        if not layer:
+            continue
+        
+        try:
+            layer_idx = int(layer)
+        except (ValueError, TypeError):
+            continue
+        
+        if layer_idx not in typical_indices:
+            continue
+        
+        value = value_getter(node)
+        if value > 0:
+            layer_values[layer_idx] += value
+    
+    # Aggregate by layer type
+    values_by_type: dict[Any, list[float]] = defaultdict(list)
+    
+    for layer_idx in typical_indices:
+        if layer_idx >= len(layer_profile.layer_types):
+            continue
+        layer_type = layer_profile.layer_types[layer_idx]
+        
+        if layer_idx in layer_values:
+            values_by_type[layer_type].append(layer_values[layer_idx])
+    
+    # Apply aggregation
+    result: dict[Any, float] = {}
+    for layer_type, values in values_by_type.items():
+        if values:
+            if aggregator == "avg":
+                result[layer_type] = sum(values) / len(values)
+            else:  # sum
+                result[layer_type] = sum(values)
+    
+    return result
+
+
 # ── TrainingFlopsPass ───────────────────────────────────────────────────────────
 
 class TrainingFlopsPass(GraphPass):
@@ -101,7 +168,12 @@ class TrainingFlopsPass(GraphPass):
 
         if forward_flops > 0 or backward_flops > 0:
             # Per-node annotations available — scale to full model
-            if layer_scale != 1.0:
+            # Use per-layer-type scaling when LayerProfile is available
+            if layer_profile is not None and typical_indices is not None:
+                forward_flops, backward_flops = self._scale_by_layer_type(
+                    g, forward_flops, backward_flops, layer_profile, typical_indices
+                )
+            elif layer_scale != 1.0:
                 forward_flops = int(forward_flops * layer_scale)
                 backward_flops = int(backward_flops * layer_scale)
             training_flops = forward_flops + backward_flops
@@ -135,6 +207,88 @@ class TrainingFlopsPass(GraphPass):
         g.metadata["recompute_flops"] = recompute_flops
 
         return g
+
+    def _scale_by_layer_type(
+        self,
+        graph: "OpGraph",
+        forward_flops: int,
+        backward_flops: int,
+        layer_profile,
+        typical_indices: list[int],
+    ) -> tuple[int, int]:
+        """Scale FLOPs using per-layer-type counts from LayerProfile.
+        
+        For heterogeneous models (e.g., V4 with HCA/CSA/SWA layers), this is more
+        accurate than simple num_layers / num_typical scaling.
+        
+        Logic:
+        1. Extract per-layer FLOPs for each typical layer
+        2. Map each typical layer to its layer type
+        3. Multiply each type's FLOPs by the count of that type in the full model
+        4. Sum all types to get total FLOPs
+        """
+        from python.zrt.graph.layer_strategy import LayerType
+        
+        is_stitched = graph.metadata.get("fwd_bwd_stitched", False)
+        
+        # Define value getters for forward and backward FLOPs
+        if is_stitched:
+            # Stitched graph: backward FLOPs are in flops_fwd for bwd-phase nodes
+            def fwd_getter(node):
+                phase = node.annotations.get("phase", "fwd")
+                return node.annotations.get("flops_fwd", 0) if phase not in _BWD_PHASES else 0
+            
+            def bwd_getter(node):
+                phase = node.annotations.get("phase", "")
+                return node.annotations.get("flops_fwd", 0) if phase in _BWD_PHASES else 0
+        else:
+            # Non-stitched graph: backward FLOPs are in flops_dx + flops_dw
+            def fwd_getter(node):
+                return node.annotations.get("flops_fwd", 0)
+            
+            def bwd_getter(node):
+                return node.annotations.get("flops_dx", 0) + node.annotations.get("flops_dw", 0)
+        
+        # Use shared utility to aggregate by layer type
+        type_fwd_flops = _aggregate_by_layer_type(
+            graph, layer_profile, typical_indices, fwd_getter, aggregator="sum"
+        )
+        type_bwd_flops = _aggregate_by_layer_type(
+            graph, layer_profile, typical_indices, bwd_getter, aggregator="sum"
+        )
+        
+        # Scale by layer type counts
+        scaled_fwd = 0
+        scaled_bwd = 0
+        
+        for layer_type, count in layer_profile.get_type_counts().items():
+            if count > 0:
+                scaled_fwd += type_fwd_flops.get(layer_type, 0) * count
+                scaled_bwd += type_bwd_flops.get(layer_type, 0) * count
+        
+        # Add non-layer FLOPs (embed, lm_head, etc.) scaled by simple ratio
+        non_layer_fwd = sum(
+            fwd_getter(n) for n in graph.nodes.values()
+            if not (n.annotations.get("layer") or getattr(n, "layer", ""))
+        )
+        non_layer_bwd = sum(
+            bwd_getter(n) for n in graph.nodes.values()
+            if not (n.annotations.get("layer") or getattr(n, "layer", ""))
+        )
+        
+        num_typical = len(typical_indices)
+        num_layers = layer_profile.total_layers
+        non_layer_scale = num_layers / num_typical if num_typical > 0 else 1.0
+        scaled_fwd += int(non_layer_fwd * non_layer_scale)
+        scaled_bwd += int(non_layer_bwd * non_layer_scale)
+        
+        logger.info(
+            "_scale_by_layer_type: fwd=%d -> %d, bwd=%d -> %d (scale=%.2f)",
+            forward_flops, scaled_fwd, backward_flops, scaled_bwd,
+            (scaled_fwd + scaled_bwd) / max(forward_flops + backward_flops, 1),
+        )
+        
+        return scaled_fwd, scaled_bwd
 
 
 # ── TrainingMemoryPass ──────────────────────────────────────────────────────────
@@ -691,25 +845,14 @@ class TrainingPipelinePass(GraphPass):
                         self._scale_compute_by_layer_type(g, layer_profile, typical_indices)
                     )
                     
-                    layer_counts = {
-                        LayerType.DENSE: layer_profile.num_dense,
-                        LayerType.MOE: layer_profile.num_moe,
-                        LayerType.HCA_HASH: layer_profile.num_hca_hash,
-                        LayerType.HCA_TOPK: layer_profile.num_hca_topk,
-                        LayerType.CSA_HASH: layer_profile.num_csa_hash,
-                        LayerType.CSA_TOPK: layer_profile.num_csa_topk,
-                        LayerType.SWA_HASH: layer_profile.num_swa_hash,
-                        LayerType.SWA_TOPK: layer_profile.num_swa_topk,
-                    }
-                    
                     total_fwd_us = sum(
                         per_layer_fwd.get(lt, 0.0) * count
-                        for lt, count in layer_counts.items()
+                        for lt, count in layer_profile.get_type_counts().items()
                         if count > 0
                     )
                     total_bwd_us = sum(
                         per_layer_bwd.get(lt, 0.0) * count
-                        for lt, count in layer_counts.items()
+                        for lt, count in layer_profile.get_type_counts().items()
                         if count > 0
                     )
                     
@@ -779,25 +922,14 @@ class TrainingPipelinePass(GraphPass):
                     self._scale_compute_by_layer_type(g, layer_profile, typical_indices)
                 )
                 
-                layer_counts = {
-                    LayerType.DENSE: layer_profile.num_dense,
-                    LayerType.MOE: layer_profile.num_moe,
-                    LayerType.HCA_HASH: layer_profile.num_hca_hash,
-                    LayerType.HCA_TOPK: layer_profile.num_hca_topk,
-                    LayerType.CSA_HASH: layer_profile.num_csa_hash,
-                    LayerType.CSA_TOPK: layer_profile.num_csa_topk,
-                    LayerType.SWA_HASH: layer_profile.num_swa_hash,
-                    LayerType.SWA_TOPK: layer_profile.num_swa_topk,
-                }
-                
                 fwd = sum(
                     per_layer_fwd.get(lt, 0.0) * count
-                    for lt, count in layer_counts.items()
+                    for lt, count in layer_profile.get_type_counts().items()
                     if count > 0
                 )
                 bwd = sum(
                     per_layer_bwd.get(lt, 0.0) * count
-                    for lt, count in layer_counts.items()
+                    for lt, count in layer_profile.get_type_counts().items()
                     if count > 0
                 )
                 
@@ -1074,30 +1206,19 @@ class TrainingPipelinePass(GraphPass):
                 self._scale_compute_by_layer_type(g, layer_profile, typical_indices)
             )
             
-            layer_counts = {
-                LayerType.DENSE: layer_profile.num_dense,
-                LayerType.MOE: layer_profile.num_moe,
-                LayerType.HCA_HASH: layer_profile.num_hca_hash,
-                LayerType.HCA_TOPK: layer_profile.num_hca_topk,
-                LayerType.CSA_HASH: layer_profile.num_csa_hash,
-                LayerType.CSA_TOPK: layer_profile.num_csa_topk,
-                LayerType.SWA_HASH: layer_profile.num_swa_hash,
-                LayerType.SWA_TOPK: layer_profile.num_swa_topk,
-            }
-            
             fwd_compute_ms = sum(
                 per_layer_fwd.get(lt, 0.0) * count / 1000.0
-                for lt, count in layer_counts.items()
+                for lt, count in layer_profile.get_type_counts().items()
                 if count > 0 and lt in per_layer_fwd
             )
             bwd_compute_ms = sum(
                 per_layer_bwd.get(lt, 0.0) * count / 1000.0
-                for lt, count in layer_counts.items()
+                for lt, count in layer_profile.get_type_counts().items()
                 if count > 0 and lt in per_layer_bwd
             )
             recompute_compute_ms = sum(
                 per_layer_recompute.get(lt, 0.0) * count / 1000.0
-                for lt, count in layer_counts.items()
+                for lt, count in layer_profile.get_type_counts().items()
                 if count > 0 and lt in per_layer_recompute
             )
         else:
@@ -1388,90 +1509,50 @@ class TrainingPipelinePass(GraphPass):
             (per_layer_fwd_us, per_layer_bwd_us, per_layer_recompute_us)
             Each is a dict[LayerType, float] mapping layer type to average latency per layer.
         """
-        from python.zrt.graph.layer_strategy import LayerType
-        from collections import defaultdict
-
         def _is_bwd_node(node):
             return node.annotations.get("phase", "") in _BWD_PHASES
 
         def _is_recompute_node(node):
             return is_external_recompute_node(node)
 
-        # Group nodes by layer index
-        layer_fwd_total: dict[int, float] = defaultdict(float)
-        layer_bwd_total: dict[int, float] = defaultdict(float)
-        layer_recompute_total: dict[int, float] = defaultdict(float)
+        # Define value getters that filter out comm/optimizer nodes
+        def fwd_getter(node):
+            if node.category == "communication" or node.annotations.get("optimizer_step"):
+                return 0.0
+            if _is_recompute_node(node) or _is_bwd_node(node):
+                return 0.0
+            return node.annotations.get("latency_us", 0.0)
 
-        for node in g.nodes.values():
-            layer = node.annotations.get("layer") or getattr(node, "layer", "")
-            if not layer:
-                continue
+        def bwd_getter(node):
+            if node.category == "communication" or node.annotations.get("optimizer_step"):
+                return 0.0
+            if _is_recompute_node(node) or not _is_bwd_node(node):
+                return 0.0
+            return node.annotations.get("latency_us", 0.0)
 
-            try:
-                layer_idx = int(layer)
-            except (ValueError, TypeError):
-                continue
-
-            if layer_idx not in typical_indices:
-                continue
-
-            if layer_idx >= len(layer_profile.layer_types):
-                continue
-
+        def recompute_getter(node):
+            if node.category == "communication" or node.annotations.get("optimizer_step"):
+                return 0.0
+            if not _is_recompute_node(node):
+                return 0.0
             latency = node.annotations.get("latency_us", 0.0)
+            return node.annotations.get("base_latency_us", latency)
 
-            if node.category == "communication":
-                continue
-            if node.annotations.get("optimizer_step"):
-                continue
-
-            if _is_recompute_node(node):
-                base_lat = node.annotations.get("base_latency_us", latency)
-                layer_recompute_total[layer_idx] += base_lat
-            elif _is_bwd_node(node):
-                layer_bwd_total[layer_idx] += latency
-            else:
-                layer_fwd_total[layer_idx] += latency
-
-        # Aggregate by layer type, averaging across typical layers of same type
-        typical_fwd_by_type: dict[Any, list[float]] = defaultdict(list)
-        typical_bwd_by_type: dict[Any, list[float]] = defaultdict(list)
-        typical_recompute_by_type: dict[Any, list[float]] = defaultdict(list)
-
-        for layer_idx in typical_indices:
-            if layer_idx >= len(layer_profile.layer_types):
-                continue
-            layer_type = layer_profile.layer_types[layer_idx]
-            
-            if layer_idx in layer_fwd_total:
-                typical_fwd_by_type[layer_type].append(layer_fwd_total[layer_idx])
-            if layer_idx in layer_bwd_total:
-                typical_bwd_by_type[layer_type].append(layer_bwd_total[layer_idx])
-            if layer_idx in layer_recompute_total:
-                typical_recompute_by_type[layer_type].append(layer_recompute_total[layer_idx])
-
-        per_layer_fwd: dict[Any, float] = {}
-        per_layer_bwd: dict[Any, float] = {}
-        per_layer_recompute: dict[Any, float] = {}
-
-        for layer_type, latencies in typical_fwd_by_type.items():
-            if latencies:
-                per_layer_fwd[layer_type] = sum(latencies) / len(latencies)
-        
-        for layer_type, latencies in typical_bwd_by_type.items():
-            if latencies:
-                per_layer_bwd[layer_type] = sum(latencies) / len(latencies)
-        
-        for layer_type, latencies in typical_recompute_by_type.items():
-            if latencies:
-                per_layer_recompute[layer_type] = sum(latencies) / len(latencies)
+        # Use shared utility to aggregate by layer type (with averaging)
+        per_layer_fwd = _aggregate_by_layer_type(
+            g, layer_profile, typical_indices, fwd_getter, aggregator="avg"
+        )
+        per_layer_bwd = _aggregate_by_layer_type(
+            g, layer_profile, typical_indices, bwd_getter, aggregator="avg"
+        )
+        per_layer_recompute = _aggregate_by_layer_type(
+            g, layer_profile, typical_indices, recompute_getter, aggregator="avg"
+        )
 
         logger.info(
-            "_scale_compute_by_layer_type: per_layer_fwd=%s us, per_layer_bwd=%s us, "
-            "typical_layers_per_type=%s",
+            "_scale_compute_by_layer_type: per_layer_fwd=%s us, per_layer_bwd=%s us",
             {k.value: f"{v:.1f}" for k, v in per_layer_fwd.items()},
             {k.value: f"{v:.1f}" for k, v in per_layer_bwd.items()},
-            {k.value: len(v) for k, v in typical_fwd_by_type.items()},
         )
 
         return per_layer_fwd, per_layer_bwd, per_layer_recompute

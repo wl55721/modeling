@@ -130,14 +130,16 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
              condition=lambda c: c.is_training and c.training.tp_coc)
     pipe.add("split", PipelineParallelPass(),
              condition=lambda c: c.parallel.pp > 1)
-    # GraphCoarsenPass aggregates aten-level nodes into block-level nodes
-    # by leaf module scope.  No-op for already block-level inputs and for
-    # stitched fwd+bwd graphs (which have reversed gradient-flow edges
-    # that would create cycles after coarsening).
-    pipe.add("split", GraphCoarsenPass())
+    # GraphCoarsenPass and FusionPass are mutually exclusive:
+    # - GraphCoarsenPass: aggregates aten ops by scope into block-level nodes
+    # - FusionPass: fuses aten ops by module_class + rich rules
+    # When "coarsen" is in optim_flags, use GraphCoarsenPass; otherwise FusionPass.
+    pipe.add("split", GraphCoarsenPass(),
+             condition=lambda c: "coarsen" in c.optim_flags)
 
     # ── Stage 2: Fuse ─────────────────────────────────────────────────────────
-    pipe.add("fuse", FusionPass())
+    pipe.add("fuse", FusionPass(),
+             condition=lambda c: "coarsen" not in c.optim_flags)
 
     # ── Stage 3: Optim ────────────────────────────────────────────────────────
     pipe.add("optim", QuantizationPass(),
