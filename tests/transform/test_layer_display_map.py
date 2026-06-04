@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import openpyxl
-import pytest
 
 from python.zrt.graph.layer_strategy import LayerProfile, LayerType
 from python.zrt.ir.graph import Edge, OpGraph
