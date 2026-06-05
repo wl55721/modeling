@@ -1,0 +1,38 @@
+{
+  "name": "Compressor",
+  "description": "KV Cache Compressor: compresses key-value representations for reduced memory footprint",
+  "inputs": [
+    {
+      "name": "kv",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [
+    {
+      "name": "wkv",
+      "shape": "[head_dim, hidden_size]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "wgate",
+      "shape": "[head_dim, hidden_size]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "ape",
+      "shape": "[compress_ratio, head_dim]",
+      "dtype": "fp32"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "kv",
+      "shape": "[B, S // compress_ratio, head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "4 * B * S * hidden_size * head_dim * fp16",
+  "module": "attn.compressor",
+  "category": "MLA"
+}

@@ -1,0 +1,43 @@
+{
+  "name": "MLAPrologV4",
+  "description": "MLA Prolog DeepSeek-V4: projects hidden states to Q and compressed KV for Multi-Head Latent Attention",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [
+    {
+      "name": "wq_a",
+      "shape": "[q_lora_rank, hidden_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "wq_b",
+      "shape": "[num_attention_heads // tp_size * head_dim, q_lora_rank]",
+      "dtype": "int8"
+    },
+    {
+      "name": "wkv",
+      "shape": "[head_dim, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "query_nope",
+      "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "key_nope",
+      "shape": "[B, S, 1, head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "2*B*S*hidden_dim*q_lora_rank*fp16 + 2*B*S*q_lora_rank*num_attention_heads//tp_size*head_dim*int8 + 2*B*S*hidden_dim*head_dim*fp16 + 4*B*S*(q_lora_rank+num_attention_heads//tp_size*head_dim+head_dim)*fp32",
+  "module": "attn",
+  "category": "MLA"
+}

@@ -1,0 +1,74 @@
+[
+    {
+        "name": "MLAPrologV4",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_dim]",
+                "dtype": "fp16"
+            }
+        ],
+        "params": [
+            {
+                "name": "q_a",
+                "shape": "[q_lora_rank, hidden_dim]",
+                "dtype": "fp16"
+            },
+            {
+                "name": "q_b",
+                "shape": "[num_attention_heads // tp_size * head_dim, q_lora_rank]",
+                "dtype": "int8"
+            },
+            {
+                "name": "wkv",
+                "shape": "[head_dim, hidden_dim]",
+                "dtype": "fp16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "query_nope",
+                "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+                "dtype": "fp16"
+            },
+            {
+                "name": "key_nope",
+                "shape": "[B, S, 1, head_dim]",
+                "dtype": "fp16"
+            }
+        ],
+        "compute_flops": "2*B*S*hidden_dim*q_lora_rank*fp16 + 2*B*S*q_lora_rank*num_attention_heads//tp_size*head_dim*int8 + 2*B*S*hidden_dim*head_dim*fp16 + 4*B*S*(q_lora_rank+num_attention_heads//tp_size*head_dim+head_dim)*fp32",
+        "module": "attn"
+    },
+    {
+        "name": "MLAEpilogV4",
+        "inputs": [
+            {
+                "name": "attn_out",
+                "shape": "[B, S, o_groups, num_attention_heads * head_dim // o_groups]",
+                "dtype": "fp16"
+            }
+        ],
+        "params": [
+            {
+                "name": "wo_a",
+                "shape": "[o_groups * o_lora_rank // o_tp_size, num_attention_heads * head_dim // o_groups]",
+                "dtype": "fp16"
+            },
+            {
+                "name": "wo_b",
+                "shape": "[hidden_size, o_groups * o_lora_rank // o_tp_size]",
+                "dtype": "fp8"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "y",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "fp16"
+            }
+        ],
+        "compute_flops": "2*B*S*o_groups*o_lora_rank//o_tp_size*num_attention_heads*head_dim//o_groups*fp16 + 2*B*S*o_groups*o_lora_rank//o_tp_size*hidden_size*fp8",
+        "module": "attn.o_proj"
+    }
+]

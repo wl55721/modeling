@@ -1,0 +1,78 @@
+[
+    {
+        "name": "MatMul",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "int8"
+            }
+        ],
+        "params": [
+            {
+                "name": "weight",
+                "shape": "[2 * moe_intermediate_size, hidden_size]",
+                "dtype": "int8"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "y",
+                "shape": "[B, S, 2 * moe_intermediate_size]",
+                "dtype": "fp16"
+            }
+        ],
+        "compute_flops": "2 * B * S * hidden_size * 2 * moe_intermediate_size * int8",
+        "module": "moe.shared_expert.gate_up_proj"
+    },
+    {
+        "name": "SwiGluQuant",
+        "inputs": [
+            {
+                "name": "gate_out",
+                "shape": "[B, S, 2 * moe_intermediate_size]",
+                "dtype": "fp16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, moe_intermediate_size]",
+                "dtype": "int8"
+            },
+            {
+                "name": "scale",
+                "shape": "[B, S]",
+                "dtype": "fp32"
+            }
+        ],
+        "compute_flops": "11 * B * S * moe_intermediate_size * fp16",
+        "module": "moe.shared_expert.act_fn"
+    },
+    {
+        "name": "MatMul",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "int8"
+            }
+        ],
+        "params": [
+            {
+                "name": "weight",
+                "shape": "[moe_intermediate_size, hidden_size]",
+                "dtype": "int8"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "y",
+                "shape": "[B, S, moe_intermediate_size]",
+                "dtype": "fp16"
+            }
+        ],
+        "compute_flops": "2 * B * S * hidden_size * moe_intermediate_size * int8",
+        "module": "moe.shared_expert.down_proj"
+    }
+]

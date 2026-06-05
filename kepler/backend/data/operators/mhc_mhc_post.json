@@ -1,0 +1,37 @@
+{
+  "name": "MHCPost",
+  "description": "hc_post for deepseek-v4: projects MHC output back to hidden_dim",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "bf16"
+    },
+    {
+      "name": "residual",
+      "shape": "[B, S, hc_mult, hidden_size]",
+      "dtype": "bf16"
+    },
+    {
+      "name": "post",
+      "shape": "[B, S, hc_mult]",
+      "dtype": "fp32"
+    },
+    {
+      "name": "comb",
+      "shape": "[B, S, hc_mult, hc_mult]",
+      "dtype": "fp32"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, hc_mult, hidden_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "compute_flops": "2*B*S*hc_mult*hidden_size*fp32 + B*S*hc_mult*(hc_mult+hc_mult-1)*hidden_size*fp32",
+  "module": "mhc_post",
+  "category": "MHC"
+}

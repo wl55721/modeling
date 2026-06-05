@@ -1,0 +1,23 @@
+{
+  "name": "KVCompressorEpilog",
+  "description": "KV Compressor Epilog: reconstructs KV cache from compressed representation",
+  "inputs": [
+    {
+      "name": "kv",
+      "shape": "[B, S // compress_ratio, head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "kv",
+      "shape": "[B, S // compress_ratio, head_dim]",
+      "dtype": "fp8"
+    }
+  ],
+  "compute_flops": "factor * 2 * B * S // compress_ratio * head_dim * fp16",
+  "module": "attn.compressor",
+  "category": "MLA",
+  "tips": "factor=1(prefill) 0.25(decode, compress_ratio=4), 0.008(decode, compress_ratio=128)"
+}

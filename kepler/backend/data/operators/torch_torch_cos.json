@@ -1,0 +1,22 @@
+{
+  "name": "TorchCos",
+  "description": "Element-wise cosine: y = cos(x)",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "0",
+  "module": "attn",
+  "category": "Torch"
+}

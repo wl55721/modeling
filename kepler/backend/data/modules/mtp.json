@@ -1,0 +1,233 @@
+[
+    {
+        "name": "Embedding",
+        "module": "mtp.embed",
+        "inputs": [
+            {
+                "name": "token_ids",
+                "shape": "[B, S]",
+                "dtype": "int64"
+            }
+        ],
+        "params": [
+            {
+                "name": "weight",
+                "shape": "[vocab_size // embed_tp_size, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "embeddings",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "0"
+    },
+    {
+        "name": "AllReduce",
+        "module": "mtp.embed",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "params": [],
+        "outputs": [
+            {
+                "name": "y",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "0"
+    },
+    {
+        "name": "RMSNorm",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "hidden_states",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "4 * B * S * hidden_size * fp32",
+        "module": "mtp.e_norm"
+    },
+    {
+        "name": "RMSNorm",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "hidden_states",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "4 * B * S * hidden_size * fp32",
+        "module": "mtp.h_norm"
+    },
+    {
+        "name": "Linear",
+        "description": "Dense linear transformation Y = X @ W^T",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "params": [
+            {
+                "name": "weight",
+                "shape": "[hidden_size, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "y",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "2 * B * S * hidden_size * hidden_size * bf16",
+        "module": "mtp.e_proj",
+        "category": "Linear"
+    },
+    {
+        "name": "Linear",
+        "description": "Dense linear transformation Y = X @ W^T",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "params": [
+            {
+                "name": "weight",
+                "shape": "[hidden_size, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "y",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "2 * B * S * hidden_size * hidden_size * bf16",
+        "module": "mtp.h_proj",
+        "category": "Linear"
+    },
+    {
+        "name": "MHCHead",
+        "module": "mtp.mhc_head",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hc_mult, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "params": [
+            {
+                "name": "hc_head_fn",
+                "shape": "[hc_mult, hc_mult * hidden_size]",
+                "dtype": "fp32"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "logits",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "4*B*S*hc_mult*hidden_size*fp32 + 2*B*S*hc_mult*hidden_size*hc_mult*fp32 + 10*B*S*hc_mult*fp32"
+    },
+    {
+        "name": "RMSNorm",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "hidden_states",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "4 * B * S * hidden_size * fp32",
+        "module": "mtp.lm_head"
+    },
+    {
+        "name": "ColumnParallelLinear",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "params": [
+            {
+                "name": "weight",
+                "shape": "[vocab_size // lmhead_tp_size, hidden_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "y_shard",
+                "shape": "[B, S, vocab_size // lmhead_tp_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "2 * B * S * hidden_dim * vocab_size // lmhead_tp_size * bf16",
+        "module": "mtp.lm_head"
+    },
+    {
+        "name": "AllGather",
+        "inputs": [
+            {
+                "name": "logits_shard",
+                "shape": "[B, S, vocab_size // lmhead_tp_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "params": [],
+        "outputs": [
+            {
+                "name": "logits",
+                "shape": "[B, S, vocab_size]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "0",
+        "module": "mtp.lm_head"
+    }
+]

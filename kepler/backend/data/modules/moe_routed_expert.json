@@ -1,0 +1,78 @@
+[
+    {
+        "name": "GroupMatMul",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[(B+ep_size-1) // ep_size * top_k, S, hidden_dim]",
+                "dtype": "fp8"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "gate_up_out",
+                "shape": "[(B+ep_size-1) // ep_size * top_k, S, 2 * moe_intermediate_size]",
+                "dtype": "fp16"
+            }
+        ],
+        "params": [
+            {
+                "name": "weight",
+                "shape": "[expert_groups, 2 * moe_intermediate_size, hidden_dim]",
+                "dtype": "int8"
+            }
+        ],
+        "compute_flops": "2 * ((B+ep_size-1) // ep_size * top_k) * S * expert_groups * hidden_dim * (2 * moe_intermediate_size) * int8",
+        "module": "moe.routed_expert.gate_up_proj"
+    },
+    {
+        "name": "SwiGluQuant",
+        "inputs": [
+            {
+                "name": "gate_out",
+                "shape": "[(B+ep_size-1) // ep_size * top_k, S, intermediate_dim]",
+                "dtype": "fp16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "x",
+                "shape": "[(B+ep_size-1) // ep_size * top_k, S, intermediate_dim]",
+                "dtype": "int8"
+            },
+            {
+                "name": "scale",
+                "shape": "[(B+ep_size-1)//ep_size*top_k, S]",
+                "dtype": "fp32"
+            }
+        ],
+        "compute_flops": "4 * ((B+ep_size-1) // ep_size * top_k) * S * intermediate_dim * fp32 + 2 * ((B+ep_size-1) // ep_size * top_k) * S * intermediate_dim * fp16",
+        "module": "moe.routed_expert.act_fn"
+    },
+    {
+        "name": "GroupMatMul",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[(B+ep_size-1) // ep_size * top_k, S, moe_intermediate_size]",
+                "dtype": "int8"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "down_out",
+                "shape": "[(B+ep_size-1) // ep_size * top_k, S, hidden_dim]",
+                "dtype": "fp16"
+            }
+        ],
+        "params": [
+            {
+                "name": "weight",
+                "shape": "[expert_groups, hidden_dim, moe_intermediate_size]",
+                "dtype": "int8"
+            }
+        ],
+        "compute_flops": "2 * ((B+ep_size-1) // ep_size * top_k) * S * expert_groups * hidden_dim * moe_intermediate_size * int8",
+        "module": "moe.routed_expert.down_proj"
+    }
+]

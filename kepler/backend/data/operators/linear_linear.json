@@ -1,0 +1,28 @@
+{
+  "name": "Linear",
+  "description": "Dense linear transformation Y = X @ W^T",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "params": [
+    {
+      "name": "weight",
+      "shape": "[hidden_size, hidden_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "compute_flops": "2 * B * S * hidden_size * hidden_size * bf16",
+  "module": "attn.x_proj",
+  "category": "Linear"
+}

@@ -1,0 +1,32 @@
+{
+  "name": "LightningIndexer",
+  "description": "Lightning Indexer: fast approximate nearest-neighbor index for MoE expert routing",
+  "inputs": [
+    {
+      "name": "query",
+      "shape": "[B, S, index_n_heads, index_head_dim]",
+      "dtype": "fp8"
+    },
+    {
+      "name": "key",
+      "shape": "[B, seq_len // compress_ratio, index_head_dim]",
+      "dtype": "fp8"
+    },
+    {
+      "name": "weights",
+      "shape": "[B, S, index_n_heads]",
+      "dtype": "bf16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "topk_indices",
+      "shape": "[B, S, seq_len // compress_ratio]",
+      "dtype": "int64"
+    }
+  ],
+  "compute_flops": "2*B*S*index_n_heads*index_head_dim*seq_len//compress_ratio*fp8 + 5*B*S*index_n_heads*seq_len//compress_ratio*fp16",
+  "module": "attn.indexer",
+  "category": "MoE"
+}

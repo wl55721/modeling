@@ -1,0 +1,32 @@
+{
+  "name": "ScaledDotProductAttn",
+  "description": "Standard scaled dot-product attention: softmax(Q @ K^T / sqrt(d)) @ V",
+  "inputs": [
+    {
+      "name": "q",
+      "shape": "[B, num_heads, S, head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "k",
+      "shape": "[B, num_kv_heads, S, head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "v",
+      "shape": "[B, num_kv_heads, S, head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "attn_out",
+      "shape": "[B, num_heads, S, head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "2 * B * num_heads * S * S * head_dim + 2 * B * num_heads * S * head_dim * head_dim",
+  "module": "attn.sdpa",
+  "category": "Attention"
+}

@@ -1,0 +1,28 @@
+{
+  "name": "MHCHead",
+  "description": "Multi-Head Cache Head: per-depth token prediction with shared embedding head",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hc_mult, hidden_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "params": [
+    {
+      "name": "hc_head_fn",
+      "shape": "[hc_mult, hc_mult * hidden_size]",
+      "dtype": "fp32"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "logits",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "compute_flops": "6*B*S*hc_mult*hidden_size*fp32 + 2*B*S*hc_mult*hidden_size*hc_mult*fp32 + 11*B*S*hc_mult*fp32",
+  "module": "mhc_head",
+  "category": "MHC"
+}

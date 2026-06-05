@@ -1,0 +1,22 @@
+{
+  "name": "AllGather",
+  "description": "AllGather collective communication: gather sharded tensors from all TP devices",
+  "inputs": [
+    {
+      "name": "logits_shard",
+      "shape": "[B, S, vocab_size // lmhead_tp_size]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "logits",
+      "shape": "[B, S, vocab_size]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "0",
+  "module": "lm_head",
+  "category": "Communication"
+}
