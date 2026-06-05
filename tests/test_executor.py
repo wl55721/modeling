@@ -373,8 +373,8 @@ def test_comm_latency_pass_intra_node():
 
     # Should use intra_node bandwidth (NVLink)
     assert result_node.annotations.get("cross_node") is False
-    latency = result_node.annotations.get("latency_us")
-    assert latency is not None and latency > 0.0
+    latency = result_node.sim_result.latency_us
+    assert latency > 0.0
 
 
 def test_comm_latency_pass_cross_node():
@@ -402,8 +402,8 @@ def test_comm_latency_pass_cross_node():
 
     # Should use inter_node bandwidth (RoCE/IB)
     assert result_node.annotations.get("cross_node") is True
-    latency = result_node.annotations.get("latency_us")
-    assert latency is not None and latency > 0.0
+    latency = result_node.sim_result.latency_us
+    assert latency > 0.0
 
 
 def test_comm_latency_pass_zero_group_size():
@@ -430,7 +430,7 @@ def test_comm_latency_pass_zero_group_size():
     result_node = result.nodes["allreduce_0"]
 
     # Should be zero latency
-    assert result_node.annotations.get("latency_us") == pytest.approx(0.0)
+    assert result_node.sim_result.latency_us == pytest.approx(0.0)
 
 
 def test_comm_latency_pass_alltoall():
@@ -456,6 +456,6 @@ def test_comm_latency_pass_alltoall():
     result = CommLatencyPass().run(g, ctx)
     result_node = result.nodes["a2a_0"]
 
-    latency = result_node.annotations.get("latency_us")
-    assert latency is not None and latency > 0.0
+    latency = result_node.sim_result.latency_us
+    assert latency > 0.0
     assert result_node.annotations.get("comm_algorithm") == "all_to_all"

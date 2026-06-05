@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from python.zrt.ir.node import update_latency
 from python.zrt.transform.base import GraphPass
 
 if TYPE_CHECKING:
@@ -180,8 +181,7 @@ class CommLatencyPass(GraphPass):
                 collective, group_size, data_bytes, bandwidth_bps, link.latency_us
             )
 
-            # Annotate results
-            node.annotations["latency_us"] = latency_us
+            update_latency(node, latency_us)
             node.annotations["cross_node"] = cross_node
             node.annotations["placement_source"] = placement_source
             node.annotations["comm_algorithm"] = "ring" if collective == "all_reduce" else collective

@@ -661,11 +661,12 @@ def test_graph_capture_mega_moe_latency_includes_internal_ep_comm():
     out = build_default_pipeline().run(graph, ctx)
 
     mega = [n for n in out.nodes.values() if n.op_type == "mega_moe"][0]
-    assert mega.annotations["mega_moe_dispatch_us"] > 0
-    assert mega.annotations["mega_moe_combine_us"] > 0
-    assert mega.annotations["mega_moe_exposed_comm_us"] > 0
-    assert mega.annotations["mega_moe_hidden_comm_us"] >= 0
-    assert mega.annotations["latency_us"] >= mega.annotations["base_latency_us"]
+    assert mega.sim_result is not None
+    assert mega.sim_result.mega_moe_dispatch_us > 0
+    assert mega.sim_result.mega_moe_combine_us > 0
+    assert mega.sim_result.mega_moe_exposed_comm_us > 0
+    assert mega.sim_result.mega_moe_hidden_comm_us >= 0
+    assert mega.sim_result.latency_us >= mega.sim_result.base_latency_us
 
 
 def test_graph_capture_unset_mega_moe_waves_auto_selects_pipeline_divisor():
@@ -678,7 +679,8 @@ def test_graph_capture_unset_mega_moe_waves_auto_selects_pipeline_divisor():
     out = build_default_pipeline().run(graph, ctx)
 
     mega = [n for n in out.nodes.values() if n.op_type == "mega_moe"][0]
-    assert mega.annotations["mega_moe_effective_waves"] == 4
+    assert mega.sim_result is not None
+    assert mega.sim_result.mega_moe_effective_waves == 4
 
 
 def test_mega_moe_report_order_keeps_shared_allreduce_before_routed_branch():
@@ -811,7 +813,10 @@ def test_graph_capture_mega_moe_backward_does_not_keep_external_a2a():
         "down_bwd",
         "gate_up_bwd",
     }
-    assert any(n.annotations.get("mega_moe_internal_comm_us", 0) > 0 for n in grouped)
+    assert any(
+        (n.sim_result is not None and n.sim_result.mega_moe_internal_comm_us > 0)
+        for n in grouped
+    )
 
 
 def test_expert_weight_name_matches_path_segments_only():
@@ -978,14 +983,55 @@ def test_flops_pass_mm_formula():
 
 # ── RooflinePass ──────────────────────────────────────────────────────────────
 
-def test_roofline_pass_bound_annotation():
+def test_roofline_pass_bound_in_sim_result():
+    """RooflinePass 的 bound/latency 信息存储在 sim_result 中，不再写入 annotations。"""
     g = simple_linear_graph()
     ctx = _ctx()
     g2 = FlopsPass().run(g, ctx)
     g3 = RooflinePass().run(g2, ctx)
     for node in g3.nodes.values():
-        assert node.annotations["bound"] in ("compute", "memory", "latency")
-        assert node.annotations["latency_us"] >= 0
+        assert node.sim_result is not None
+        assert node.sim_result.bound in ("compute", "memory", "latency")
+        assert node.sim_result.latency_us >= 0
+
+
+def test_roofline_pass_sets_sim_result():
+    """RooflinePass 应为每个节点设置 sim_result，annotations 中不再包含 simResult 字段。"""
+    from python.zrt.simulator.result import SimResult
+    g = simple_linear_graph()
+    ctx = _ctx()
+    g2 = FlopsPass().run(g, ctx)
+    g3 = RooflinePass().run(g2, ctx)
+    for node in g3.nodes.values():
+        sr = node.sim_result
+        assert sr is not None, f"Node {node.id} missing sim_result"
+        assert isinstance(sr, SimResult)
+        assert sr.op_node_id == node.id
+        assert sr.backend == "roofline"
+        assert sr.confidence == 0.3
+        assert sr.flops == node.annotations.get("flops", 0)
+        assert sr.latency_us >= 0
+        assert sr.compute_us >= 0
+        assert sr.memory_us >= 0
+        assert sr.bound in ("compute", "memory", "latency")
+        assert "compute_us" not in node.annotations
+        assert "memory_us" not in node.annotations
+        assert "bound" not in node.annotations
+        assert "arithmetic_intensity" not in node.annotations
+
+
+def test_roofline_pass_sim_result_survives_clone():
+    """graph.clone() 应深拷贝 sim_result，克隆图的修改不影响原图。"""
+    g = simple_linear_graph()
+    ctx = _ctx()
+    g2 = FlopsPass().run(g, ctx)
+    g3 = RooflinePass().run(g2, ctx)
+    g4 = g3.clone()
+    for nid, node in g4.nodes.items():
+        assert node.sim_result is not None
+        orig = g3.nodes[nid].sim_result
+        assert node.sim_result is not orig
+        assert node.sim_result.latency_us == orig.latency_us
 
 
 # ── Full pipeline ─────────────────────────────────────────────────────────────

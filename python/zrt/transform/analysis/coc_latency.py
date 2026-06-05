@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from python.zrt.ir.node import update_latency
 from python.zrt.transform.base import GraphPass
 
 if TYPE_CHECKING:
@@ -33,7 +34,7 @@ class CoCLatencyPass(GraphPass):
             k = int(node.attrs.get("coc_tile_k", 1))
             if k <= 1:
                 continue
-            lat = node.annotations.get("latency_us", 0.0)
+            lat = node.sim_result.latency_us
             if lat > 0:
-                node.annotations["latency_us"] = lat / k
+                update_latency(node, lat / k)
         return g

@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from python.zrt.ir.node import update_latency
 from python.zrt.ir.param_count import count_params, count_params_by_component
 from python.zrt.transform.base import GraphPass
 from python.zrt.transform.training.recompute import is_external_recompute_node
@@ -1139,7 +1140,7 @@ class TrainingPipelinePass(GraphPass):
             if n.category == "communication" or not is_external_recompute_node(n):
                 continue
             sid = n.annotations.get("stage_id", 0)
-            lat = n.annotations.get("base_latency_us", n.annotations.get("latency_us", 0.0))
+            lat = n.sim_result.base_latency_us or n.sim_result.latency_us
             stage_recompute_us[sid] = stage_recompute_us.get(sid, 0.0) + lat
         if layer_scale != 1.0:
             stage_recompute_us = {s: v * layer_scale for s, v in stage_recompute_us.items()}
@@ -1316,7 +1317,7 @@ class TrainingPipelinePass(GraphPass):
             )
         else:
             fwd_compute_ms = sum(
-                n.annotations.get("latency_us", 0.0)
+                n.sim_result.latency_us
                 for n in g.nodes.values()
                 if not _is_bwd_node(n)
                 and n.category != "communication"
@@ -1324,7 +1325,7 @@ class TrainingPipelinePass(GraphPass):
                 and not n.annotations.get("optimizer_step")
             ) / 1000.0
             bwd_compute_ms = sum(
-                n.annotations.get("latency_us", 0.0)
+                n.sim_result.latency_us
                 for n in g.nodes.values()
                 if _is_bwd_node(n)
                 and n.category != "communication"
@@ -1340,7 +1341,7 @@ class TrainingPipelinePass(GraphPass):
                     and not n.annotations.get("optimizer_step")),
             )
             recompute_compute_ms = sum(
-                n.annotations.get("base_latency_us", n.annotations.get("latency_us", 0.0))
+                n.sim_result.base_latency_us or n.sim_result.latency_us
                 for n in g.nodes.values()
                 if n.category != "communication"
                 and is_external_recompute_node(n)
@@ -1443,11 +1444,8 @@ class TrainingPipelinePass(GraphPass):
             sr["hidden_comm_ms"] = sr.get("hidden_comm_ms", 0.0) + opt_comm_hidden_us / 1000.0
 
             if muon_ag and ag_time_us > 0:
-                muon_ag.annotations["latency_us"] = ag_time_us
+                update_latency(muon_ag, ag_time_us)
                 muon_ag.annotations["comm_time_us"] = ag_time_us
-                muon_ag.annotations["compute_us"] = 0.0
-                muon_ag.annotations["memory_us"] = 0.0
-                muon_ag.annotations["bound"] = "comm"
                 muon_ag.annotations["overlap_type"] = "moonshot_ag" if rotation_active else "none"
                 muon_ag.annotations["overlap_target"] = "compute:optimizer_step+fwd_window" if rotation_active else ""
                 muon_ag.annotations["overlap_exposed_us"] = ag_exposed_us
@@ -1456,11 +1454,8 @@ class TrainingPipelinePass(GraphPass):
                     muon_ag.annotations["overlap_hide_window_us"] = opt_compute_us + max(0.0, fwd_window_us - rs_hidden_us)
 
             if muon_rs and rs_time_us > 0:
-                muon_rs.annotations["latency_us"] = rs_time_us
+                update_latency(muon_rs, rs_time_us)
                 muon_rs.annotations["comm_time_us"] = rs_time_us
-                muon_rs.annotations["compute_us"] = 0.0
-                muon_rs.annotations["memory_us"] = 0.0
-                muon_rs.annotations["bound"] = "comm"
                 muon_rs.annotations["overlap_type"] = "moonshot_rs" if rotation_active else "none"
                 muon_rs.annotations["overlap_target"] = "fwd_window" if rotation_active else ""
                 muon_rs.annotations["overlap_exposed_us"] = rs_exposed_us
@@ -1469,10 +1464,7 @@ class TrainingPipelinePass(GraphPass):
                     muon_rs.annotations["overlap_hide_window_us"] = fwd_window_us
 
             if opt_node and not (muon_ag or muon_rs) and opt_compute_us > 0:
-                opt_node.annotations["latency_us"] = opt_compute_us
-                opt_node.annotations["compute_us"] = opt_compute_us
-                opt_node.annotations["memory_us"] = 0.0
-                opt_node.annotations["bound"] = "compute"
+                update_latency(opt_node, opt_compute_us)
                 opt_node.annotations["overlap_exposed_us"] = opt_compute_us
 
             g.metadata["optimizer_ag_exposed_us"] = ag_exposed_us
@@ -1646,7 +1638,7 @@ class TrainingPipelinePass(GraphPass):
             if layer_idx >= len(layer_profile.layer_types):
                 continue
 
-            latency = node.annotations.get("latency_us", 0.0)
+            latency = node.sim_result.latency_us
 
             if node.category == "communication":
                 continue
@@ -1654,7 +1646,7 @@ class TrainingPipelinePass(GraphPass):
                 continue
 
             if _is_recompute_node(node):
-                base_lat = node.annotations.get("base_latency_us", latency)
+                base_lat = node.sim_result.base_latency_us or latency
                 layer_recompute_total[layer_idx] += base_lat
             elif _is_bwd_node(node):
                 layer_bwd_total[layer_idx] += latency
@@ -1752,7 +1744,7 @@ class TrainingPipelinePass(GraphPass):
             return 0.0
 
         latency_sum = sum(
-            n.annotations.get("latency_us", 0.0) for n in dp_comm_nodes
+            n.sim_result.latency_us for n in dp_comm_nodes
         )
         if latency_sum > 0.0:
             return latency_sum
@@ -1830,7 +1822,7 @@ def _extract_p2p_latency_per_edge(g) -> tuple[dict[tuple[int, int], float], dict
         dst = node.attrs.get("dst_stage", -1)
         if src < 0 or dst < 0:
             continue
-        lat = node.annotations.get("latency_us", 0.0)
+        lat = node.sim_result.latency_us
         phase = node.annotations.get("phase", "")
         key = (src, dst)
         if phase == "fwd":
@@ -1855,7 +1847,7 @@ def _extract_p2p_latency_us(g) -> float:
     max_lat = 0.0
     for node in g.nodes.values():
         if node.op_type == "comm.send_recv":
-            lat = node.annotations.get("latency_us", 0.0)
+            lat = node.sim_result.latency_us
             if lat > max_lat:
                 max_lat = lat
     return max_lat

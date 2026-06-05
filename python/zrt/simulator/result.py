@@ -24,18 +24,44 @@ class SimResult:
     confidence          : estimate quality  [0-1]; roofline = 0.3, profDB = 0.9
     """
 
-    op_node_id: str
-    latency_us: float
-    compute_us: float
-    memory_us: float
-    flops: int
-    read_bytes: int
-    write_bytes: int
-    arithmetic_intensity: float
-    bound: str
-    hw_utilization: float
-    backend: str
-    confidence: float
+    op_node_id: str = ""
+    latency_us: float = 0.0
+    compute_us: float = 0.0
+    memory_us: float = 0.0
+    flops: int = 0
+    read_bytes: int = 0
+    write_bytes: int = 0
+    arithmetic_intensity: float = 0.0
+    bound: str = ""
+    hw_utilization: float = 0.0
+    backend: str = ""
+    confidence: float = 0.0
+    
+    base_compute_us: float = 0.0
+    base_memory_us: float = 0.0
+    base_latency_us: float = 0.0
+    
+    saved_activation_bytes: int = 0
+    activation_memory_us: float = 0.0
+    
+    checkpoint_activation_bytes: int = 0
+    checkpoint_memory_us: float = 0.0
+    
+    recompute_flops: int = 0
+    recompute_read_bytes: int = 0
+    recompute_write_bytes: int = 0
+    recompute_compute_us: float = 0.0
+    recompute_memory_us: float = 0.0
+    recompute_latency_us: float = 0.0
+    
+    mega_moe_dispatch_us: float = 0.0
+    mega_moe_combine_us: float = 0.0
+    mega_moe_exposed_comm_us: float = 0.0
+    mega_moe_hidden_comm_us: float = 0.0
+    mega_moe_internal_comm_us: float = 0.0
+    mega_moe_effective_waves: int = 0
+    mega_moe_dispatch_bytes: int = 0
+    mega_moe_combine_bytes: int = 0
 
     @property
     def total_bytes(self) -> int:

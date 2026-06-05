@@ -473,17 +473,15 @@ class TransformedGraphExcelWriter:
                 node.annotations.get("write_bytes", ""),
                 formulas["write_sym"],
                 formulas["write_num"],
-                node.annotations.get("saved_activation_bytes", 0),
-                round(node.annotations.get("activation_memory_us", 0), 3) if node.annotations.get("activation_memory_us") else "",
-                # comm
+                node.sim_result.saved_activation_bytes,
+                round(node.sim_result.activation_memory_us, 3) if node.sim_result.activation_memory_us else "",
                 comm_vol,
-                # timing & bound
-                round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
-                round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
-                round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
-                round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
-                node.annotations.get("bound", ""),
-                round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
+                round(node.sim_result.compute_us, 3) if node.sim_result.compute_us else "",
+                round(node.sim_result.memory_us, 3) if node.sim_result.memory_us else "",
+                round(node.sim_result.base_latency_us, 3) if node.sim_result.base_latency_us else "",
+                round(node.sim_result.latency_us, 3) if node.sim_result.latency_us else "",
+                node.sim_result.bound,
+                round(node.sim_result.arithmetic_intensity, 2) if node.sim_result.arithmetic_intensity else "",
                 annotations_str,
             ]
 
@@ -963,16 +961,16 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 node.annotations.get("write_bytes", ""),
                 formulas["write_sym"],
                 formulas["write_num"],
-                node.annotations.get("saved_activation_bytes", 0),
-                round(node.annotations.get("activation_memory_us", 0), 3) if node.annotations.get("activation_memory_us") else "",
+                node.sim_result.saved_activation_bytes,
+                round(node.sim_result.activation_memory_us, 3) if node.sim_result.activation_memory_us else "",
                 _comm_vol(node),
-                round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
-                round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
-                round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
+                round(node.sim_result.compute_us, 3) if node.sim_result.compute_us else "",
+                round(node.sim_result.memory_us, 3) if node.sim_result.memory_us else "",
+                round(node.sim_result.base_latency_us, 3) if node.sim_result.base_latency_us else "",
                 "",
-                round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
-                node.annotations.get("bound", ""),
-                round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
+                round(node.sim_result.latency_us, 3) if node.sim_result.latency_us else "",
+                node.sim_result.bound,
+                round(node.sim_result.arithmetic_intensity, 2) if node.sim_result.arithmetic_intensity else "",
             ]
             fill = self._comm_fill if node.is_comm else self._compute_fill
             self._write_row(ws, row_idx, values, fill)
@@ -982,7 +980,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
         if bwd_graph is not None:
             for node in _phase_nodes(bwd_graph, "bwd"):
                 formulas = get_op_formulas(node)
-                replay_us = node.annotations.get("recompute_latency_us", 0.0) or 0.0
+                replay_us = node.sim_result.recompute_latency_us
                 is_recompute = (
                     replay_us > 0
                     or node.annotations.get("recompute", False)
@@ -1019,13 +1017,13 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                     "",
                     "",
                     _comm_vol(node),
-                    round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
-                    round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
-                    round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
+                    round(node.sim_result.compute_us, 3) if node.sim_result.compute_us else "",
+                    round(node.sim_result.memory_us, 3) if node.sim_result.memory_us else "",
+                    round(node.sim_result.base_latency_us, 3) if node.sim_result.base_latency_us else "",
                     round(replay_us, 3) if replay_us else "",
-                    round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
-                    node.annotations.get("bound", ""),
-                    round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
+                    round(node.sim_result.latency_us, 3) if node.sim_result.latency_us else "",
+                    node.sim_result.bound,
+                    round(node.sim_result.arithmetic_intensity, 2) if node.sim_result.arithmetic_intensity else "",
                 ]
                 self._write_row(ws, row_idx, values, fill)
                 row_idx += 1
@@ -1072,9 +1070,9 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         for row_idx, node in enumerate(recompute_nodes, 2):
             lat = (
-                node.annotations.get("recompute_latency_us", 0)
-                or node.annotations.get("base_latency_us", 0)
-                or node.annotations.get("latency_us", 0)
+                node.sim_result.recompute_latency_us
+                or node.sim_result.base_latency_us
+                or node.sim_result.latency_us
                 or 0
             )
             flops = node.annotations.get("flops", 0) or 0
@@ -1087,7 +1085,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 node.layer or "",
                 flops,
                 round(lat, 3),
-                node.annotations.get("bound", ""),
+                node.sim_result.bound,
                 ", ".join(str(t.shape) for t in node.inputs),
             ]
             self._write_row(ws, row_idx, values, _fill)
@@ -1182,9 +1180,8 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             step_flops = float(attrs.get("step_flops", 0) or 0)
             group_size = int(attrs.get("group_size", 0) or 0)
 
-            # Read timing from annotations (set by TrainingPipelinePass)
-            latency_us = float(node.annotations.get("latency_us", 0) or 0)
-            compute_us = float(node.annotations.get("compute_us", 0) or 0)
+            latency_us = float(node.sim_result.latency_us or 0)
+            compute_us = float(node.sim_result.compute_us or 0)
             comm_time_us = float(node.annotations.get("comm_time_us", 0) or 0)
             
             # Fallback: compute from attrs if annotations not set
@@ -1494,7 +1491,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             layer_type_raw = layer_profile.layer_types[layer_idx]
             # Convert to string (handle both enum and string)
             layer_type = layer_type_raw.value if hasattr(layer_type_raw, "value") else str(layer_type_raw)
-            latency_us = node.annotations.get("latency_us", 0.0)
+            latency_us = node.sim_result.latency_us
 
             if node.category == "communication":
                 continue

@@ -305,18 +305,17 @@ def _mega_moe_internal_comm_us(node, ctx, base_latency_us: float) -> tuple[float
 class RooflinePass(GraphPass):
     """Annotate nodes with Roofline-model timing estimates and bound classification.
 
-    Requires hw_spec in ctx.  Adds:
-      node.annotations["compute_us"]           : float
-      node.annotations["memory_us"]            : float
-      node.annotations["latency_us"]           : float
-      node.annotations["arithmetic_intensity"] : float
-      node.annotations["bound"]                : "compute" | "memory" | "latency"
+    Requires hw_spec in ctx.
+    Sets node.sim_result (SimResult) as the authoritative source for:
+      latency_us, compute_us, memory_us, arithmetic_intensity, bound.
+    Retains non-simResult annotations: base_*_us, recompute_*, saved_activation_bytes, etc.
     """
 
     name = "roofline"
 
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
         from python.zrt.simulator.backends.roofline import RooflineSimulator
+        from python.zrt.simulator.result import SimResult
         from python.zrt.ir.types import DType
         sim = RooflineSimulator()
         hw  = ctx.hw_spec
@@ -398,28 +397,39 @@ class RooflinePass(GraphPass):
             else:
                 bound = "latency"
 
-            node.annotations["compute_us"]           = compute_us
-            node.annotations["memory_us"]            = memory_us
-            node.annotations["base_compute_us"]      = base_compute_us
-            node.annotations["base_memory_us"]       = base_memory_us
-            node.annotations["base_latency_us"]      = base_latency_us
-            node.annotations["saved_activation_bytes"] = saved_activation_b
-            node.annotations["activation_memory_us"] = activation_memory_us
-            node.annotations["checkpoint_activation_bytes"] = 0
-            node.annotations["checkpoint_memory_us"] = 0.0
-            node.annotations["recompute_flops"]      = recompute_flops
-            node.annotations["recompute_read_bytes"] = recompute_read_b
-            node.annotations["recompute_write_bytes"] = recompute_write_b
-            node.annotations["recompute_compute_us"] = recompute_compute_us
-            node.annotations["recompute_memory_us"]  = recompute_memory_us
-            node.annotations["recompute_latency_us"] = recompute_latency_us
-            node.annotations["arithmetic_intensity"] = ai
-            node.annotations["bound"]                = bound
-            node.annotations.update(mega_moe_annotations)
-            # Respect pre-existing latency_us (e.g. from profiling or test injection)
-            # BUT for backward nodes, always recalculate to include recompute_latency
-            if "latency_us" not in node.annotations or is_bwd:
-                node.annotations["latency_us"] = final_latency_us
+            hw_util = 0.0
+            if peak > 0 and final_latency_us > 0:
+                actual_rate = base_flops / (final_latency_us * 1e-6)
+                hw_util = min(1.0, actual_rate / peak)
+
+            node.sim_result = SimResult(
+                op_node_id=node.id,
+                latency_us=final_latency_us,
+                compute_us=compute_us,
+                memory_us=memory_us,
+                flops=int(base_flops),
+                read_bytes=int(base_read_b),
+                write_bytes=int(base_write_b),
+                arithmetic_intensity=ai,
+                bound=bound,
+                hw_utilization=hw_util,
+                backend="roofline",
+                confidence=0.3,
+                base_compute_us=base_compute_us,
+                base_memory_us=base_memory_us,
+                base_latency_us=base_latency_us,
+                saved_activation_bytes=int(saved_activation_b),
+                activation_memory_us=activation_memory_us,
+                checkpoint_activation_bytes=0,
+                checkpoint_memory_us=0.0,
+                recompute_flops=int(recompute_flops),
+                recompute_read_bytes=int(recompute_read_b),
+                recompute_write_bytes=int(recompute_write_b),
+                recompute_compute_us=recompute_compute_us,
+                recompute_memory_us=recompute_memory_us,
+                recompute_latency_us=recompute_latency_us,
+                **mega_moe_annotations,
+            )
 
         return g
 

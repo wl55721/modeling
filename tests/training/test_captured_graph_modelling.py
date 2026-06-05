@@ -156,10 +156,10 @@ def test_pipeline_routing_runs_roofline_and_stream_assign():
     pipe = build_default_pipeline()
     result = pipe.run(g, ctx)
 
-    # All compute nodes must have latency_us (from RooflinePass)
+    # All compute nodes must have sim_result (from RooflinePass)
     for nid, node in result.nodes.items():
-        assert "latency_us" in node.annotations, (
-            f"Node {nid} missing latency_us — RooflinePass did not run"
+        assert node.sim_result is not None, (
+            f"Node {nid} missing sim_result — RooflinePass did not run"
         )
         assert "stream_id" in node.annotations, (
             f"Node {nid} missing stream_id — StreamAssignPass did not run"
