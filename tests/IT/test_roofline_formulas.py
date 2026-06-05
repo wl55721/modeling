@@ -126,6 +126,24 @@ class TestBmm:
         assert w == B * M * N * b
 
 
+class TestBaddbmm:
+    """aten.baddbmm.default: bias + batch matmul
+    Same FLOPs as bmm (bias add is negligible).
+    """
+
+    def test_baddbmm_basic(self):
+        B, M, K, N = 8, 32, 64, 128
+        b = 2
+        flops, r, w = _fmr(
+            "aten.baddbmm.default",
+            [_tm("a", (B, M, K)), _tm("b", (B, K, N))],
+            [_tm("c", (B, M, N))],
+        )
+        assert flops == 2.0 * B * M * K * N
+        assert r == (B * M * K + B * K * N) * b
+        assert w == B * M * N * b
+
+
 class TestLinear:
     """aten.linear.default: input=(*,I), weight=(O,I), optional bias=(O,)
     FLOPs = 2·batch·I·O [+ batch·O if bias]
@@ -465,6 +483,15 @@ class TestElementwise1:
         )
         assert flops == 1.0 * N
 
+    def test_square(self):
+        N = 64 * 128
+        flops, r, w = _fmr(
+            "aten.square.default",
+            [_tm("inp", (64, 128))],
+            [_tm("out", (64, 128))],
+        )
+        assert flops == 1.0 * N
+
 
 class TestElementwise2:
     """2 ops/elem: reciprocal, clamp"""
@@ -560,6 +587,24 @@ class TestReduction:
             "aten.var.correction",
             [_tm("inp", (16, 64))],
             [_tm("out", (16,))],
+        )
+        assert flops == 3.0 * N_out
+
+    def test_std(self):
+        N_out = 16
+        flops, r, w = _fmr(
+            "aten.std.correction",
+            [_tm("inp", (16, 64))],
+            [_tm("out", (16,))],
+        )
+        assert flops == 3.0 * N_out
+
+    def test_std_default(self):
+        N_out = 32
+        flops, r, w = _fmr(
+            "aten.std.default",
+            [_tm("inp", (32, 64))],
+            [_tm("out", (32,))],
         )
         assert flops == 3.0 * N_out
 
