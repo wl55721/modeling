@@ -1,11 +1,14 @@
 """Analysis passes (Stage 4): FLOPs annotation, Roofline, and Stream assignment."""
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING
 
 from python.zrt.transform.base import GraphPass
 from python.zrt.transform.training.recompute import is_external_recompute_node
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
@@ -376,12 +379,6 @@ class RooflinePass(GraphPass):
             memory_us = base_memory_us + activation_memory_us
             if is_bwd:
                 final_latency_us = base_latency_us + recompute_latency_us
-                if recompute_latency_us > 0:
-                    logger.debug(
-                        "RooflinePass: backward node %s has recompute_latency_us=%.1f us "
-                        "(base=%.1f us)",
-                        node.id, recompute_latency_us, base_latency_us,
-                    )
             elif base_compute_us > 0 or base_memory_us > 0 or activation_memory_us > 0:
                 final_latency_us = base_latency_us + activation_memory_us
             else:

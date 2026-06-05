@@ -260,6 +260,32 @@ def main() -> None:
         help="Global batch size across DP ranks (training, default: 32).",
     )
     parser.add_argument(
+        "--dp-bucket-cap-mb", type=float, default=None,
+        help="DDP gradient bucket cap in MiB when --dp-ddp-buckets is enabled "
+             "(training, default: 25.0).",
+    )
+    parser.add_argument(
+        "--dp-overlap",
+        dest="dp_overlap",
+        action="store_true",
+        default=None,
+        help="Explicitly reaffirm original DP hidden/exposed overlap accounting "
+             "(training default: enabled).",
+    )
+    parser.add_argument(
+        "--no-dp-overlap",
+        dest="dp_overlap",
+        action="store_false",
+        help="Disable DP overlap and model gradient reduction as fully exposed pure DP.",
+    )
+    parser.add_argument(
+        "--dp-ddp-buckets",
+        action="store_true",
+        default=False,
+        help="Use DDP-style cap-based DP gradient buckets for trace-level overlap. "
+             "Without this flag, the original layer DP hidden/exposed path is used.",
+    )
+    parser.add_argument(
         "--total-params", type=float, default=None,
         help="Full model param count, e.g. 671e9 (for scaling traced layers).",
     )
@@ -301,6 +327,15 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    dp_overlap = True if args.dp_overlap is None else args.dp_overlap
+    dp_bucket_cap_mb = 25.0 if args.dp_bucket_cap_mb is None else args.dp_bucket_cap_mb
+    if args.dp_ddp_buckets and not dp_overlap:
+        parser.error(
+            "--dp-ddp-buckets requires DP overlap to be enabled. "
+            "Use --no-dp-overlap without --dp-ddp-buckets for pure DP."
+        )
+    args.dp_overlap = dp_overlap
+    args.dp_bucket_cap_mb = dp_bucket_cap_mb
 
     # ── --list-fusion-rules: print and exit ──────────────────────────────────
     if args.list_fusion_rules:
@@ -724,6 +759,9 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         pp_schedule=args.pp_schedule,
         vpp_chunks=args.vpp_chunks,
         pp_mode=getattr(args, "pp_mode", "trace"),
+        dp_overlap_in_bubble=True if args.dp_overlap is None else args.dp_overlap,
+        dp_bucket_mode="ddp" if getattr(args, "dp_ddp_buckets", False) else "layer",
+        dp_bucket_cap_mb=args.dp_bucket_cap_mb if args.dp_bucket_cap_mb is not None else 25.0,
         tp_coc=args.tp_coc,
         trace_ep_waves=getattr(args, "trace_ep_waves", False),
         trace_moe_fb_overlap=getattr(args, "trace_moe_fb_overlap", False),

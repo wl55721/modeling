@@ -51,6 +51,7 @@ class ScheduledOp:
     ep_wave_k: int = 0
     overlap_hidden_us: float = 0.0
     overlap_exposed_us: float = 0.0
+    attrs: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return (
@@ -147,6 +148,7 @@ class DAGScheduler:
 
     _PARALLELISM_TAG_MAP: dict[str, str] = {
         "tp": "tp", "ep": "ep", "pp": "pp", "cp": "cp",
+        "data_parallel": "dp",
     }
 
     @staticmethod
@@ -164,6 +166,7 @@ class DAGScheduler:
         """
         finish:       dict[str, float] = {}   # node_id → end_us
         stream_avail: dict[int, float] = {}   # stream_id → next_free_us
+        stream_types: dict[int, str] = {}
         scheduled:    list[ScheduledOp] = []
         scheduled_ids: set[str] = set()
 
@@ -196,12 +199,27 @@ class DAGScheduler:
             )
             # resource constraint: wait for stream to be free
             s_free = stream_avail.get(stream_id, 0.0)
+            if node.annotations.get("blocking_comm"):
+                # A blocking comm fences compute streams that have already
+                # appeared in topological scheduling. If none exist yet, this
+                # naturally reduces to the current stream's availability.
+                s_free = max(
+                    [s_free] + [
+                        t for sid, t in stream_avail.items()
+                        if stream_types.get(sid) == "compute"
+                    ]
+                )
 
             start = max(pred_done, s_free)
             end   = start + lat
 
             finish[node.id]         = end
             stream_avail[stream_id] = end
+            stream_types[stream_id] = stream_type
+            if node.annotations.get("blocking_comm"):
+                for sid, stype in list(stream_types.items()):
+                    if stype == "compute":
+                        stream_avail[sid] = end
             scheduled_ids.add(node.id)
 
             scheduled.append(ScheduledOp(
@@ -239,6 +257,7 @@ class DAGScheduler:
                     )
                     or 0.0
                 ),
+                attrs = dict(node.attrs),
             ))
 
             for succ_id in graph.successors(node.id):

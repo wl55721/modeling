@@ -110,6 +110,12 @@ class CommLatencyPass(GraphPass):
 
             # Compute total data bytes: prefer explicit msg_bytes attr, else tensor sizes
             data_bytes = node.attrs.get("msg_bytes", 0)
+            if (
+                data_bytes == 0
+                and node.annotations.get("dp_comm")
+                and node.attrs.get("role") == "dp_grad_reduce"
+            ):
+                data_bytes = node.attrs.get("bucket_bytes", 0)
             if data_bytes == 0:
                 data_bytes = sum(t.mem_bytes for t in node.inputs)
             if data_bytes == 0:
