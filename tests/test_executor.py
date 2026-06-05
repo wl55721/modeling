@@ -82,6 +82,28 @@ def test_stream_serialization():
     assert sched["b"].start_us >= sched["a"].end_us
 
 
+def test_scheduler_uses_layer_stable_priority_for_ready_nodes():
+    """Ready-node tie-break follows effective layer before insertion order."""
+    later = _node("later_layer", latency_us=10.0, stream_id=0)
+    earlier = _node("earlier_layer", latency_us=5.0, stream_id=0)
+    later.layer = "3"
+    earlier.layer = "2"
+
+    # Insert later first. Plain topo_sort would schedule it first, but the
+    # scheduler should use layer-stable ready priority for trace readability.
+    g = _graph([later, earlier], [])
+
+    tl = DAGScheduler().schedule(g)
+
+    assert [op.node_id for op in tl.scheduled_ops] == [
+        "earlier_layer",
+        "later_layer",
+    ]
+    sched = {op.node_id: op for op in tl.scheduled_ops}
+    assert sched["earlier_layer"].start_us == pytest.approx(0.0)
+    assert sched["later_layer"].start_us == pytest.approx(5.0)
+
+
 def test_parallel_independent_different_streams():
     """Two independent nodes on different streams run concurrently after shared pred."""
     root  = _node("root", latency_us=10.0, stream_id=0)

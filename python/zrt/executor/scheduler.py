@@ -15,6 +15,7 @@ If neither is available, 1 µs is used as a conservative placeholder.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import heapq
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -41,6 +42,15 @@ class ScheduledOp:
     overlap_type: str = ""    # "coc" | "mc2" | "ring_cp" | "none"
     coc_tile_k:   int = 0
     overlap_target: str = ""  # node_id of the compute predecessor for CoC
+    inserted_by: str = ""
+    collective: str = ""
+    comm_role: str = ""
+    component: str = ""
+    scope: str = ""
+    module_class: str = ""
+    ep_wave_k: int = 0
+    overlap_hidden_us: float = 0.0
+    overlap_exposed_us: float = 0.0
     attrs: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:
@@ -158,8 +168,26 @@ class DAGScheduler:
         stream_avail: dict[int, float] = {}   # stream_id → next_free_us
         stream_types: dict[int, str] = {}
         scheduled:    list[ScheduledOp] = []
+        scheduled_ids: set[str] = set()
 
-        for node in graph.topo_sort():
+        topo_nodes = graph.topo_sort()
+        priority = self._ready_priority(graph, topo_nodes)
+        in_deg: dict[str, int] = {
+            node_id: len(graph.predecessors(node_id))
+            for node_id in graph.nodes
+        }
+        ready: list[tuple[int, str]] = [
+            (priority.get(node_id, len(priority)), node_id)
+            for node_id, deg in in_deg.items()
+            if deg == 0
+        ]
+        heapq.heapify(ready)
+
+        while ready:
+            _, node_id = heapq.heappop(ready)
+            if node_id in scheduled_ids:
+                continue
+            node = graph.nodes[node_id]
             stream_id   = node.annotations.get("stream_id", 0)
             stream_type = node.annotations.get("stream_type", "compute")
             lat         = self._latency(node)
@@ -192,6 +220,7 @@ class DAGScheduler:
                 for sid, stype in list(stream_types.items()):
                     if stype == "compute":
                         stream_avail[sid] = end
+            scheduled_ids.add(node.id)
 
             scheduled.append(ScheduledOp(
                 node_id     = node.id,
@@ -207,8 +236,37 @@ class DAGScheduler:
                 overlap_type = node.annotations.get("overlap_type", "none"),
                 coc_tile_k   = int(node.attrs.get("coc_tile_k", 0)),
                 overlap_target = node.annotations.get("overlap_target", ""),
+                inserted_by = node.annotations.get("inserted_by", ""),
+                collective = node.attrs.get("collective", ""),
+                comm_role = node.attrs.get("role", ""),
+                component = getattr(node, "component", "") or "",
+                scope = getattr(node, "scope", "") or "",
+                module_class = getattr(node, "module_class", "") or "",
+                ep_wave_k = int(node.attrs.get("ep_wave_k", 0)),
+                overlap_hidden_us = float(
+                    node.annotations.get(
+                        "moe_fb_hidden_us",
+                        node.annotations.get("overlap_hidden_us", 0.0),
+                    )
+                    or 0.0
+                ),
+                overlap_exposed_us = float(
+                    node.annotations.get(
+                        "moe_fb_exposed_us",
+                        node.annotations.get("overlap_exposed_us", 0.0),
+                    )
+                    or 0.0
+                ),
                 attrs = dict(node.attrs),
             ))
+
+            for succ_id in graph.successors(node.id):
+                in_deg[succ_id] -= 1
+                if in_deg[succ_id] == 0:
+                    heapq.heappush(
+                        ready,
+                        (priority.get(succ_id, len(priority)), succ_id),
+                    )
 
         return Timeline(
             scheduled_ops = scheduled,
@@ -217,6 +275,16 @@ class DAGScheduler:
         )
 
     # ── internal ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ready_priority(graph: "OpGraph", topo_nodes: list["OpNode"]) -> dict[str, int]:
+        """Return layer-stable priority for ready-queue tie breaking."""
+        try:
+            from python.zrt.transform.exporter import layer_stable_sort
+            ordered = layer_stable_sort(topo_nodes, graph=graph)
+        except Exception:
+            ordered = topo_nodes
+        return {node.id: idx for idx, node in enumerate(ordered)}
 
     def _latency(self, node: "OpNode") -> float:
         if "latency_us" in node.annotations:

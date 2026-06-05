@@ -1,11 +1,13 @@
 """Tests for python.zrt.transform pipeline."""
 import pytest
+import onnx
 from types import SimpleNamespace
 
 from python.zrt.ir.node import OpNode
 from python.zrt.ir.edge import Edge
 from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.types import TensorMeta, DType
+from python.zrt.executor import DAGScheduler
 import python.zrt.hardware.registry as hw_registry
 from python.zrt.transform import (
     ParallelConfig, StreamConfig, QuantConfig, TransformContext,
@@ -100,6 +102,13 @@ def routed_moe_graph():
         ],
         metadata={"seq_len": 8, "hidden": 16},
     )
+
+
+def routed_moe_graph_with_router_dependency():
+    graph = routed_moe_graph()
+    graph.edges.append(Edge("src", 0, "router", 0, graph.nodes["src"].outputs[0]))
+    graph._rebuild_adjacency()
+    return graph
 
 
 def routed_moe_graph_with_expert_add_chain():
@@ -471,6 +480,32 @@ def test_expert_grouped_mm_mega_moe_off_keeps_grouped_forward_path():
     assert by_role["down"].inputs[0].shape == (2, 8, 4)
     assert by_role["gate_up"].annotations["ep_tokens_per_rank"] == 16
     assert by_role["gate_up"].annotations["ep_tokens_per_expert"] == 8
+
+
+def test_ep_dispatch_depends_on_moe_gate_control_after_grouped_mm():
+    graph = routed_moe_graph_with_router_dependency()
+    ctx = _ctx(ep=2)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = ExpertParallelPass().run(graph, ctx)
+    out = ExpertGroupedMMPass().run(out, ctx)
+    out = CommInserterPass().run(out, ctx)
+
+    dispatch_id = "comm_a2a_dispatch_transformer_layers_0_ffn_grouped_gate_up"
+    assert dispatch_id in out.nodes
+    assert "router" in out.predecessors(dispatch_id)
+
+    control_edges = [
+        e for e in out.edges
+        if e.src == "router" and e.dst == dispatch_id
+    ]
+    assert len(control_edges) == 1
+    assert control_edges[0].is_control
+
+    out = StreamAssignPass().run(out, ctx)
+    timeline = DAGScheduler().schedule(out)
+    scheduled = {op.node_id: op for op in timeline.scheduled_ops}
+    assert scheduled[dispatch_id].start_us >= scheduled["router"].end_us
 
 
 def test_expert_grouped_mm_removes_routed_expert_add_chain():
@@ -852,6 +887,25 @@ def test_excel_export_separates_base_and_effective_flops(tmp_path):
     effective_idx = header.index("Effective FLOPs (with recompute)")
     assert rows[1][flops_idx] == 100
     assert rows[1][effective_idx] == 200
+
+
+def test_export_transformed_graph_writes_netron_onnx_with_edges(tmp_path):
+    from python.zrt.transform.exporter import export_transformed_graph
+
+    graph = simple_linear_graph()
+    paths = export_transformed_graph(graph, _ctx(), tmp_path)
+
+    onnx_path = tmp_path / "test_transformed_graph.onnx"
+    assert paths["onnx"] == onnx_path
+    assert onnx_path.exists()
+
+    model = onnx.load(onnx_path)
+    onnx.checker.check_model(model)
+    assert len(model.graph.node) == 2
+    q, o = model.graph.node
+    assert q.output
+    assert o.input
+    assert set(q.output) & set(o.input)
 
 
 # ── StreamAssignPass ──────────────────────────────────────────────────────────

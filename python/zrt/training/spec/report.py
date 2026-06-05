@@ -142,6 +142,14 @@ class TrainingReport:
     pp_hidden_ms: float = 0.0           # PP P2P hidden by DualPipe/DualPipeV
     cp_hidden_ms: float = 0.0           # CP A2A hidden by compute overlap
 
+    # Detailed EP hidden-communication attribution.
+    ep_fb_total_ms: float = 0.0
+    ep_fb_hidden_ms: float = 0.0
+    ep_fb_exposed_ms: float = 0.0
+    ep_fb_steady_hidden_ms: float = 0.0
+    ep_fb_boundary_hidden_ms: float = 0.0
+    mega_moe_hidden_ms: float = 0.0
+
     # Total comm volume = exposed + hidden
     total_comm_volume_ms: float = 0.0
 
@@ -228,6 +236,12 @@ class TrainingReport:
             "ep_hidden_ms": self.ep_hidden_ms,
             "pp_hidden_ms": self.pp_hidden_ms,
             "cp_hidden_ms": self.cp_hidden_ms,
+            "ep_fb_total_ms": self.ep_fb_total_ms,
+            "ep_fb_hidden_ms": self.ep_fb_hidden_ms,
+            "ep_fb_exposed_ms": self.ep_fb_exposed_ms,
+            "ep_fb_steady_hidden_ms": self.ep_fb_steady_hidden_ms,
+            "ep_fb_boundary_hidden_ms": self.ep_fb_boundary_hidden_ms,
+            "mega_moe_hidden_ms": self.mega_moe_hidden_ms,
             "total_comm_volume_ms": self.total_comm_volume_ms,
             "tp_total_ms": self.tp_total_ms,
             "cp_total_ms": self.cp_total_ms,

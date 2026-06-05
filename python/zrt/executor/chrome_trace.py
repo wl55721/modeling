@@ -120,9 +120,19 @@ class ChromeTraceExporter:
 
     _MIN_VISIBLE_US = 1.0
 
-    def __init__(self, time_unit: str = "us") -> None:
+    def __init__(
+        self,
+        time_unit: str = "us",
+        *,
+        trace_ep_waves: bool = False,
+        trace_moe_fb_overlap: bool = False,
+        ep_wave_k: int = 0,
+    ) -> None:
         self._mult = 1000.0 if time_unit == "ns" else 1.0
         self._time_unit = time_unit
+        self._trace_ep_waves = trace_ep_waves
+        self._trace_moe_fb_overlap = trace_moe_fb_overlap
+        self._ep_wave_k = max(0, int(ep_wave_k))
 
     # ── metadata helpers ──────────────────────────────────────────────────
 
@@ -370,7 +380,10 @@ class ChromeTraceExporter:
                     grid_slot.get((s, m, "bwd_dx"), m * stage_total + fwd_lat),
                 )
 
-                for op in tl.scheduled_ops:
+                skip_ids: set[str] = set()
+                for idx, op in enumerate(tl.scheduled_ops):
+                    if op.node_id in skip_ids:
+                        continue
                     cat = "communication" if op.stream_type == "comm" else "compute"
                     if replicate:
                         name = f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}"
@@ -386,14 +399,51 @@ class ChromeTraceExporter:
 
                     dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
 
+                    if self._trace_ep_waves and self._is_ep_dispatch(op):
+                        group = self._find_ep_wave_group(tl.scheduled_ops, idx)
+                        if group is not None and self._ep_wave_count(*group) > 1:
+                            _dispatch, expert_ops, combine, blockers, dispatch_ready = group
+                            dispatch_ready_rel = (
+                                dispatch_ready
+                                if op.phase == "fwd" or not op.phase
+                                else dispatch_ready - fwd_lat
+                            )
+                            combine_region_end = (
+                                combine.start_us + combine.latency_us
+                                if combine.phase == "fwd" or not combine.phase
+                                else combine.start_us - fwd_lat + combine.latency_us
+                            )
+                            events.extend(self._ep_wave_events(
+                                op, expert_ops, combine,
+                                pid=s,
+                                detail_base=0,
+                                base=base,
+                                mb=m,
+                                phase=op.phase,
+                                name_prefix=f"m{m}:" if replicate else "",
+                                rel_start=lambda candidate: (
+                                    candidate.start_us
+                                    if candidate.phase == "fwd" or not candidate.phase
+                                    else candidate.start_us - fwd_lat
+                                ),
+                                blockers=blockers,
+                                dispatch_ready_us=dispatch_ready_rel,
+                                region_end_us=combine_region_end,
+                            ))
+                            skip_ids.update(
+                                {op.node_id, combine.node_id}
+                                | {expert.node_id for expert in expert_ops}
+                            )
+                            continue
+
                     events.append(ChromeTraceEvent(
-                        name=name,
-                        cat=cat,
+                        name=self._moe_fb_event_name(op, name),
+                        cat=self._moe_fb_event_cat(op, cat),
                         pid=s,
                         tid=op.stream_id,
                         ts=(base + rel_start) * self._mult,
                         dur=dur_us * self._mult,
-                        args={
+                        args=self._moe_fb_event_args(op, {
                             "phase": op.phase,
                             "node_id": op.node_id,
                             "op_type": op.op_type,
@@ -402,7 +452,7 @@ class ChromeTraceExporter:
                             **self._bucket_args(op),
                             **ddp_tail_args.get(op.node_id, {}),
                             "mb": m,
-                        },
+                        }),
                     ).to_dict())
 
         events = self._deduplicate(events)
@@ -467,13 +517,13 @@ class ChromeTraceExporter:
                 name = f"{op.phase}:{op.op_type}" if op.phase else op.op_type
                 dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
                 events.append(ChromeTraceEvent(
-                    name=name,
-                    cat=cat,
+                    name=self._moe_fb_event_name(op, name),
+                    cat=self._moe_fb_event_cat(op, cat),
                     pid=d,
                     tid=detail_base + op.stream_id,
                     ts=op.start_us * self._mult,
                     dur=dur_us * self._mult,
-                    args={
+                    args=self._moe_fb_event_args(op, {
                         "phase": op.phase,
                         "node_id": op.node_id,
                         "op_type": op.op_type,
@@ -482,7 +532,7 @@ class ChromeTraceExporter:
                         **self._bucket_args(op),
                         **ddp_tail_args.get(op.node_id, {}),
                         "view": "detail",
-                    },
+                    }),
                 ).to_dict())
 
         events = self._deduplicate(events)
@@ -551,20 +601,51 @@ class ChromeTraceExporter:
 
             for m in range(stitched.M):
                 fwd_base = grid_index.get((d, m, "fwd"), 0.0)
-                for op in tl.scheduled_ops:
+                skip_ids: set[str] = set()
+                for idx, op in enumerate(tl.scheduled_ops):
+                    if op.node_id in skip_ids:
+                        continue
                     if op.phase == "fwd":
                         dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
                         ts = (fwd_base + op.start_us) * self._mult
                         if op.overlap_type not in ("none", "") and op.overlap_target:
                             ts = self._shift_overlap_comm_op(op, compute_index, fwd_base, ts)
+                        if self._trace_ep_waves and self._is_ep_dispatch(op):
+                            group = self._find_ep_wave_group(tl.scheduled_ops, idx)
+                            if group is not None and self._ep_wave_count(*group) > 1:
+                                _dispatch, expert_ops, combine, blockers, dispatch_ready = group
+                                events.extend(self._ep_wave_events(
+                                    op, expert_ops, combine,
+                                    pid=d,
+                                    detail_base=detail_base,
+                                    base=fwd_base,
+                                    mb=m,
+                                    phase="fwd",
+                                    name_prefix=f"m{m}:",
+                                    rel_start=lambda candidate: candidate.start_us,
+                                    blockers=blockers,
+                                    dispatch_ready_us=dispatch_ready,
+                                    region_end_us=combine.start_us + combine.latency_us,
+                                ))
+                                skip_ids.update(
+                                    {op.node_id, combine.node_id}
+                                    | {expert.node_id for expert in expert_ops}
+                                )
+                                continue
                         events.append(ChromeTraceEvent(
-                            name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
-                            cat="compute" if op.stream_type != "comm" else "communication",
+                            name=self._moe_fb_event_name(
+                                op,
+                                f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
+                            ),
+                            cat=self._moe_fb_event_cat(
+                                op,
+                                "compute" if op.stream_type != "comm" else "communication",
+                            ),
                             pid=d,
                             tid=detail_base + op.stream_id,
                             ts=ts,
                             dur=dur_us * self._mult,
-                            args={
+                            args=self._moe_fb_event_args(op, {
                                 "phase": "fwd",
                                 "mb": m,
                                 "node_id": op.node_id,
@@ -573,25 +654,69 @@ class ChromeTraceExporter:
                                 "parallelism": op.parallelism_tag,
                                 **self._bucket_args(op),
                                 "view": "detail",
-                            },
+                            }),
                         ).to_dict())
 
                 bwd_base = grid_index.get((d, m, "bwd"), grid_index.get((d, m, "bwd_dx"), 0.0))
-                for op in tl.scheduled_ops:
+                skip_ids = set()
+                for idx, op in enumerate(tl.scheduled_ops):
+                    if op.node_id in skip_ids:
+                        continue
                     if "bwd" in op.phase:
                         dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
                         relative_start = op.start_us - bwd_origin
                         ts = (bwd_base + relative_start) * self._mult
                         if op.overlap_type not in ("none", "") and op.overlap_target:
                             ts = self._shift_overlap_comm_op(op, compute_index, bwd_base, ts)
+                        if self._trace_ep_waves and self._is_ep_dispatch(op):
+                            group = self._find_ep_wave_group(tl.scheduled_ops, idx)
+                            if group is not None and self._ep_wave_count(*group) > 1:
+                                _dispatch, expert_ops, combine, blockers, dispatch_ready = group
+                                dispatch_ready_rel = (
+                                    dispatch_ready - fwd_lat
+                                    if len(op.phase) > 0 and "fwd" not in op.phase
+                                    else dispatch_ready
+                                )
+                                events.extend(self._ep_wave_events(
+                                    op, expert_ops, combine,
+                                    pid=d,
+                                    detail_base=detail_base,
+                                    base=bwd_base,
+                                    mb=m,
+                                    phase="bwd",
+                                    name_prefix=f"m{m}:",
+                                    rel_start=lambda candidate: (
+                                        candidate.start_us - fwd_lat
+                                        if len(candidate.phase) > 0 and "fwd" not in candidate.phase
+                                        else candidate.start_us
+                                    ),
+                                    blockers=blockers,
+                                    dispatch_ready_us=dispatch_ready_rel,
+                                    region_end_us=(
+                                        combine.start_us - fwd_lat + combine.latency_us
+                                        if len(combine.phase) > 0 and "fwd" not in combine.phase
+                                        else combine.start_us + combine.latency_us
+                                    ),
+                                ))
+                                skip_ids.update(
+                                    {op.node_id, combine.node_id}
+                                    | {expert.node_id for expert in expert_ops}
+                                )
+                                continue
                         events.append(ChromeTraceEvent(
-                            name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
-                            cat="compute" if op.stream_type != "comm" else "communication",
+                            name=self._moe_fb_event_name(
+                                op,
+                                f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
+                            ),
+                            cat=self._moe_fb_event_cat(
+                                op,
+                                "compute" if op.stream_type != "comm" else "communication",
+                            ),
                             pid=d,
                             tid=detail_base + op.stream_id,
                             ts=ts,
                             dur=dur_us * self._mult,
-                            args={
+                            args=self._moe_fb_event_args(op, {
                                 "phase": "bwd",
                                 "mb": m,
                                 "node_id": op.node_id,
@@ -601,7 +726,7 @@ class ChromeTraceExporter:
                                 **self._bucket_args(op),
                                 **ddp_tail_args.get(op.node_id, {}),
                                 "view": "detail",
-                            },
+                            }),
                         ).to_dict())
 
         doc = self._build_doc(events)
@@ -610,6 +735,466 @@ class ChromeTraceExporter:
         return doc
 
     # ── internals ─────────────────────────────────────────────────────────
+
+    def _is_moe_fb_comm(self, op) -> bool:
+        return (
+            self._trace_moe_fb_overlap
+            and op.stream_type == "comm"
+            and op.parallelism_tag == "ep"
+            and op.op_type == "comm.all_to_all"
+            and op.comm_role in ("dispatch", "combine")
+        )
+
+    def _is_moe_fb_hidden_comm(self, op) -> bool:
+        return self._is_moe_fb_comm(op) and self._moe_fb_hidden_us(op) > 0.0
+
+    @staticmethod
+    def _moe_fb_hidden_us(op) -> float:
+        return max(0.0, float(getattr(op, "overlap_hidden_us", 0.0) or 0.0))
+
+    @staticmethod
+    def _moe_fb_exposed_us(op) -> float:
+        explicit = float(getattr(op, "overlap_exposed_us", 0.0) or 0.0)
+        if explicit > 0.0:
+            return explicit
+        hidden = ChromeTraceExporter._moe_fb_hidden_us(op)
+        return max(0.0, float(getattr(op, "latency_us", 0.0) or 0.0) - hidden)
+
+    def _moe_fb_event_name(self, op, name: str) -> str:
+        if not self._is_moe_fb_comm(op):
+            return name
+        state = "hidden" if self._is_moe_fb_hidden_comm(op) else "exposed"
+        return f"{name} [moe_fb {state} {op.comm_role}]"
+
+    def _moe_fb_event_cat(self, op, cat: str) -> str:
+        if not self._is_moe_fb_comm(op):
+            return cat
+        state = "hidden" if self._is_moe_fb_hidden_comm(op) else "exposed"
+        return f"communication.ep.moe_fb.{state}"
+
+    def _moe_fb_event_args(self, op, args: dict) -> dict:
+        if not self._is_moe_fb_comm(op):
+            return args
+        hidden_us = self._moe_fb_hidden_us(op)
+        exposed_us = self._moe_fb_exposed_us(op)
+        enriched = dict(args)
+        enriched.update({
+            "view": args.get("view", "detail"),
+            "parallelism": "ep",
+            "overlap": "moe_fb",
+            "role": op.comm_role,
+            "hidden": hidden_us > 0.0,
+            "hidden_us": hidden_us,
+            "exposed_us": exposed_us,
+            "original_node": op.node_id,
+            "stream_type": op.stream_type,
+        })
+        return enriched
+
+    @staticmethod
+    def _is_ep_dispatch(op) -> bool:
+        return (
+            op.stream_type == "comm"
+            and op.parallelism_tag == "ep"
+            and op.op_type == "comm.all_to_all"
+            and op.comm_role == "dispatch"
+        )
+
+    @staticmethod
+    def _is_ep_combine(op) -> bool:
+        return (
+            op.stream_type == "comm"
+            and op.parallelism_tag == "ep"
+            and op.op_type == "comm.all_to_all"
+            and op.comm_role == "combine"
+        )
+
+    @staticmethod
+    def _is_ep_expert_compute(op) -> bool:
+        if op.stream_type == "comm":
+            return False
+        text = " ".join((
+            op.op_type or "",
+            op.component or "",
+            op.scope or "",
+            op.module_class or "",
+            op.node_id or "",
+        )).lower()
+        return (
+            "groupedmatmul" in text
+            or "grouped_gate_up" in text
+            or "routed_expert_ffn" in text
+        )
+
+    @staticmethod
+    def _is_ep_wave_excluded_compute(op) -> bool:
+        text = " ".join((
+            op.op_type or "",
+            op.module_class or "",
+            op.component or "",
+            op.node_id or "",
+        )).lower()
+        return "moe_gate" in text or "gate" == (op.module_class or "").lower()
+
+    @classmethod
+    def _is_ep_wave_compute_candidate(cls, op) -> bool:
+        text = " ".join((
+            op.op_type or "",
+            op.module_class or "",
+            op.component or "",
+            op.scope or "",
+            op.node_id or "",
+        )).lower()
+        if "shared_expert" in text or "shared_experts" in text:
+            return False
+        return (
+            cls._is_ep_expert_compute(op)
+            or "grouped_silu" in text
+            or ".ffn.moe" in text
+        )
+
+    def _find_ep_wave_group(self, ops, dispatch_idx: int):
+        dispatch = ops[dispatch_idx]
+        expert_candidates = []
+        blockers = []
+        pre_region_compute = []
+        in_expert_region = False
+        expert_region_start = 0.0
+        for op in ops[dispatch_idx + 1:]:
+            if op.phase != dispatch.phase:
+                continue
+            if not self._same_ep_region_scope(dispatch.scope, op.scope):
+                continue
+            if self._is_ep_combine(op):
+                if not expert_candidates:
+                    return None
+                expert_candidates.sort(key=lambda candidate: candidate.start_us)
+                expert_candidates = self._trim_ep_region_at_down(expert_candidates)
+                if not expert_candidates:
+                    return None
+                blockers.sort(key=lambda candidate: candidate.start_us)
+                region_end = expert_candidates[-1].start_us
+                blockers = [
+                    blocker for blocker in blockers
+                    if blocker.start_us <= region_end
+                ]
+                pre_region_compute = [
+                    candidate for candidate in ops
+                    if candidate.phase == dispatch.phase
+                    and candidate.stream_type != "comm"
+                    and self._same_ep_region_scope(dispatch.scope, candidate.scope)
+                    and candidate.start_us < expert_region_start
+                ]
+                dispatch_ready = max(
+                    (candidate.end_us for candidate in pre_region_compute),
+                    default=dispatch.start_us,
+                )
+                return dispatch, expert_candidates, op, blockers, dispatch_ready
+            if self._is_ep_expert_compute(op):
+                in_expert_region = True
+                if not expert_candidates:
+                    expert_region_start = op.start_us
+                expert_candidates.append(op)
+                continue
+            if not in_expert_region and op.stream_type != "comm":
+                pre_region_compute.append(op)
+                continue
+            if in_expert_region and op.stream_type != "comm" and op.start_us >= expert_region_start:
+                if self._is_ep_wave_excluded_compute(op):
+                    blockers.append(op)
+                elif self._is_ep_wave_compute_candidate(op):
+                    expert_candidates.append(op)
+        return None
+
+    @staticmethod
+    def _trim_ep_region_at_down(expert_ops):
+        last_down_idx = None
+        for idx, op in enumerate(expert_ops):
+            text = " ".join((op.op_type or "", op.node_id or "", op.scope or "")).lower()
+            if "grouped_down" in text:
+                last_down_idx = idx
+        if last_down_idx is None:
+            return expert_ops
+        return expert_ops[:last_down_idx + 1]
+
+    @staticmethod
+    def _same_ep_region_scope(dispatch_scope: str, op_scope: str) -> bool:
+        if not dispatch_scope or not op_scope:
+            return False
+        if dispatch_scope == op_scope:
+            return True
+        marker = ".ffn."
+        if marker not in dispatch_scope or marker not in op_scope:
+            return False
+        return dispatch_scope.split(marker, 1)[0] == op_scope.split(marker, 1)[0]
+
+    @staticmethod
+    def _ep_expert_score(op) -> tuple[int, float]:
+        text = " ".join((
+            op.op_type or "",
+            op.component or "",
+            op.scope or "",
+            op.module_class or "",
+            op.node_id or "",
+        )).lower()
+        is_grouped = int("groupedmatmul" in text or "grouped_mm" in text)
+        return is_grouped, op.latency_us
+
+    def _ep_wave_count(self, *ops) -> int:
+        for op in ops:
+            if getattr(op, "ep_wave_k", 0) > 1:
+                return int(op.ep_wave_k)
+        return self._ep_wave_k if self._ep_wave_k > 1 else 1
+
+    def _ep_wave_events(
+        self,
+        dispatch,
+        expert_ops,
+        combine,
+        *,
+        pid: int,
+        detail_base: int,
+        base: float,
+        mb: int,
+        phase: str,
+        name_prefix: str,
+        rel_start,
+        blockers=(),
+        dispatch_ready_us: float | None = None,
+        region_end_us: float | None = None,
+    ) -> list[dict]:
+        waves = self._ep_wave_count(dispatch, *expert_ops, combine)
+        if waves <= 1:
+            return []
+
+        dispatch_start = max(
+            rel_start(dispatch),
+            dispatch_ready_us if dispatch_ready_us is not None else rel_start(dispatch),
+        )
+        dispatch_lat = dispatch.latency_us / waves
+        combine_lat = combine.latency_us / waves
+        expert_index = {op.node_id: idx for idx, op in enumerate(expert_ops)}
+        expert_lats = {op.node_id: op.latency_us / waves for op in expert_ops}
+        expert_starts = {op.node_id: rel_start(op) for op in expert_ops}
+        blocker_intervals = [
+            (rel_start(op), rel_start(op) + op.latency_us)
+            for op in blockers
+        ]
+        expert_name_counts: dict[str, int] = {}
+        for op in expert_ops:
+            expert_name_counts[op.op_type] = expert_name_counts.get(op.op_type, 0) + 1
+
+        events: list[dict] = []
+        stream_free = {
+            "comm": dispatch_start,
+            "compute": dispatch_start,
+        }
+        end_time: dict[tuple[str, int], float] = {}
+        unscheduled = {
+            (role, wave)
+            for wave in range(waves)
+            for role in (
+                ["dispatch"]
+                + [f"expert:{op.node_id}" for op in expert_ops]
+                + ["combine"]
+            )
+        }
+        role_priority = {"combine": 0, "expert": 1, "dispatch": 2}
+
+        def deps_done(role: str, wave: int) -> bool:
+            if role == "dispatch":
+                return wave == 0 or ("dispatch", wave - 1) in end_time
+            if role.startswith("expert:"):
+                idx = expert_index[role.split(":", 1)[1]]
+                if idx == 0:
+                    return ("dispatch", wave) in end_time
+                prev = expert_ops[idx - 1]
+                return (f"expert:{prev.node_id}", wave) in end_time
+            last = expert_ops[-1]
+            return (f"expert:{last.node_id}", wave) in end_time
+
+        def earliest_start(role: str, wave: int) -> float:
+            if role == "dispatch":
+                dep_ready = dispatch_start
+                stream = "comm"
+            elif role.startswith("expert:"):
+                op_id = role.split(":", 1)[1]
+                idx = expert_index[op_id]
+                if idx == 0:
+                    dep_ready = max(end_time[("dispatch", wave)], expert_starts[op_id])
+                else:
+                    prev = expert_ops[idx - 1]
+                    dep_ready = end_time[(f"expert:{prev.node_id}", wave)]
+                stream = "compute"
+            else:
+                last = expert_ops[-1]
+                dep_ready = end_time[(f"expert:{last.node_id}", wave)]
+                stream = "comm"
+            return max(dep_ready, stream_free[stream])
+
+        def avoid_compute_blockers(start: float, dur: float) -> float:
+            adjusted = start
+            changed = True
+            while changed:
+                changed = False
+                for blocker_start, blocker_end in blocker_intervals:
+                    if adjusted < blocker_end and adjusted + dur > blocker_start:
+                        adjusted = blocker_end
+                        changed = True
+            return adjusted
+
+        while unscheduled:
+            ready = [
+                (
+                    earliest_start(role, wave),
+                    role_priority["expert" if role.startswith("expert:") else role],
+                    wave,
+                    role,
+                )
+                for role, wave in unscheduled
+                if deps_done(role, wave)
+            ]
+            if not ready:
+                break
+            start, _priority, wave, role = min(ready)
+
+            if role == "dispatch":
+                op = dispatch
+                stream = "comm"
+                dur = dispatch_lat
+                cat = "communication.ep.dispatch"
+                event_role = "dispatch"
+                event_name = f"{name_prefix}{phase}:wave{wave}-dispatch"
+            elif role.startswith("expert:"):
+                op_id = role.split(":", 1)[1]
+                op = expert_ops[expert_index[op_id]]
+                stream = "compute"
+                dur = expert_lats[op_id]
+                start = avoid_compute_blockers(start, dur)
+                cat = "compute.ep.expert"
+                event_role = "expert"
+                event_name = self._ep_expert_event_name(
+                    name_prefix,
+                    phase,
+                    wave,
+                    op,
+                    expert_ops[:expert_index[op_id]],
+                    expert_name_counts,
+                )
+            else:
+                op = combine
+                stream = "comm"
+                dur = combine_lat
+                cat = "communication.ep.combine"
+                event_role = "combine"
+                event_name = f"{name_prefix}{phase}:wave{wave}-combine"
+
+            end = start + dur
+            stream_free[stream] = end
+            end_time[(role, wave)] = end
+            unscheduled.remove((role, wave))
+            events.append(self._wave_event(
+                event_name,
+                cat,
+                pid,
+                detail_base + op.stream_id,
+                base + start,
+                dur,
+                op,
+                mb,
+                wave,
+                waves,
+                event_role,
+            ))
+
+        if region_end_us is not None and not blockers:
+            self._fit_wave_events_to_region(
+                events,
+                base + dispatch_start,
+                base + region_end_us,
+            )
+
+        return events
+
+    def _fit_wave_events_to_region(
+        self,
+        events: list[dict],
+        region_start_us: float,
+        region_end_us: float,
+    ) -> None:
+        if not events or region_end_us <= region_start_us:
+            return
+        synth_end_us = max(
+            (event["ts"] + event["dur"]) / self._mult
+            for event in events
+            if event.get("ph") == "X"
+        )
+        if synth_end_us <= region_end_us:
+            return
+        scale = (region_end_us - region_start_us) / (synth_end_us - region_start_us)
+        if scale <= 0:
+            return
+        for event in events:
+            if event.get("ph") != "X":
+                continue
+            ts_us = event["ts"] / self._mult
+            dur_us = event["dur"] / self._mult
+            event["ts"] = (region_start_us + (ts_us - region_start_us) * scale) * self._mult
+            event["dur"] = dur_us * scale * self._mult
+            event.setdefault("args", {})["ep_wave_fit_scale"] = scale
+
+    @staticmethod
+    def _ep_expert_event_name(
+        name_prefix: str,
+        phase: str,
+        wave: int,
+        op,
+        previous_ops,
+        name_counts: dict[str, int],
+    ) -> str:
+        base = f"{name_prefix}{phase}:wave{wave}-expert-{op.op_type}"
+        if name_counts.get(op.op_type, 0) <= 1:
+            return base
+        duplicate_index = sum(1 for prev in previous_ops if prev.op_type == op.op_type)
+        if duplicate_index == 0:
+            return base
+        suffix = (op.node_id or f"{duplicate_index}").split("_")[-1]
+        return f"{base}:{suffix}"
+
+    def _wave_event(
+        self,
+        name: str,
+        cat: str,
+        pid: int,
+        tid: int,
+        ts_us: float,
+        dur_us: float,
+        op,
+        mb: int,
+        wave: int,
+        waves: int,
+        role: str,
+    ) -> dict:
+        return ChromeTraceEvent(
+            name=name,
+            cat=cat,
+            pid=pid,
+            tid=tid,
+            ts=ts_us * self._mult,
+            dur=max(dur_us, self._MIN_VISIBLE_US if op.stream_type == "comm" else 0.0) * self._mult,
+            args={
+                "phase": op.phase,
+                "mb": mb,
+                "op_type": op.op_type,
+                "view": "detail",
+                "parallelism": "ep",
+                "role": role,
+                "wave": wave,
+                "waves": waves,
+                "original_node": op.node_id,
+                "stream_type": op.stream_type,
+            },
+        ).to_dict()
 
     @staticmethod
     def _bucket_args(op) -> dict:

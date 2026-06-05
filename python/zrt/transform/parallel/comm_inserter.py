@@ -225,6 +225,11 @@ class CommInserterPass(GraphPass):
                 _propagate_phase(first, dispatch)
                 g.add_node(dispatch)
                 _prepend_comm(g, first.id, dispatch)
+                _add_control_edges(
+                    g,
+                    first.annotations.get("ep_routing_control_ids", []),
+                    dispatch.id,
+                )
 
             if combine_id not in g.nodes:
                 combine = OpNode(
@@ -736,3 +741,17 @@ def _prepend_comm(g: "OpGraph", dst_id: str, comm_node: OpNode) -> None:
             ))
 
     g._rebuild_adjacency()
+
+
+def _add_control_edges(g: "OpGraph", src_ids: list[str], dst_id: str) -> None:
+    """Add control dependencies from routing nodes to an inserted comm node."""
+    changed = False
+    for src_id in src_ids:
+        if src_id not in g.nodes or src_id == dst_id:
+            continue
+        if any(e.src == src_id and e.dst == dst_id for e in g.edges):
+            continue
+        g.edges.append(Edge(src=src_id, src_idx=0, dst=dst_id, dst_idx=0, tensor=None))
+        changed = True
+    if changed:
+        g._rebuild_adjacency()

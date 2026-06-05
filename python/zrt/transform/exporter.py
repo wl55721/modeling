@@ -692,10 +692,26 @@ def export_transformed_graph(graph: OpGraph, ctx: TransformContext,
     json_path = output_dir / f"{base_name}_transformed_graph.json"
     _export_json(graph, ctx, json_path)
 
+    onnx_path = output_dir / f"{base_name}_transformed_graph.onnx"
+    export_transformed_graph_onnx(graph, onnx_path)
+
     return {
         "excel": excel_path,
         "json": json_path,
+        "onnx": onnx_path,
     }
+
+
+def export_transformed_graph_onnx(graph: OpGraph, output_path: Path) -> Path:
+    """Export a transformed OpGraph to ONNX for Netron visualization."""
+    base_name = graph.name.replace("/", "_").replace(":", "_")
+    from python.zrt.report.onnx_exporter import export_onnx_from_records
+    return export_onnx_from_records(
+        _graph_to_fused_records(graph, preserve_topological_order=True),
+        output_path,
+        f"{base_name}_transformed",
+        is_fused=True,
+    )
 
 
 def _export_json(graph: OpGraph, ctx: TransformContext, output_path: Path) -> None:
@@ -1748,7 +1764,8 @@ def _get_fused_dtypes_from_sem_io(node: OpNode, direction: str) -> str:
 
 
 def _graph_to_fused_records(graph: OpGraph,
-                            phase_filter: str | None = None) -> List[Dict[str, Any]]:
+                            phase_filter: str | None = None,
+                            preserve_topological_order: bool = False) -> List[Dict[str, Any]]:
     """Build fused-record dicts from an OpGraph for the Fused Operators sheet.
 
     When the graph is a stitched fwd+bwd unified graph, ``phase_filter``
@@ -1756,10 +1773,32 @@ def _graph_to_fused_records(graph: OpGraph,
     """
     arrow = " → "
     records: List[Dict[str, Any]] = []
-    nodes = layer_stable_sort(graph.topo_sort(), graph=graph)
+    nodes = graph.topo_sort()
+    if not preserve_topological_order:
+        nodes = layer_stable_sort(nodes, graph=graph)
     if phase_filter is not None and (graph.phase == "train"
                                      or graph.metadata.get("fwd_bwd_stitched")):
         nodes = [n for n in nodes if n.annotations.get("phase") == phase_filter]
+    included_ids = {node.id for node in nodes}
+    incoming: dict[str, list[tuple[int, int]]] = {node.id: [] for node in nodes}
+    outgoing: dict[str, list[tuple[int, int]]] = {node.id: [] for node in nodes}
+    next_tensor_id = 0
+    for edge in graph.edges:
+        if edge.src not in included_ids or edge.dst not in included_ids:
+            continue
+        tensor_id = next_tensor_id
+        next_tensor_id += 1
+        outgoing[edge.src].append((edge.src_idx, tensor_id))
+        incoming[edge.dst].append((edge.dst_idx, tensor_id))
+    for node in nodes:
+        if not incoming[node.id]:
+            for input_idx, _tensor in enumerate(node.inputs):
+                incoming[node.id].append((input_idx, next_tensor_id))
+                next_tensor_id += 1
+        if not outgoing[node.id]:
+            for output_idx, _tensor in enumerate(node.outputs):
+                outgoing[node.id].append((output_idx, next_tensor_id))
+                next_tensor_id += 1
     for idx, node in enumerate(nodes):
         constituents = node.fused_from or [node.op_type]
         # Recover the "raw Node IDs that fused into this node".  Strip the
@@ -1812,6 +1851,8 @@ def _graph_to_fused_records(graph: OpGraph,
             "fused_output_dtypes": _get_fused_dtypes_from_sem_io(node, "output"),
             "fused_input_sources": "",
             "fused_output_sources": "",
+            "_input_ids": [tid for _slot, tid in sorted(incoming[node.id])],
+            "_output_ids": [tid for _slot, tid in sorted(outgoing[node.id])],
         })
     return records
 

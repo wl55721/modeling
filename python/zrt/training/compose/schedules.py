@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Union
 
 from zrt.training.compose.stage import StageTime, stage_time
 from zrt.training.models.comm import CommSpec, comm_spec_from_node, total_comm_time, optimizer_comm_time
+from zrt.training.models.moe_fb_overlap import apply_moe_fb_overlap
 
 if TYPE_CHECKING:
     from zrt.ir.graph import OpGraph
@@ -140,8 +141,16 @@ class StepResult:
     dp_hidden: float = 0.0  # DP AR absorbed in pipeline bubble
     tp_hidden: float = 0.0  # TP hidden by CoC/MC2
     cp_hidden: float = 0.0  # CP hidden by compute overlap
-    ep_hidden: float = 0.0  # EP hidden by wave-overlap
+    ep_hidden: float = 0.0  # Aggregate EP hidden comm
     pp_hidden: float = 0.0  # PP P2P hidden by DualPipe/DualPipeV bwd_dw stream
+
+    # Detailed EP hidden-communication attribution.
+    ep_fb_total: float = 0.0
+    ep_fb_hidden: float = 0.0
+    ep_fb_exposed: float = 0.0
+    ep_fb_steady_hidden: float = 0.0
+    ep_fb_boundary_hidden: float = 0.0
+    mega_moe_hidden: float = 0.0
 
     # Total comm volume = exposed + hidden
     total_comm_volume: float = 0.0  # All comm in step
@@ -218,6 +227,12 @@ class StepResult:
             "cp_hidden_ms": self.cp_hidden * _k,
             "ep_exposed_ms": self.ep_exposed * _k,
             "ep_hidden_ms": self.ep_hidden * _k,
+            "ep_fb_total_ms": self.ep_fb_total * _k,
+            "ep_fb_hidden_ms": self.ep_fb_hidden * _k,
+            "ep_fb_exposed_ms": self.ep_fb_exposed * _k,
+            "ep_fb_steady_hidden_ms": self.ep_fb_steady_hidden * _k,
+            "ep_fb_boundary_hidden_ms": self.ep_fb_boundary_hidden * _k,
+            "mega_moe_hidden_ms": self.mega_moe_hidden * _k,
             "pp_exposed_ms": self.pp_exposed * _k,
             "pp_hidden_ms": self.pp_hidden * _k,
             "dp_exposed_ms": self.dp_exposed * _k,
@@ -776,6 +791,8 @@ def pipeline_step_time(
         st = stage_time(stage_ops, stage_colls, model, system, strategy, domain=domain)
         stage_times.append(st)
 
+    stage_times = apply_moe_fb_overlap(stage_times, strategy)
+
     comm_times = total_comm_time(graph, model, system, strategy, domain=domain)
     dp_ar_time = comm_times.get("dp_grad_reduce", 0.0)
 
@@ -875,6 +892,12 @@ def pipeline_step_time(
                 comm_fwd=st.comm_fwd + pp_p2p_fwd_exposed[i],
                 comm_bwd=st.comm_bwd + pp_p2p_bwd_exposed[i],
                 ep_hidden=st.ep_hidden,
+                ep_fb_hidden=st.ep_fb_hidden,
+                ep_fb_exposed=st.ep_fb_exposed,
+                ep_fb_total=st.ep_fb_total,
+                ep_fb_steady_hidden=st.ep_fb_steady_hidden,
+                ep_fb_boundary_hidden=st.ep_fb_boundary_hidden,
+                mega_moe_hidden=st.mega_moe_hidden,
                 tp_hidden=st.tp_hidden,
                 tp_exposed=st.tp_exposed,
                 ep_exposed=st.ep_exposed,
@@ -948,10 +971,19 @@ def pipeline_step_time(
         )
         step.tp_hidden = scale * s_bot.tp_hidden
         step.ep_hidden = scale * s_bot.ep_hidden
+        step.ep_fb_total = scale * s_bot.ep_fb_total
+        step.ep_fb_hidden = scale * s_bot.ep_fb_hidden
+        step.ep_fb_exposed = scale * s_bot.ep_fb_exposed
+        step.ep_fb_steady_hidden = scale * s_bot.ep_fb_steady_hidden
+        step.ep_fb_boundary_hidden = scale * s_bot.ep_fb_boundary_hidden
+        step.mega_moe_hidden = scale * s_bot.mega_moe_hidden
         step.pp_hidden = scale * pp_p2p_hidden[bot_idx]
     else:
         step.tp_exposed = step.ep_exposed = step.cp_exposed = step.pp_exposed = 0.0
         step.tp_hidden = step.ep_hidden = step.pp_hidden = 0.0
+        step.ep_fb_total = step.ep_fb_hidden = step.ep_fb_exposed = 0.0
+        step.ep_fb_steady_hidden = step.ep_fb_boundary_hidden = 0.0
+        step.mega_moe_hidden = 0.0
 
     exposed_comm_excl_dp = (step.tp_exposed + step.ep_exposed
                             + step.cp_exposed + step.pp_exposed)
