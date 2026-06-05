@@ -30,6 +30,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from python.zrt.ir.edge import Edge
+from python.zrt.ir.node import update_latency
 from python.zrt.transform.base import GraphPass
 
 logger = logging.getLogger(__name__)
@@ -57,9 +58,9 @@ def _clone_node_as_tile(
     tile.attrs["coc_tile_index"] = tile_index
     tile.attrs["coc_tile_k"] = tile_k
 
-    orig_lat = src.annotations.get("latency_us", 0.0)
+    orig_lat = src.sim_result.latency_us
     if orig_lat > 0:
-        tile.annotations["latency_us"] = orig_lat / tile_k
+        update_latency(tile, orig_lat / tile_k)
 
     return tile
 

@@ -116,7 +116,15 @@ class OpNode:
     # ── module forward-call instance (used by fusion bucketing) ──
     call_id: int = 0
 
+    # ── simulation result (set by RooflinePass, updated by CostModel) ──
+    sim_result: Any = None
+
     # ── convenience ──────────────────────────────────────────────────────────
+
+    def __post_init__(self):
+        if self.sim_result is None:
+            from python.zrt.simulator.result import SimResult
+            self.sim_result = SimResult(op_node_id=self.id)
 
     @property
     def is_fused(self) -> bool:
@@ -145,3 +153,46 @@ class OpNode:
         ins  = ", ".join(repr(t) for t in self.inputs)
         outs = ", ".join(repr(t) for t in self.outputs)
         return f"OpNode({self.id}, {self.op_type}, [{ins}] → [{outs}])"
+
+
+def update_latency(node: OpNode, latency_us: float) -> None:
+    node.sim_result.latency_us = latency_us
+
+
+def get_base_compute_us(node: OpNode) -> float:
+    return node.sim_result.base_compute_us
+
+
+def get_base_memory_us(node: OpNode) -> float:
+    return node.sim_result.base_memory_us
+
+
+def get_checkpoint_activation_bytes(node: OpNode) -> int:
+    return node.sim_result.checkpoint_activation_bytes
+
+
+def get_checkpoint_memory_us(node: OpNode) -> float:
+    return node.sim_result.checkpoint_memory_us
+
+
+def get_recompute_flops(node: OpNode) -> int:
+    return node.sim_result.recompute_flops
+
+
+def get_recompute_read_bytes(node: OpNode) -> int:
+    return node.sim_result.recompute_read_bytes
+
+
+def get_recompute_write_bytes(node: OpNode) -> int:
+    return node.sim_result.recompute_write_bytes
+
+
+def get_recompute_compute_us(node: OpNode) -> float:
+    return node.sim_result.recompute_compute_us
+
+
+def get_recompute_memory_us(node: OpNode) -> float:
+    return node.sim_result.recompute_memory_us
+
+
+

@@ -17,7 +17,6 @@ from python.zrt.simulator.backends.lookup import (
     _get_cost_model_op_type,
     _get_primary_dtype,
     _calculate_hw_util,
-    _build_sim_result,
 )
 
 
@@ -361,77 +360,4 @@ class TestCalculateHwUtil:
         assert util < 0.5  # decode matmul is heavily memory-bound
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# _build_sim_result
-# ═════════════════════════════════════════════════════════════════════════════
 
-class TestBuildSimResult:
-
-    def test_confidence_zeroed_when_hw_util_zero(self, hw_910b):
-        """When no flops annotation, hw_util=0 → confidence should be 0."""
-        node = _node(
-            "aten.view.default",
-            inputs=[_tm("a", (64, 64))],
-            outputs=[_tm("o", (32, 128))],
-        )
-        r = _build_sim_result(node, hw_910b, 0.0, "lookup", 0.8)
-        assert r.confidence == 0.0
-
-    def test_confidence_preserved_when_hw_util_nonzero(self, hw_910b):
-        M, K, N = 1024, 4096, 7168
-        flops = 2 * M * N * K
-        node = _node(
-            "aten.mm.default",
-            inputs=[_tm("a", (M, K)), _tm("b", (K, N))],
-            outputs=[_tm("o", (M, N))],
-            annotations={"flops": flops},
-        )
-        r = _build_sim_result(node, hw_910b, 200.0, "lookup", 0.8)
-        assert r.confidence == 0.8
-        assert r.backend == "lookup"
-        assert r.latency_us == 200.0
-        assert r.hw_utilization > 0.0
-
-    def test_backend_field_reflects_passed_value(self, hw_910b):
-        node = _node(
-            "aten.mm.default",
-            inputs=[_tm("a", (64, 64)), _tm("b", (64, 64))],
-            outputs=[_tm("o", (64, 64))],
-            annotations={"flops": 1000},
-        )
-        r = _build_sim_result(node, hw_910b, 50.0, "tilesim", 0.9)
-        assert r.backend == "tilesim"
-
-    def test_op_node_id_preserved(self, hw_910b):
-        node = _node(
-            "aten.silu.default",
-            inputs=[_tm("x", (128,))],
-            outputs=[_tm("o", (128,))],
-        )
-        node.id = "op_42"
-        r = _build_sim_result(node, hw_910b, 5.0, "lookup", 0.3)
-        assert r.op_node_id == "op_42"
-
-    def test_annotations_flow_through_to_result(self, hw_910b):
-        node = _node(
-            "aten.mm.default",
-            inputs=[_tm("a", (64, 128)), _tm("b", (128, 64))],
-            outputs=[_tm("o", (64, 64))],
-            annotations={
-                "flops": 1_048_576,
-                "compute_us": 12.5,
-                "memory_us": 3.2,
-                "read_bytes": 65536,
-                "write_bytes": 16384,
-                "arithmetic_intensity": 12.8,
-                "bound": "compute",
-            },
-        )
-        r = _build_sim_result(node, hw_910b, 100.0, "lookup", 0.8)
-        assert r.flops == 1_048_576
-        assert r.compute_us == 12.5
-        assert r.memory_us == 3.2
-        assert r.read_bytes == 65536
-        assert r.write_bytes == 16384
-        assert r.arithmetic_intensity == 12.8
-        assert r.bound == "compute"

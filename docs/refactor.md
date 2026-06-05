@@ -53,7 +53,7 @@
 
 两条路径在 Stage 1（OpGraph 产物）之后分叉，各自独立计算 FLOPs/Memory/Pipeline，最终在 Stage 4（TrainingReport）汇合。
 
-**关键差异**：路径 B 产出 block-level OpGraph（~20 个高层节点，`spec.*` op_type），路径 A 产出 aten-level OpGraph（~200 个细粒度节点，`aten.*` op_type）。Transform Pipeline 的 Pass 设计假设 block-level 输入，因此路径 A 的 aten-level OpGraph 需要经过 **GraphCoarsenPass**（尚未实现）聚合后才能正确走通 Transform Pipeline。
+**关键差异**：路径 B 产出 block-level OpGraph（~20 个高层节点，`spec.*` op_type），路径 A 产出 aten-level OpGraph（~200 个细粒度节点，`aten.*` op_type）。Transform Pipeline 的 Pass 设计假设 block-level 输入，因此路径 A 的 aten-level OpGraph 需要聚合后才能正确走通 Transform Pipeline。
 
 ```mermaid
 flowchart TB
@@ -136,7 +136,7 @@ flowchart TB
     P1_RPT --> RPT["TrainingReport<br/><b>固定产物 ④</b>"]
     P2_RPT --> RPT
 
-    GAP["⚠ GraphCoarsenPass 缺失<br/>FusionPass 无法聚合 aten→block<br/>路径 A Transform Pipeline 不完整"]
+    GAP["⚠ 路径 A aten-level OpGraph<br/>FusionPass 无法直接处理<br/>需聚合为 block-level 后走通 Pipeline"]
 
     style INPUT fill:#e1f5fe
     style BUILD fill:#fff3e0
@@ -151,14 +151,13 @@ flowchart TB
 ```
 
 **已知限制**：
-- GraphCoarsenPass 缺失（C6 验证）：FusionPass 无法自动聚合 aten→block，路径 A 的 Transform Pipeline 不完整
+- 路径 A 的 aten-level OpGraph 需要聚合为 block-level 后才能走通 Transform Pipeline
 - 路径 B 仍走 Legacy 估算（`_estimate_legacy`），未迁移到 Transform Pipeline
 
 ### 2.3 目标归一化流程图
 
 归一化后，两条路径在 Stage 1（OpGraph）汇合，统一走 Transform Pipeline：
 
-- **GraphCoarsenPass**（新增）：将 aten-level OpGraph 按 `module_path` 聚合为 block-level OpNode，使路径 A 的抓图输出能正确走通 Transform Pipeline。对 block-level 输入（路径 B）为 no-op。
 - **路径 B 迁移**：`_estimate_legacy` 废弃，路径 B 也走 `estimate_via_pipeline()`
 
 ```mermaid
@@ -179,12 +178,10 @@ flowchart TB
     BCG --> OG
 
     subgraph PIPE["Stage 2: Transform Pipeline (固定产物 ②)"]
-        COARSEN["GraphCoarsenPass<br/>aten → block<br/>(仅 aten-level 输入需要)"]
         S1["split"]
         S2["fuse"]
         S3["optim"]
         S4["analyze"]
-        COARSEN --> S1
         S1 --> S2
         S2 --> S3
         S3 --> S4
@@ -210,7 +207,6 @@ flowchart TB
     style TOG fill:#fff9c4,stroke:#f57f17,stroke-width:3px
     style SR fill:#fff9c4,stroke:#f57f17,stroke-width:3px
     style RPT fill:#fff9c4,stroke:#f57f17,stroke-width:3px
-    style COARSEN fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
 ```
 
 ### 2.4 固定产物定义
@@ -550,31 +546,24 @@ Phase C (抓图路径接入)                           ✅ C1-C8 已完成
     ├── C3: estimate_via_pipeline 加 capture 参数 ✅
     ├── C4: config_loader 解析 capture: 段 ✅
     ├── C5: CLI _run_capture_estimate ✅
-    ├── C6: FusionPass 聚合验证 → 发现需要 GraphCoarsenPass ⚠
+    ├── C6: FusionPass 聚合验证 → aten-level 需扩展 FusionPass ⚠
     ├── C7: _run_training_modelling 废弃标记 ✅
     ├── C8: compare_paths.py 支持 capture ✅
     │
     ▼
-Phase D (GraphCoarsenPass)                       ⏳ 待实现 → 与 E2 合并
-    │
-    ├── 按 module_path 聚合 aten→block
-    ├── 路径 A 完整走通 Transform Pipeline
-    ├── 废弃 _run_training_modelling
-    │
-    ▼
 Phase E (统一性能评估路径)                        ⏳ 待开始  ← 详见 §12
     │
-    ├── E1: Pipeline 校准 (4 基线模型 × 多硬件, 以 Legacy 为锚)
-    │     ├── E1.1: 校准基础设施 (calibration_utils + 逐 Pass 测试)
-    │     ├── E1.2: TrainingFlopsPass 校准 (FP4/HC/CSA/SWA 感知)
-    │     ├── E1.3: TrainingMemoryPass 校准 (FP4 权重/Muon/HC 激活)
-    │     ├── E1.4: TrainingPipelinePass 校准 (DualPipeV/Muon/层间不均)
-    │     └── E1.5: 全基线回归验证 (15 Anchor × 86 字段)
+    ├── E1: FusionPass 扩展 (aten-level OpGraph 融合支持)
+    │     ├── E1.1: 扩展 FusionPass 支持 aten-level 节点模式匹配
+    │     ├── E1.2: 路径 A 端到端验证 (抓图 → Fusion → Pipeline → Report)
+    │     └── E1.3: Fusion 输出 vs explicit graph 结构对比
     │
-    ├── E2: GraphCoarsenPass (= Phase D 合并实施)
-    │     ├── E2.1: 聚合规则 (V4 特有: HC/Indexer/Compressor)
-    │     ├── E2.2: 路径 A 端到端验证
-    │     └── E2.3: Coarsen 输出 vs explicit graph 结构对比
+    ├── E2: Pipeline 校准 (4 基线模型 × 多硬件, 以 Legacy 为锚)
+    │     ├── E2.1: 校准基础设施 (calibration_utils + 逐 Pass 测试)
+    │     ├── E2.2: TrainingFlopsPass 校准 (FP4/HC/CSA/SWA 感知)
+    │     ├── E2.3: TrainingMemoryPass 校准 (FP4 权重/Muon/HC 激活)
+    │     ├── E2.4: TrainingPipelinePass 校准 (DualPipeV/Muon/层间不均)
+    │     └── E2.5: 全基线回归验证 (15 Anchor × 86 字段)
     │
     ├── E3: 路径 B 迁移到 Transform Pipeline
     │     ├── E3.1: estimate() 统一入口 (_estimate_legacy 废弃)
@@ -709,21 +698,21 @@ Step 3: TrainingPipelinePass 校准
 ### 12.4 分阶段实施计划
 
 ```
-Phase E1: Pipeline 校准（block-level 基线对齐）     ⏳ 待开始
+Phase E1: FusionPass 扩展 (aten-level 融合支持)     ⏳ 待实现
     │
-    ├── E1.1: 校准基础设施搭建
-    ├── E1.2: TrainingFlopsPass 校准
-    ├── E1.3: TrainingMemoryPass 校准
-    ├── E1.4: TrainingPipelinePass 校准
-    ├── E1.5: 全基线回归验证
-    ├── E1.6: 趋势校准 (monotonicity / direction checks)
+    ├── E1.1: 扩展 FusionPass 支持 aten-level 节点模式匹配
+    ├── E1.2: 路径 A 端到端验证
+    ├── E1.3: Fusion 后 OpGraph 与 block-level 对比
     │
     ▼
-Phase E2: GraphCoarsenPass 实现                     ⏳ 待实现 (即 Phase D)
+Phase E2: Pipeline 校准（block-level 基线对齐）     ⏳ 待开始
     │
-    ├── E2.1: 聚合规则设计与实现
-    ├── E2.2: 路径 A 端到端验证
-    ├── E2.3: Coarsen 后 OpGraph 与 block-level 对比
+    ├── E2.1: 校准基础设施搭建
+    ├── E2.2: TrainingFlopsPass 校准
+    ├── E2.3: TrainingMemoryPass 校准
+    ├── E2.4: TrainingPipelinePass 校准
+    ├── E2.5: 全基线回归验证
+    ├── E2.6: 趋势校准 (monotonicity / direction checks)
     │
     ▼
 Phase E3: 路径 B 迁移到 Transform Pipeline          ⏳ 待开始
@@ -743,11 +732,90 @@ Phase E4: Legacy 清理 + 回归守护                    ⏳ 待开始
 完成 — 单一评估路径
 ```
 
-### 12.5 Phase E1: Pipeline 校准（block-level 基线对齐）
+### 12.5 Phase E1: FusionPass 扩展（aten-level OpGraph 融合支持）
+
+**目标**：扩展 FusionPass 使其能直接处理 aten-level OpGraph（路径 A 真实抓图产出），无需额外的 GraphCoarsenPass 中间步骤。
+
+#### 12.5.1 E1.1 扩展 FusionPass 支持 aten-level 节点模式匹配
+
+**修改文件**：`python/zrt/transform/fusion/`
+
+当前 FusionPass 的匹配规则基于 block-level OpNode（`spec.*` op_type），无法识别 aten-level OpNode（`aten.*` op_type）。需要扩展匹配引擎，使其同时支持两种粒度：
+
+**扩展方向**：
+
+| 维度 | 当前状态 | 扩展目标 |
+|------|---------|---------|
+| 匹配粒度 | `spec.*` op_type 模式 | 同时支持 `aten.*` op_type 子图模式 |
+| 规则来源 | YAML 规则文件（按 model_type） | 新增 aten-level 规则（按 aten 子图拓扑） |
+| 融合产出 | 单个 fused OpNode（`spec.fused_*`） | 单个 fused OpNode（保留 aten 语义或映射为 spec） |
+| 输入检测 | 假设 block-level 输入 | 自动检测输入粒度，选择对应规则集 |
+
+**aten-level 融合模式示例**（以 DeepSeek-V4 为例）：
+
+| aten 子图模式 | 融合后标识 | 说明 |
+|--------------|-----------|------|
+| `aten.linear` + `aten.silu` + `aten.linear` | `fused.swiglu` | SwiGLU FFN 融合 |
+| `aten.rms_norm` + `aten.linear` (q/kv proj) | `fused.norm_qkv` | Norm + QKV 投影融合 |
+| `aten.matmul` + `aten.softmax` + `aten.matmul` | `fused.flash_attn` | Flash Attention 融合 |
+| `aten.all_gather` + `aten.linear` | `fused.ag_linear` | 通信-计算融合 (TP) |
+| `aten.linear` + `aten.reduce_scatter` | `fused.linear_rs` | 计算-通信融合 (TP) |
+| HC 相关 aten 子图 | `fused.hc_block` | Hyper-Connection 融合块 |
+| Indexer 相关 aten 子图 | `fused.indexer_block` | Lightning Indexer 融合块 |
+
+**融合逻辑**：
+1. 检测输入 OpGraph 粒度（`spec.*` vs `aten.*`）
+2. 加载对应规则集（block-level 规则 或 aten-level 规则）
+3. 子图模式匹配 → 生成 fused OpNode
+4. 对 block-level 输入保持现有行为（no-op 或已有规则）
+
+#### 12.5.2 E1.2 路径 A 端到端验证
+
+```python
+def test_fusion_v4_pro_end_to_end():
+    """V4 Pro 真实抓图 → FusionPass → Pipeline → TrainingReport 端到端验证。
+    
+    原理: 抓图产出 aten-level OpGraph (~500 nodes for V4 Pro)，
+          FusionPass 直接对 aten-level 节点进行融合，
+          然后走通 Transform Pipeline 产出 TrainingReport。
+    观测点:
+      - Fusion 后节点数: 融合后节点数应显著减少
+      - TrainingReport 各字段非零且合理
+      - 与路径 B 的 TrainingReport 在数量级上一致
+    """
+    ...
+```
+
+#### 12.5.3 E1.3 Fusion 输出 vs explicit graph 结构对比
+
+```python
+def test_fusion_output_matches_explicit_graph():
+    """FusionPass 处理 aten-level OpGraph 后的结果应与 build_explicit_graph() 产出结构相似。
+    
+    原理: 同一模型的两种构图路径，aten-level 经过 FusionPass 后应产出相似的拓扑。
+    观测点:
+      - 节点类型分布: 融合后 op_type 的种类和数量
+      - 边连接模式: fwd/bwd 的数据流拓扑
+      - FLOPs 分布: 各 op_type 的 FLOPs 占比
+    """
+    ...
+```
+
+#### 12.5.4 E1 关键文件
+
+| 操作 | 文件 | 说明 |
+|------|------|------|
+| 修改 | `transform/fusion/` | 扩展 FusionPass 支持 aten-level 匹配 |
+| 修改 | `transform/pipeline.py` | Pipeline 入口根据输入粒度选择融合规则集 |
+| 新增 | `transform/fusion/rules/aten_*.yaml` | aten-level 融合规则文件 |
+| 新增 | `tests/training/test_fusion_aten_level.py` | aten-level 融合正确性 + 端到端测试 |
+| 参考 | `transform/fusion/rules/deepseek_v4.yaml` | V4 block-level 融合规则（已有） |
+
+### 12.6 Phase E2: Pipeline 校准（block-level 基线对齐）
 
 **目标**：让 Transform Pipeline 在 block-level OpGraph 上的输出与 Legacy 已校准结果数值对齐。
 
-#### 12.5.1 E1.1 校准基础设施搭建
+#### 12.6.1 E2.1 校准基础设施搭建
 
 **新增文件**：`tests/training/calibration/test_pipeline_calibration.py`
 
@@ -828,7 +896,7 @@ def run_both_paths(model, system, strategy) -> dict:
     return comparison
 ```
 
-#### 12.5.2 E1.2 TrainingFlopsPass 校准
+#### 12.6.2 E2.2 TrainingFlopsPass 校准
 
 **修改文件**：`python/zrt/transform/analysis/training.py::TrainingFlopsPass`
 
@@ -864,7 +932,7 @@ def test_flops_pass_v4_pro_calibration():
     assert comparison["backward_flops"]["diff_pct"] < 0.001
 ```
 
-#### 12.5.3 E1.3 TrainingMemoryPass 校准
+#### 12.6.3 E2.3 TrainingMemoryPass 校准
 
 **修改文件**：`python/zrt/transform/analysis/training.py::TrainingMemoryPass`
 
@@ -902,7 +970,7 @@ def test_memory_pass_v4_pro_calibration():
     assert comparison["grad_hbm_gb"]["diff_pct"] < 0.02
 ```
 
-#### 12.5.4 E1.4 TrainingPipelinePass 校准
+#### 12.6.4 E2.4 TrainingPipelinePass 校准
 
 **修改文件**：`python/zrt/transform/analysis/training.py::TrainingPipelinePass`
 
@@ -945,14 +1013,14 @@ def test_pipeline_pass_v4_pro_dualpipev_calibration():
     assert comparison["optimizer_time_ms"]["diff_pct"] < 0.05
 ```
 
-#### 12.5.5 E1.5 全基线回归验证
+#### 12.6.5 E2.5 全基线回归验证
 
 **新增文件**：`tests/training/calibration/test_full_baseline_regression.py`
 
 ```python
 """全基线端到端回归测试 — 确保 Pipeline 在所有基线模型上与 Legacy 对齐。
 
-原理: 在 E1.2-E1.4 逐 Pass 修复后，端到端验证所有基线模型 × 硬件组合。
+原理: 在 E2.2-E2.4 逐 Pass 修复后，端到端验证所有基线模型 × 硬件组合。
 观测点: 每个 Anchor 的 86 个数值字段均在容差内。
 """
 
@@ -987,11 +1055,11 @@ def test_pipeline_matches_legacy(model_id, anchor_id):
     ...
 ```
 
-#### 12.5.6 E1.6 趋势校准（Monotonicity / Direction Checks）
+#### 12.6.6 E2.6 趋势校准（Monotonicity / Direction Checks）
 
 **目标**：验证估算器在配置参数单调变化时，输出指标的变化方向符合物理直觉。
 
-**原理**：数值校准（E1.2-E1.5）确保单点精度，但无法捕获公式的系统性错误。例如，一个 FLOPs 公式可能在某个点上恰好与 Legacy 一致，但在参数变化时趋势错误（如 TP 增大但显存反而上升）。趋势校准通过扫描参数空间、验证输出方向，捕获这类系统性缺陷。
+**原理**：数值校准（E2.2-E2.5）确保单点精度，但无法捕获公式的系统性错误。例如，一个 FLOPs 公式可能在某个点上恰好与 Legacy 一致，但在参数变化时趋势错误（如 TP 增大但显存反而上升）。趋势校准通过扫描参数空间、验证输出方向，捕获这类系统性缺陷。
 
 **方法论**：固定基线配置，逐一扫描某个参数的变化序列，断言指定指标的变化方向（单调递增/递减/先降后升等）。
 
@@ -1562,7 +1630,7 @@ def test_trend_num_experts_increase(model_id):
 | T8.1 | HC mult↑ | 1→2→4→8 | — | act_hbm, compute_time_ms, weight_hbm | — |
 | T8.2 | Experts↑ | 64→384 | — | total_params, weight_hbm | total_flops |
 
-#### 12.5.7 E1 关键文件
+#### 12.6.7 E2 关键文件
 
 | 操作 | 文件 | 说明 |
 |------|------|------|
@@ -1576,96 +1644,11 @@ def test_trend_num_experts_increase(model_id):
 | 参考 | `training/compose/schedules.py` | Legacy Pipeline 基准实现 |
 | 参考 | `scripts/compare_paths.py` | 现有对比脚本（复用逻辑） |
 
-### 12.6 Phase E2: GraphCoarsenPass 实现
-
-**目标**：让路径 A 的 aten-level OpGraph（真实抓图产出）能正确走通 Transform Pipeline。
-
-> 注：此阶段与 Phase D（GraphCoarsenPass）合并实施。
-
-#### 12.6.1 E2.1 聚合规则设计与实现
-
-**新增文件**：`python/zrt/transform/passes/coarsen.py`
-
-```python
-class GraphCoarsenPass(GraphPass):
-    """将 aten-level OpGraph 按 module_path 聚合为 block-level OpNode。
-
-    对已经是 block-level 的输入（op_type 前缀为 "spec."）为 no-op。
-    """
-```
-
-**聚合规则表**（以 DeepSeek-V4 为例）：
-
-| module_path 模式 | 聚合后 op_type | 聚合后 spec_kind | 说明 |
-|-----------------|---------------|-----------------|------|
-| `model.embed_tokens.*` | `spec.embed` | `embed` | 嵌入层 |
-| `model.layers.N.input_layernorm.*` | `spec.ln` | `rmsnorm` | 输入归一化 |
-| `model.layers.N.self_attn.q_proj.*` + `compressor.*` | `spec.q_proj` | `q_proj_csa` / `q_proj_hca` | Q 投影 + KV 压缩 |
-| `model.layers.N.self_attn.kv_proj.*` | `spec.kv_proj` | `kv_proj` | KV 投影 |
-| `model.layers.N.self_attn.attn_core.*` | `spec.attn_core` | `attn_core` | 核心注意力 |
-| `model.layers.N.self_attn.o_proj.*` | `spec.o_proj` | `o_proj` | 输出投影 |
-| `model.layers.N.self_attn.indexer.*` | `spec.indexer` | `indexer` | 稀疏索引器 (CSA 层) |
-| `model.layers.N.post_attention_layernorm.*` | `spec.ln` | `rmsnorm` | 后注意力归一化 |
-| `model.layers.N.mlp.gate_proj.*` | `spec.gate` | `router` | MoE 路由门 |
-| `model.layers.N.mlp.experts.*` | `spec.expert` | `swiglu_expert` | SwiGLU 专家 |
-| `model.layers.N.mlp.shared_experts.*` | `spec.shared_expert` | `shared_expert` | 共享专家 |
-| `model.layers.N.hc_pre.*` | `spec.hc_pre` | `hc_pre` | HC 预注意力 |
-| `model.layers.N.hc_post.*` | `spec.hc_post` | `hc_post` | HC 后注意力 |
-| `lm_head.*` | `spec.lm_head` | `lm_head` | 语言模型头 |
-
-**聚合逻辑**：
-1. 按 `module_path` 前缀分桶
-2. 桶内所有 aten OpNode 的 FLOPs 求和 → 聚合后 OpNode 的 FLOPs
-3. 桶内第一个 OpNode 的输入 → 聚合后 OpNode 的输入
-4. 桶内最后一个 OpNode 的输出 → 聚合后 OpNode 的输出
-5. 保留 `attrs["spec_kind"]`、`attrs["layer_id"]`、`attrs["component"]`
-
-#### 12.6.2 E2.2 路径 A 端到端验证
-
-```python
-def test_coarsen_v4_pro_end_to_end():
-    """V4 Pro 真实抓图 → Coarsen → Pipeline → TrainingReport 端到端验证。
-    
-    原理: 抓图产出 aten-level OpGraph (~500 nodes for V4 Pro)，
-          Coarsen 后应变为 block-level (~30 nodes/layer × num_layers)，
-          然后走通 Transform Pipeline 产出 TrainingReport。
-    观测点:
-      - Coarsen 后节点数: 预期 ~30 × num_layers_traced + 非层节点
-      - TrainingReport 各字段非零且合理
-      - 与路径 B 的 TrainingReport 在数量级上一致
-    """
-    ...
-```
-
-#### 12.6.3 E2.3 Coarsen 后 OpGraph 与 block-level 对比
-
-```python
-def test_coarsen_output_matches_explicit_graph():
-    """Coarsen 后的 OpGraph 应与 build_explicit_graph() 产出的结构相似。
-    
-    原理: 同一模型的两种构图路径，经过 Coarsen 后应产出相似的 block-level 拓扑。
-    观测点:
-      - 节点类型分布: spec.* op_type 的种类和数量
-      - 边连接模式: fwd/bwd 的数据流拓扑
-      - FLOPs 分布: 各 op_type 的 FLOPs 占比
-    """
-    ...
-```
-
-#### 12.6.4 E2 关键文件
-
-| 操作 | 文件 | 说明 |
-|------|------|------|
-| 新增 | `transform/passes/coarsen.py` | GraphCoarsenPass 实现 |
-| 修改 | `transform/pipeline.py` | Pipeline 入口加入 CoarsenPass（aten-level 输入时自动启用） |
-| 新增 | `tests/training/test_graph_coarsen.py` | 聚合正确性 + 端到端测试 |
-| 新增 | `transform/fusion/rules/deepseek_v4.yaml` | V4 融合规则（已有，需验证覆盖度） |
-
 ### 12.7 Phase E3: 路径 B 迁移到 Transform Pipeline
 
 **目标**：`_estimate_legacy()` 废弃，所有路径统一走 `estimate_via_pipeline()`。
 
-**前提**：E1 已确保 Pipeline 在 block-level 输入上与 Legacy 数值一致。
+**前提**：E2 已确保 Pipeline 在 block-level 输入上与 Legacy 数值一致。
 
 #### 12.7.1 E3.1 estimate() 统一入口
 
@@ -1785,14 +1768,14 @@ CONFIGS = [
 }
 ```
 
-> 注：`values` 中的 `0.0` 为占位符，E1 完成后用实际 Pipeline 输出填充。
+> 注：`values` 中的 `0.0` 为占位符，E2 完成后用实际 Pipeline 输出填充。
 
 **新增文件**：`tests/training/calibration/test_golden_regression.py`
 
 ```python
 """Golden value 回归守护 — 每次 CI 运行验证 Pipeline 输出不漂移。
 
-原理: 以 E1 校准后的 Pipeline 输出为 golden value，
+原理: 以 E2 校准后的 Pipeline 输出为 golden value，
       后续任何代码变更不得导致输出漂移超过容差。
 观测点: 每个 baseline 的 P0-P3 指标均在容差内。
 """
@@ -1807,11 +1790,11 @@ CONFIGS = [
 ### 12.9 依赖关系与风险
 
 ```
-Phase E1 (Pipeline 校准)  ←── 无依赖，可立即开始
-    │                         是 E2/E3/E4 的前提
+Phase E1 (FusionPass 扩展) ←── 无依赖，可立即开始
+    │                           是 E2/E3/E4 的前提
     │
-Phase E2 (GraphCoarsenPass) ←── 可与 E1 并行开发
-    │                           但校准验证需 E1 完成
+Phase E2 (Pipeline 校准)   ←── 依赖 E1
+    │                           端到端校准需 FusionPass 支持 aten-level 输入
     │
 Phase E3 (路径 B 迁移)     ←── 依赖 E1 + E2
     │
@@ -1821,9 +1804,9 @@ Phase E4 (Legacy 清理)     ←── 依赖 E3
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
-| Pipeline Pass 公式与 Legacy 差异大 | E1 工作量增加 | 逐 Pass 对比，优先修 FlopsPass（P0 指标） |
+| aten-level 融合规则不通用 | 新模型需新增规则 | 规则表驱动，按 model_type 分发 |
+| Pipeline Pass 公式与 Legacy 差异大 | E2 工作量增加 | 逐 Pass 对比，优先修 FlopsPass（P0 指标） |
 | V4 特有 op 未被 Pipeline 识别 | 校准无法通过 | 先审计 Pipeline Pass 对 V4 op_type 的覆盖度 |
-| GraphCoarsenPass 聚合规则不通用 | 新模型需新增规则 | 规则表驱动，按 model_type 分发 |
 | DualPipeV 调度在 Pipeline 中未实现 | V4 Pro 校准失败 | 优先验证 PPStitcher 对 DualPipeV 的支持 |
 | Golden value 随代码演进而过时 | 回归守护误报 | golden values 版本化管理，定期重新校准 |
 
@@ -1839,7 +1822,7 @@ flowchart TB
 
     subgraph BUILD["Stage 1: OpGraph"]
         BEG["build_explicit_graph()<br/>block-level"]
-        BCG["build_captured_graph()<br/>aten-level → Coarsen → block-level"]
+        BCG["build_captured_graph()<br/>aten-level"]
     end
 
     YAML_B --> BEG

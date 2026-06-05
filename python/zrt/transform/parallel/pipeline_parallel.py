@@ -105,8 +105,8 @@ class PipelineParallelPass(GraphPass):
             layer_nodes.setdefault(layer_idx, set()).add(node.id)
 
             load = (
-                node.annotations.get("compute_us")
-                or node.annotations.get("latency_us")
+                node.sim_result.compute_us
+                or node.sim_result.latency_us
                 or node.annotations.get("flops", 0) / 1e12
                 or 1.0
             )
@@ -337,8 +337,8 @@ class PipelineParallelPass(GraphPass):
                 continue
 
             load = (
-                node.annotations.get("compute_us")
-                or node.annotations.get("latency_us")
+                node.sim_result.compute_us
+                or node.sim_result.latency_us
                 or node.annotations.get("flops", 0) / 1e12
                 or 1.0
             )
@@ -587,7 +587,7 @@ class PipelineParallelPass(GraphPass):
                 continue
             
             layer_type = layer_profile.layer_types[layer_idx]
-            latency = node.annotations.get("latency_us", 0.0)
+            latency = node.sim_result.latency_us
             typical_costs[layer_type] = typical_costs.get(layer_type, 0.0) + latency
         
         return typical_costs

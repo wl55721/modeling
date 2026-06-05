@@ -8,9 +8,10 @@ Iterate nodes in topological order.  For each node:
     start_us    = max(ready_time, stream_free)
     end_us      = start_us + latency_us
 
-latency_us is read from node.annotations["latency_us"] when present.
-If missing and hw_spec is provided, the Roofline backend estimates it.
-If neither is available, 1 µs is used as a conservative placeholder.
+latency_us is read from node.sim_result (set by RooflinePass) when present.
+Falls back to annotations["latency_us"] for comm/optimizer nodes.
+If neither is available and hw_spec is provided, the Roofline backend estimates it.
+Otherwise, 1 µs is used as a conservative placeholder.
 """
 from __future__ import annotations
 
@@ -287,6 +288,8 @@ class DAGScheduler:
         return {node.id: idx for idx, node in enumerate(ordered)}
 
     def _latency(self, node: "OpNode") -> float:
+        if node.sim_result.backend:
+            return node.sim_result.latency_us
         if "latency_us" in node.annotations:
             return float(node.annotations["latency_us"])
         if self._hw is not None:

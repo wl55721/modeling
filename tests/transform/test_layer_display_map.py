@@ -17,6 +17,7 @@ from python.zrt.graph.layer_strategy import LayerProfile, LayerType
 from python.zrt.ir.graph import Edge, OpGraph
 from python.zrt.ir.node import OpNode
 from python.zrt.ir.types import DType, TensorMeta
+from python.zrt.simulator.result import SimResult
 from python.zrt.transform.exporter import (
     TrainingGraphExcelWriter,
     _build_layer_display_map,
@@ -40,6 +41,20 @@ def _mk_node(nid: str, layer: str = "", op_type: str = "aten.add.Tensor",
         layer=layer,
     )
     n.annotations["phase"] = phase
+    n.sim_result = SimResult(
+        op_node_id=nid,
+        latency_us=0.0,
+        compute_us=0.0,
+        memory_us=0.0,
+        flops=0,
+        read_bytes=0,
+        write_bytes=0,
+        arithmetic_intensity=0.0,
+        bound="",
+        hw_utilization=0.0,
+        backend="test",
+        confidence=1.0,
+    )
     return n
 
 
@@ -391,9 +406,22 @@ class TestWriteFwdBwdOpsSheet:
     def test_recompute_flag_in_bwd(self, tmp_path):
         bwd_node = _mk_node("b0", layer="0", phase="bwd")
         bwd_node.annotations["recompute"] = True
-        bwd_node.annotations["recompute_latency_us"] = 5.0
-        bwd_node.annotations["base_latency_us"] = 10.0
-        bwd_node.annotations["latency_us"] = 15.0
+        bwd_node.sim_result = SimResult(
+            op_node_id="b0",
+            latency_us=15.0,
+            compute_us=0.0,
+            memory_us=0.0,
+            flops=0,
+            read_bytes=0,
+            write_bytes=0,
+            arithmetic_intensity=0.0,
+            bound="latency",
+            hw_utilization=0.0,
+            backend="test",
+            confidence=1.0,
+            recompute_latency_us=5.0,
+            base_latency_us=10.0,
+        )
 
         fwd = [_mk_node("f0", layer="0", phase="fwd")]
         _, bwd_rows = self._write_and_read(tmp_path, fwd, [bwd_node])
@@ -407,8 +435,22 @@ class TestWriteFwdBwdOpsSheet:
 
     def test_activation_columns_fwd(self, tmp_path):
         fwd_node = _mk_node("f0", layer="0", phase="fwd")
-        fwd_node.annotations["saved_activation_bytes"] = 1024
-        fwd_node.annotations["activation_memory_us"] = 2.5
+        fwd_node.sim_result = SimResult(
+            op_node_id="f0",
+            latency_us=0.0,
+            compute_us=0.0,
+            memory_us=0.0,
+            flops=0,
+            read_bytes=0,
+            write_bytes=0,
+            arithmetic_intensity=0.0,
+            bound="latency",
+            hw_utilization=0.0,
+            backend="test",
+            confidence=1.0,
+            saved_activation_bytes=1024,
+            activation_memory_us=2.5,
+        )
         fwd_rows, _ = self._write_and_read(tmp_path, [fwd_node])
         assert fwd_rows[0]["Activation (B)"] == 1024
         assert fwd_rows[0]["Activation Memory (µs)"] == 2.5
