@@ -243,6 +243,7 @@ def _build_onnx_from_records(
             inputs=input_names,
             outputs=output_names,
             name=node_name,
+            domain="ai.aten",
         )
 
         # ── Attributes (visible in Netron properties panel) ───────────────
@@ -280,11 +281,38 @@ def _build_onnx_from_records(
     # connections are implicit via shared names — no value_info needed,
     # no weight tensors appear as large input boxes in Netron.
     _dummy = helper.make_tensor_type_proto(TensorProto.FLOAT, [1])
+    produced_names = {
+        name
+        for node in onnx_nodes
+        for name in node.output
+    }
+    consumed_names = {
+        name
+        for node in onnx_nodes
+        for name in node.input
+    }
+    graph_input_names = [
+        name for name in tid_to_name.values()
+        if name in consumed_names and name not in produced_names
+    ]
+    graph_output_names = [
+        name for name in tid_to_name.values()
+        if name in produced_names and name not in consumed_names
+    ]
+    if not graph_output_names and onnx_nodes:
+        graph_output_names = list(onnx_nodes[-1].output)
+
     graph = helper.make_graph(
         onnx_nodes,
         name=model_name,
-        inputs=[helper.make_value_info("graph_input",  _dummy)],
-        outputs=[helper.make_value_info("graph_output", _dummy)],
+        inputs=[
+            helper.make_value_info(name, _dummy)
+            for name in graph_input_names
+        ],
+        outputs=[
+            helper.make_value_info(name, _dummy)
+            for name in graph_output_names
+        ],
         value_info=[],
     )
 

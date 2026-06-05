@@ -900,6 +900,7 @@ def test_export_transformed_graph_writes_netron_onnx_with_edges(tmp_path):
     assert onnx_path.exists()
 
     model = onnx.load(onnx_path)
+    onnx.checker.check_model(model)
     assert len(model.graph.node) == 2
     q, o = model.graph.node
     assert q.output
