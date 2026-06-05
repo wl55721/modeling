@@ -1,5 +1,5 @@
 from ..common.tensor_base import TensorBase
-from .base import OpCubeBase
+from .op_base import OpCubeBase
 
 
 class MatMul(OpCubeBase):

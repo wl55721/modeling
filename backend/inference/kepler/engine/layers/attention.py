@@ -1,4 +1,4 @@
-from .base import OpMixBase, TensorBase
+from .op_base import OpMixBase, TensorBase
 
 
 class FlashAttention(OpMixBase):

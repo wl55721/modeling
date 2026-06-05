@@ -1,6 +1,6 @@
 from backend.inference.kepler.engine.common.tensor_base import DType
 
-from .base import OpVectorBase, TensorBase
+from .op_base import OpVectorBase, TensorBase
 
 
 class Sigmoid(OpVectorBase):

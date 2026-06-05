@@ -13,7 +13,7 @@ import networkx as nx
 
 from .common.tensor_base import TensorBase, DType
 from .chips.config import AIChipConfig
-from .layers.base import OperatorExecuteResult
+from .layers.op_base import OperatorExecuteResult
 from .model_config import ModelConfig, OperatorConfig
 from . import layers as _layers
 from ....utils.log import logger
@@ -85,19 +85,18 @@ class Node:
 
     def fill_operator(self, context: dict) -> None:
         op_cls = getattr(_layers, self.op_name, None)
-        if op_cls is not None:
-            try:
-                self.op = op_cls(weights=self.weight_tensors, **context)
-                self.op.op_id = self.op_id
-                self.op.op_name = self.op_name
-                self.op.layer_idx = self.layer_idx
-                self.op.rank_idx = self.rank_idx
-                self.op.op_module = self.op_module
-                self.op.compute_flops_str = self.compute_flops
-            except Exception:
-                logger.error("failed to create operator %s", self.op_name, exc_info=True)
-        else:
-            logger.error("unknown operator type: %s", self.op_name)
+        if op_cls is None:
+            op_cls = _layers.CustomOp  # 自定义算子 fallback
+        try:
+            self.op = op_cls(weights=self.weight_tensors, **context)
+            self.op.op_id = self.op_id
+            self.op.op_name = self.op_name
+            self.op.layer_idx = self.layer_idx
+            self.op.rank_idx = self.rank_idx
+            self.op.op_module = self.op_module
+            self.op.compute_flops_str = self.compute_flops
+        except Exception:
+            logger.error("failed to create operator %s", self.op_name, exc_info=True)
 
 
 # ── 执行器 ────────────────────────────────────────────

@@ -1,9 +1,9 @@
 {
-  "name": "B300_POD",
-  "hw_env": "B300_POD",
-  "chip_name": "B300",
-  "vendor" : "NVIDIA",
-  "spec_memory_size": 288,
+  "name": "B200_Server",
+  "hw_env": "B200_Server",
+  "chip_name": "B200",
+  "vendor": "NVIDIA",
+  "spec_memory_size": 192,
   "spec_cube_fp16": 2250,
   "spec_vect_fp16": 160,
   "spec_sfu_fp16": 22,
@@ -16,5 +16,5 @@
   "bw_gmem_ratio": 0.8,
   "comm_intra_ratio": 0.8,
   "comm_inter_ratio": 0.8,
-  "superpod_limit": 72
+  "superpod_limit": 8
 }
