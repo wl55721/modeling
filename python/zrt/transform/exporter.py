@@ -707,7 +707,7 @@ def export_transformed_graph_onnx(graph: OpGraph, output_path: Path) -> Path:
     base_name = graph.name.replace("/", "_").replace(":", "_")
     from python.zrt.report.onnx_exporter import export_onnx_from_records
     return export_onnx_from_records(
-        _graph_to_fused_records(graph),
+        _graph_to_fused_records(graph, preserve_topological_order=True),
         output_path,
         f"{base_name}_transformed",
         is_fused=True,
@@ -1764,7 +1764,8 @@ def _get_fused_dtypes_from_sem_io(node: OpNode, direction: str) -> str:
 
 
 def _graph_to_fused_records(graph: OpGraph,
-                            phase_filter: str | None = None) -> List[Dict[str, Any]]:
+                            phase_filter: str | None = None,
+                            preserve_topological_order: bool = False) -> List[Dict[str, Any]]:
     """Build fused-record dicts from an OpGraph for the Fused Operators sheet.
 
     When the graph is a stitched fwd+bwd unified graph, ``phase_filter``
@@ -1772,7 +1773,9 @@ def _graph_to_fused_records(graph: OpGraph,
     """
     arrow = " → "
     records: List[Dict[str, Any]] = []
-    nodes = layer_stable_sort(graph.topo_sort(), graph=graph)
+    nodes = graph.topo_sort()
+    if not preserve_topological_order:
+        nodes = layer_stable_sort(nodes, graph=graph)
     if phase_filter is not None and (graph.phase == "train"
                                      or graph.metadata.get("fwd_bwd_stitched")):
         nodes = [n for n in nodes if n.annotations.get("phase") == phase_filter]

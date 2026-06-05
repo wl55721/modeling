@@ -299,8 +299,11 @@ def _build_onnx_from_records(
         name for name in tid_to_name.values()
         if name in produced_names and name not in consumed_names
     ]
-    if not graph_output_names and onnx_nodes:
-        graph_output_names = list(onnx_nodes[-1].output)
+    if not graph_output_names:
+        for node in reversed(onnx_nodes):
+            if node.output:
+                graph_output_names = list(node.output)
+                break
 
     graph = helper.make_graph(
         onnx_nodes,
