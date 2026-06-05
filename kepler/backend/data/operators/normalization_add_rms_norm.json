@@ -1,0 +1,27 @@
+{
+  "name": "AddRMSNorm",
+  "description": "Residual add followed by layer normalization: y = norm(x + residual)",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "bf16"
+    },
+    {
+      "name": "residual",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "compute_flops": "5 * B * S * hidden_size * fp32",
+  "module": "norm",
+  "category": "Normalization"
+}

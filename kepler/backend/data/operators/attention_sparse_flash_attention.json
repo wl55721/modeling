@@ -1,0 +1,37 @@
+{
+  "name": "SparseFlashAttention",
+  "description": "Sparse Flash Attention: fused flash attention with sparsity mask for efficient long-context",
+  "inputs": [
+    {
+      "name": "q",
+      "shape": "[B, S, num_heads, head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "k",
+      "shape": "[B, S, num_kv_heads, head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "v",
+      "shape": "[B, S, num_kv_heads, head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "sparsity_mask",
+      "shape": "[B, num_heads, S, S]",
+      "dtype": "bool"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "attn_out",
+      "shape": "[B, S, num_heads, head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "2 * B * num_heads * S * S * head_dim * sparsity_ratio",
+  "module": "attn.sparse_flash",
+  "category": "Attention"
+}

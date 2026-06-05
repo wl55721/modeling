@@ -1,0 +1,27 @@
+{
+  "name": "MoEDispatch",
+  "description": "MoE Token Dispatch via AllToAll: route tokens to assigned experts",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "bf16"
+    },
+    {
+      "name": "expert_ids",
+      "shape": "[B, S, top_k]",
+      "dtype": "int32"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "dispatched_x",
+      "shape": "[top_k, B, S, hidden_dim]",
+      "dtype": "int8"
+    }
+  ],
+  "compute_flops": "0",
+  "module": "moe.dispatch",
+  "category": "Communication"
+}

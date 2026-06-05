@@ -1,0 +1,28 @@
+{
+  "name": "GemmaRMSNorm",
+  "description": "Gemma-style RMS Normalization with learned scale parameter",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [
+    {
+      "name": "weight",
+      "shape": "[hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "4 * B * S * hidden_dim",
+  "module": "norm.gemma_rms",
+  "category": "Normalization"
+}

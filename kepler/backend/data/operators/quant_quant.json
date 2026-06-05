@@ -1,0 +1,27 @@
+{
+  "name": "DynamicQuant",
+  "description": "Dynamic quantization",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "bf16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "out",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "int8"
+    },
+    {
+      "name": "scale",
+      "shape": "[B, S]",
+      "dtype": "fp32"
+    }
+  ],
+  "compute_flops": "3 * B * S * hidden_dim * bf16",
+  "module": "quantization",
+  "category": "quantization"
+}

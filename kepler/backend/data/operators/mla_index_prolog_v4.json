@@ -1,0 +1,43 @@
+{
+  "name": "IndexPrologV4",
+  "description": "Index Prolog DeepSeek-V4: pre-processing step that prepares hidden states for index-based expert routing",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "qr",
+      "shape": "[B, S, q_lora_rank]",
+      "dtype": "fp8"
+    }
+  ],
+  "params": [
+    {
+      "name": "weight_proj",
+      "shape": "[index_n_heads, hidden_size]",
+      "dtype": "bf16"
+    },
+    {
+      "name": "q_b",
+      "shape": "[index_n_heads * index_head_dim, q_lora_rank]",
+      "dtype": "fp8"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "query",
+      "shape": "[B, S, index_n_heads]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "query",
+      "shape": "[B, S, index_n_heads * index_head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "2*B*S*hidden_size*index_n_heads*bf16 + 2*B*S*q_lora_rank*index_n_heads*index_head_dim*fp8",
+  "module": "attn.indexer",
+  "category": "MLA"
+}

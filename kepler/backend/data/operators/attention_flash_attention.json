@@ -1,0 +1,43 @@
+{
+  "name": "FlashAttention",
+  "description": "Flash Attention with fused MHA, GQA/MQA support",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [
+    {
+      "name": "q_weight",
+      "shape": "[hidden_dim, num_heads * head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "k_weight",
+      "shape": "[hidden_dim, num_kv_heads * head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "v_weight",
+      "shape": "[hidden_dim, num_kv_heads * head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "o_weight",
+      "shape": "[num_heads * head_dim, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "attn_out",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "2*B*S*(hidden_dim*num_heads*head_dim + hidden_dim*num_kv_heads*head_dim*2) + 2*B*num_heads*S*S*head_dim + 2*B*S*hidden_dim*hidden_dim",
+  "module": "attn.flash_attention",
+  "category": "Attention"
+}

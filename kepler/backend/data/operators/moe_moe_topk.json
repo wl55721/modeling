@@ -1,0 +1,27 @@
+{
+  "name": "MoETopK",
+  "description": "MoE Top-K: selects top-k experts and normalizes weights via softmax",
+  "inputs": [
+    {
+      "name": "scores",
+      "shape": "[B, S, num_experts]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "topk_weights",
+      "shape": "[B, S, top_k]",
+      "dtype": "fp32"
+    },
+    {
+      "name": "topk_indices",
+      "shape": "[B, S, top_k]",
+      "dtype": "int64"
+    }
+  ],
+  "compute_flops": "2 * B * S * num_experts * fp32 + 3 * B * S * top_k * fp32",
+  "module": "moe.topk",
+  "category": "MoE"
+}

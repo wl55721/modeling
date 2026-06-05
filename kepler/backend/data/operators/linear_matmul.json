@@ -1,0 +1,28 @@
+{
+  "name": "MatMul",
+  "description": "Standard matrix multiplication Y = X @ W^T",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "params": [
+    {
+      "name": "weight",
+      "shape": "[intermediate_size, hidden_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, intermediate_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "compute_flops": "2 * B * S * hidden_size * intermediate_size * bf16",
+  "module": "mlp.gate_up_proj",
+  "category": "Linear"
+}

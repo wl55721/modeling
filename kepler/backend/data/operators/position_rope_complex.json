@@ -1,0 +1,22 @@
+{
+  "name": "RopeComplex",
+  "description": "Complex-number Rotary Position Embedding: applies RoPE in complex domain for better precision",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+      "dtype": "bf16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+      "dtype": "bf16"
+    }
+  ],
+  "compute_flops": "3 * B * S * num_attention_heads // tp_size * head_dim * bf16",
+  "module": "attn",
+  "category": "Position"
+}

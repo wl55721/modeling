@@ -1,0 +1,27 @@
+{
+  "name": "PageAttention",
+  "description": "PagedAttention: block-based attention with paged KV cache management (vLLM-style)",
+  "inputs": [
+    {
+      "name": "q",
+      "shape": "[B, num_heads, head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "kv_blocks",
+      "shape": "[num_blocks, block_size, num_kv_heads, head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "attn_out",
+      "shape": "[B, num_heads, head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "2 * B * num_heads * (S + block_size) * head_dim",
+  "module": "attn.page_attention",
+  "category": "Attention"
+}

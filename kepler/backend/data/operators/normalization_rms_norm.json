@@ -1,0 +1,22 @@
+{
+  "name": "RMSNorm",
+  "description": "Root Mean Square Layer Normalization",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "hidden_states",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "4 * B * S * hidden_size * fp32",
+  "module": "norm",
+  "category": "Normalization"
+}

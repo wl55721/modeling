@@ -1,0 +1,22 @@
+{
+  "name": "SwiGlu",
+  "description": "SwiGLU activation: Y = SiLU(X)",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, 2 * intermediate_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, intermediate_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "compute_flops": "6 * B * S * intermediate_size * bf16",
+  "module": "mlp.act_fn",
+  "category": "Activation"
+}

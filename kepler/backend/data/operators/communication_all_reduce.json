@@ -1,0 +1,22 @@
+{
+  "name": "AllReduce",
+  "description": "AllReduce collective communication: reduce tensors across TP group and distribute result",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "0",
+  "module": "attn.o_proj",
+  "category": "Communication"
+}

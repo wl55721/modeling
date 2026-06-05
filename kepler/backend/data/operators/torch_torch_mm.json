@@ -1,0 +1,27 @@
+{
+  "name": "TorchMm",
+  "description": "Matrix multiplication: y = a @ b",
+  "inputs": [
+    {
+      "name": "a",
+      "shape": "[M, K]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "b",
+      "shape": "[K, N]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[M, N]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "2 * M * K * N * fp16",
+  "module": "torch.mm",
+  "category": "Torch"
+}
