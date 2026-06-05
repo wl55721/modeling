@@ -66,6 +66,148 @@ def _apply_moe_fb_disabled_ep_accounting(per_strat):
     )
 
 
+def _comm_strategy_tag(node) -> str:
+    raw = node.annotations.get("overlap_strategy", "")
+    if not raw:
+        raw = node.annotations.get("inserted_by", "")
+        if raw.endswith("_pass"):
+            raw = raw[:-5]
+    return raw if raw in ("tp", "ep", "pp", "cp") else ""
+
+
+def _comm_total_latency_us(node) -> float:
+    return float(
+        node.annotations.get(
+            "comm_total_latency_us",
+            node.annotations.get("latency_us", 0.0),
+        )
+        or 0.0
+    )
+
+
+def _graph_comm_exposed_hidden_us(g, node) -> tuple[float, float]:
+    """Return exposed/hidden comm time from graph annotations only."""
+    comm_lat = _comm_total_latency_us(node)
+    if comm_lat <= 0.0:
+        return 0.0, 0.0
+
+    explicit_exposed = node.annotations.get("overlap_exposed_us")
+    explicit_hidden = node.annotations.get("overlap_hidden_us")
+    if explicit_exposed is not None or explicit_hidden is not None:
+        exposed = (
+            float(explicit_exposed)
+            if explicit_exposed is not None
+            else max(0.0, comm_lat - float(explicit_hidden or 0.0))
+        )
+        hidden = (
+            float(explicit_hidden)
+            if explicit_hidden is not None
+            else max(0.0, comm_lat - exposed)
+        )
+        exposed = min(comm_lat, max(0.0, exposed))
+        hidden = min(comm_lat - exposed, max(0.0, hidden))
+        return exposed, hidden
+
+    otype = node.annotations.get("overlap_type", "none") or "none"
+    if otype == "none":
+        return comm_lat, 0.0
+
+    cp_rounds = int(node.attrs.get("cp_rounds", 1))
+    coc_tile_k = int(node.attrs.get("coc_tile_k", 4))
+    target_lat = 0.0
+    target_key = node.annotations.get("overlap_target", "")
+    if target_key:
+        target_id = target_key.split(":", 1)[1] if ":" in target_key else target_key
+        target_node = g.nodes.get(target_id)
+        if target_node:
+            target_lat = float(target_node.annotations.get("latency_us", 0.0) or 0.0)
+    if otype in ("coc", "p2p_overlap", "ring_cp") and target_lat <= 0.0:
+        pred_lats = [
+            float(g.nodes[p].annotations.get("latency_us", 0.0) or 0.0)
+            for p in g.predecessors(node.id)
+            if g.nodes[p].category != "communication"
+        ]
+        if pred_lats:
+            target_lat = max(pred_lats)
+
+    exposed = compute_exposed_comm_time(
+        comm_lat, otype, target_lat,
+        coc_tile_k=coc_tile_k,
+        cp_rounds=cp_rounds,
+    )
+    hidden = max(0.0, comm_lat - exposed)
+    return exposed, hidden
+
+
+def _apply_graph_comm_overlap_annotations(g) -> None:
+    """Materialize graph-level comm exposed latency before scheduling."""
+    for node in g.nodes.values():
+        if node.category != "communication":
+            continue
+        comm_lat = float(node.annotations.get("latency_us", 0.0) or 0.0)
+        if comm_lat <= 0.0:
+            continue
+        node.annotations.setdefault("comm_total_latency_us", comm_lat)
+        exposed, hidden = _graph_comm_exposed_hidden_us(g, node)
+        node.annotations["overlap_exposed_us"] = exposed
+        node.annotations["overlap_hidden_us"] = hidden
+        node.annotations["latency_us"] = exposed
+
+
+def _graph_per_strategy_overlap(g, pp: int):
+    """Compute comm accounting from OpGraph annotations, not scheduled traces."""
+    from python.zrt.executor.overlap import PerStrategyOverlapReport
+
+    per_stage: dict[int, PerStrategyOverlapReport] = {}
+    for node in g.nodes.values():
+        if node.category != "communication":
+            continue
+        comm_lat = _comm_total_latency_us(node)
+        if comm_lat <= 0.0:
+            continue
+        exposed, hidden = _graph_comm_exposed_hidden_us(g, node)
+        node.annotations["overlap_exposed_us"] = exposed
+        node.annotations["overlap_hidden_us"] = hidden
+
+        sid = int(node.annotations.get("stage_id", 0) or 0) if pp > 1 else 0
+        stage_report = per_stage.setdefault(sid, PerStrategyOverlapReport())
+        stage_report.total_comm_us += comm_lat
+
+        tag = _comm_strategy_tag(node)
+        if not tag:
+            continue
+        setattr(
+            stage_report,
+            f"{tag}_total_us",
+            getattr(stage_report, f"{tag}_total_us") + comm_lat,
+        )
+        setattr(
+            stage_report,
+            f"{tag}_exposed_us",
+            getattr(stage_report, f"{tag}_exposed_us") + exposed,
+        )
+        setattr(
+            stage_report,
+            f"{tag}_hidden_us",
+            getattr(stage_report, f"{tag}_hidden_us") + hidden,
+        )
+
+    merged = PerStrategyOverlapReport()
+    for tag in ("tp", "ep", "pp", "cp"):
+        for stage_report in per_stage.values():
+            curr_total = getattr(stage_report, f"{tag}_total_us", 0.0)
+            prev_total = getattr(merged, f"{tag}_total_us", 0.0)
+            if curr_total > prev_total:
+                setattr(merged, f"{tag}_total_us", curr_total)
+                setattr(merged, f"{tag}_exposed_us", getattr(stage_report, f"{tag}_exposed_us", 0.0))
+                setattr(merged, f"{tag}_hidden_us", getattr(stage_report, f"{tag}_hidden_us", 0.0))
+    merged.total_comm_us = sum(
+        getattr(merged, f"{tag}_total_us", 0.0)
+        for tag in ("tp", "ep", "pp", "cp")
+    )
+    return merged
+
+
 # ── TrainingFlopsPass ───────────────────────────────────────────────────────────
 
 class TrainingFlopsPass(GraphPass):
@@ -638,6 +780,7 @@ class TrainingPipelinePass(GraphPass):
         g = graph.clone()
 
         self._validate_graph_connectivity(g)
+        _apply_graph_comm_overlap_annotations(g)
 
         pp = ctx.parallel.pp if ctx.parallel else 1
         hw = ctx.hw_spec
@@ -950,97 +1093,10 @@ class TrainingPipelinePass(GraphPass):
         )
         per_stage_ms = per_stage_us / 1000.0
 
-        # Overlap-aware comm time: dual-path analysis.
-        # 1. Trace-based: sweep-line intersection of DAGScheduler intervals per stage.
-        # 2. Formula-based: micro-pipelining overlap (ring_cp, coc, mc2) that the
-        #    coarse-grained DAGScheduler cannot capture.
-        # The final hidden comm per strategy = max(trace_hidden, formula_hidden).
-        from python.zrt.executor.overlap import per_strategy_overlap, PerStrategyOverlapReport
-
-        per_strat = PerStrategyOverlapReport()
-        # Merge per-stage overlap: for each strategy tag, take the stage
-        # with the largest total comm as the bottleneck stage's values.
-        for s_id, tl in stage_timelines.items():
-            if tl and tl.scheduled_ops:
-                stage_report = per_strategy_overlap(tl)
-                for tag in ("tp", "ep", "pp", "cp"):
-                    curr_total = getattr(stage_report, f"{tag}_total_us", 0.0)
-                    curr_exposed = getattr(stage_report, f"{tag}_exposed_us", 0.0)
-                    curr_hidden = getattr(stage_report, f"{tag}_hidden_us", 0.0)
-                    prev_total = getattr(per_strat, f"{tag}_total_us", 0.0)
-                    if curr_total > prev_total:
-                        setattr(per_strat, f"{tag}_total_us", curr_total)
-                        setattr(per_strat, f"{tag}_exposed_us", curr_exposed)
-                        setattr(per_strat, f"{tag}_hidden_us", curr_hidden)
-
-        # Formula-based overlap for annotated comm nodes (captures micro-pipelining)
-        formula_total_by_tag: dict[str, float] = {"tp": 0.0, "ep": 0.0, "cp": 0.0, "pp": 0.0}
-        formula_hidden_by_tag: dict[str, float] = {"tp": 0.0, "ep": 0.0, "cp": 0.0, "pp": 0.0}
-        for node in g.nodes.values():
-            if node.category != "communication":
-                continue
-            otype = node.annotations.get("overlap_type", "none")
-            if otype == "none" or otype == "":
-                continue
-            comm_lat = node.annotations.get("latency_us", 0.0)
-            if comm_lat <= 0:
-                continue
-
-            cp_rounds = int(node.attrs.get("cp_rounds", 1))
-            coc_tile_k = int(node.attrs.get("coc_tile_k", 4))
-            target_lat = 0.0
-            target_key = node.annotations.get("overlap_target", "")
-            if target_key:
-                target_id = target_key.split(":", 1)[1] if ":" in target_key else target_key
-                target_node = g.nodes.get(target_id)
-                if target_node:
-                    target_lat = target_node.annotations.get("latency_us", 0.0)
-            if otype in ("coc", "p2p_overlap", "ring_cp") and target_lat <= 0.0:
-                pred_ids = g.predecessors(node.id)
-                pred_lats = [
-                    g.nodes[p].annotations.get("latency_us", 0.0)
-                    for p in pred_ids
-                    if g.nodes[p].category != "communication"
-                ]
-                if pred_lats:
-                    target_lat = max(pred_lats)
-
-            formula_exposed = compute_exposed_comm_time(
-                comm_lat, otype, target_lat,
-                coc_tile_k=coc_tile_k,
-                cp_rounds=cp_rounds,
-            )
-            formula_hidden = max(0.0, comm_lat - formula_exposed)
-
-            # Map to strategy tag
-            node_tag = node.annotations.get("overlap_strategy", "")
-            if not node_tag:
-                raw = node.annotations.get("inserted_by", "")
-                if raw.endswith("_pass"):
-                    raw = raw[:-5]
-                if raw in ("tp", "ep", "cp", "pp"):
-                    node_tag = raw
-            if not node_tag:
-                node_tag = "tp"  # default for untagged comm
-
-            if node_tag in formula_total_by_tag:
-                formula_total_by_tag[node_tag] += comm_lat
-                formula_hidden_by_tag[node_tag] += formula_hidden
-
-        # Merge: per-strategy overlap = max(trace_hidden, formula_hidden).
-        # Normalise formula totals to per-stage (trace totals are per-stage
-        # bottleneck, formula totals are whole-graph aggregate).
-        formula_div = pp if pp > 1 else 1
-        for tag in ("tp", "ep", "pp", "cp"):
-            trace_total = getattr(per_strat, f"{tag}_total_us", 0.0)
-            trace_hidden = getattr(per_strat, f"{tag}_hidden_us", 0.0)
-            f_total = formula_total_by_tag.get(tag, 0.0) / formula_div
-            f_hidden = formula_hidden_by_tag.get(tag, 0.0) / formula_div
-            merged_total = max(trace_total, f_total)
-            merged_hidden = max(trace_hidden, f_hidden)
-            setattr(per_strat, f"{tag}_total_us", merged_total)
-            setattr(per_strat, f"{tag}_hidden_us", merged_hidden)
-            setattr(per_strat, f"{tag}_exposed_us", max(0.0, merged_total - merged_hidden))
+        # Communication accounting is graph-owned.  The PP/DAGScheduler
+        # timelines are presentation artifacts and must not create hidden
+        # communication merely because intervals overlap visually.
+        per_strat = _graph_per_strategy_overlap(g, pp)
 
         moe_fb_enabled = bool(getattr(ctx.training, "moe_fb_overlap", False))
         ep_fb_total_us = per_strat.ep_total_us
@@ -1085,20 +1141,7 @@ class TrainingPipelinePass(GraphPass):
                 ep_fb_boundary_hidden_us,
             ) = _apply_moe_fb_disabled_ep_accounting(per_strat)
 
-        total_comm_us = (
-            per_strat.tp_total_us + per_strat.ep_total_us
-            + per_strat.pp_total_us + per_strat.cp_total_us
-        ) * M
-        # Ensure total includes untagged comm ops from per-stage timelines
-        trace_total = 0.0
-        for s_id, tl in stage_timelines.items():
-            if tl and tl.scheduled_ops:
-                trace_total = max(
-                    trace_total,
-                    sum(op.latency_us for op in tl.scheduled_ops if op.stream_type == "comm")
-                )
-        if trace_total * M > total_comm_us:
-            total_comm_us = trace_total * M
+        total_comm_us = per_strat.total_comm_us * M
         total_exposed_us = (
             per_strat.tp_exposed_us + per_strat.ep_exposed_us
             + per_strat.pp_exposed_us + per_strat.cp_exposed_us
