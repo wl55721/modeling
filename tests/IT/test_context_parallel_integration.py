@@ -90,6 +90,17 @@ def _make_simple_mlp_graph(seq_len: int = 2048, hidden: int = 4096, num_layers: 
     )
 
 
+def _build_graph(nodes: dict) -> "OpGraph":
+    """Build a minimal OpGraph from a node dict, with empty edges."""
+    return OpGraph(
+        name="test_graph",
+        phase="forward",
+        nodes=nodes,
+        edges=[],
+        metadata={},
+    )
+
+
 def _make_hardware_spec():
     """Create a test hardware spec."""
     return load("nvidia_h100_sxm")
@@ -319,7 +330,19 @@ class TestCPCommunicationVolume:
             )
 
     def test_compressed_stage1_bytes(self):
-        """Verify stage1 P2P bytes = batch * seq_local * hidden * 2."""
+        """Verify stage1 P2P bytes match the CompressedCPCommAnalyzer formula.
+
+        Stage 1 byte count for CSA layers is::
+
+            m * (2 * c * B + 2 * c * B + c_I * B_I)
+
+        where m=4, c=kv_head_dim, c_I=indexer_head_dim, B=effective KV
+        bytes per element, B_I=indexer dtype bytes. This matches the
+        training Spec flow's ``analyzer.stage1_comm_bytes_csa()``.
+        """
+        from zrt.training.models.compressed_cp import (
+            CompressedCPConfig, CompressedCPCommAnalyzer,
+        )
         seq_len, hidden, cp, batch = 2048, 4096, 2, 1
         graph = _make_simple_mlp_graph(seq_len=seq_len, hidden=hidden)
 
@@ -335,8 +358,10 @@ class TestCPCommunicationVolume:
         after_cp = ContextParallelPass().run(graph, ctx)
         after_comm = CommInserterPass().run(after_cp, ctx)
 
-        seq_local = seq_len // cp
-        expected_bytes = batch * seq_local * hidden * 2
+        analyzer = CompressedCPCommAnalyzer(
+            CompressedCPConfig(cp_size=cp, kv_head_dim=512, indexer_head_dim=128)
+        )
+        expected_bytes = int(analyzer.stage1_comm_bytes_csa())
 
         p2p_nodes = [
             n for n in after_comm.nodes.values()
@@ -346,13 +371,24 @@ class TestCPCommunicationVolume:
         for node in p2p_nodes:
             actual_bytes = node.attrs.get("bytes", 0)
             assert actual_bytes == expected_bytes, (
-                f"Node {node.id}: expected {expected_bytes} bytes, got {actual_bytes}"
+                f"Node {node.id}: expected {expected_bytes} bytes "
+                f"(analyzer CSA s1), got {actual_bytes}"
             )
 
     def test_compressed_stage2_bytes_compressed(self):
-        """Verify stage2 AllGather bytes = stage1_bytes / compression_ratio."""
+        """Verify stage2 AllGather bytes match the analyzer formula.
+
+        Stage 2 byte count for CSA layers is::
+
+            (cp - 1) * L * c * B + (cp - 1) * L * c_I * B_I
+
+        where L = s_local / m + 1. This matches
+        ``analyzer.stage2_comm_bytes_csa(seq_len)``.
+        """
+        from zrt.training.models.compressed_cp import (
+            CompressedCPConfig, CompressedCPCommAnalyzer,
+        )
         seq_len, hidden, cp, batch = 2048, 4096, 2, 1
-        compression_ratio = 4
         graph = _make_simple_mlp_graph(seq_len=seq_len, hidden=hidden)
 
         ctx = TransformContext(
@@ -367,9 +403,10 @@ class TestCPCommunicationVolume:
         after_cp = ContextParallelPass().run(graph, ctx)
         after_comm = CommInserterPass().run(after_cp, ctx)
 
-        seq_local = seq_len // cp
-        stage1_bytes = batch * seq_local * hidden * 2
-        expected_bytes = stage1_bytes // compression_ratio
+        analyzer = CompressedCPCommAnalyzer(
+            CompressedCPConfig(cp_size=cp, kv_head_dim=512, indexer_head_dim=128)
+        )
+        expected_bytes = int(analyzer.stage2_comm_bytes_csa(seq_len))
 
         ag_nodes = [
             n for n in after_comm.nodes.values()
@@ -379,8 +416,189 @@ class TestCPCommunicationVolume:
         for node in ag_nodes:
             actual_bytes = node.attrs.get("bytes", 0)
             assert actual_bytes == expected_bytes, (
-                f"Node {node.id}: expected {expected_bytes} bytes, got {actual_bytes}"
+                f"Node {node.id}: expected {expected_bytes} bytes "
+                f"(analyzer CSA s2), got {actual_bytes}"
             )
+
+
+class TestCompressedCPLayerType:
+    """Test CSA vs HCA vs SWA differentiation in compressed CP.
+
+    These tests verify that the graph-capture flow now distinguishes
+    between CSA (m=4) and HCA (m'=128) layers and applies the correct
+    per-layer CompressedCPCommAnalyzer formula, matching the training
+    Spec flow at ``training/ir/shard.py:_insert_cp_collectives``.
+    """
+
+    def test_hca_layer_uses_hca_formula(self):
+        """HCA layer's stage1 P2P bytes should match analyzer HCA formula."""
+        from zrt.training.models.compressed_cp import (
+            CompressedCPConfig, CompressedCPCommAnalyzer,
+        )
+        seq_len, hidden, cp, batch = 2048, 4096, 2, 1
+        graph = _make_simple_mlp_graph(seq_len=seq_len, hidden=hidden)
+
+        # Configure 1 HCA layer at index 0
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(
+                seq_len=seq_len, hidden=hidden, cp_kind="compressed",
+                micro_batch=batch,
+                compress_ratios=[128],  # HCA
+            ),
+        )
+
+        after_cp = ContextParallelPass().run(graph, ctx)
+        after_comm = CommInserterPass().run(after_cp, ctx)
+
+        analyzer = CompressedCPCommAnalyzer(
+            CompressedCPConfig(cp_size=cp, kv_head_dim=512)
+        )
+        expected_s1 = int(analyzer.stage1_comm_bytes_hca())
+        expected_s2 = int(analyzer.stage2_comm_bytes_hca(seq_len))
+
+        p2p_nodes = [
+            n for n in after_comm.nodes.values()
+            if n.attrs.get("role") == "cp_compressed_stage1"
+            and n.attrs.get("layer_type") == "hca"
+        ]
+        ag_nodes = [
+            n for n in after_comm.nodes.values()
+            if n.attrs.get("role") == "cp_compressed_stage2"
+            and n.attrs.get("layer_type") == "hca"
+        ]
+
+        assert len(p2p_nodes) > 0, "No HCA stage1 P2P node found"
+        assert len(ag_nodes) > 0, "No HCA stage2 AllGather node found"
+        for node in p2p_nodes:
+            assert node.attrs["bytes"] == expected_s1, (
+                f"HCA s1: expected {expected_s1}, got {node.attrs['bytes']}"
+            )
+        for node in ag_nodes:
+            assert node.attrs["bytes"] == expected_s2, (
+                f"HCA s2: expected {expected_s2}, got {node.attrs['bytes']}"
+            )
+
+    def test_swa_layer_skipped(self):
+        """SWA layers should not produce any compressed CP comm nodes."""
+        seq_len, hidden, cp, batch = 2048, 4096, 2, 1
+        graph = _make_simple_mlp_graph(seq_len=seq_len, hidden=hidden, num_layers=3)
+
+        # 1 SWA, 1 CSA, 1 HCA
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(
+                seq_len=seq_len, hidden=hidden, cp_kind="compressed",
+                micro_batch=batch,
+                compress_ratios=[0, 4, 128],  # SWA, CSA, HCA
+            ),
+        )
+
+        after_cp = ContextParallelPass().run(graph, ctx)
+        after_comm = CommInserterPass().run(after_cp, ctx)
+
+        swa_p2p = [
+            n for n in after_comm.nodes.values()
+            if n.attrs.get("role") == "cp_compressed_stage1"
+            and n.attrs.get("layer_type") == "swa"
+        ]
+        swa_ag = [
+            n for n in after_comm.nodes.values()
+            if n.attrs.get("role") == "cp_compressed_stage2"
+            and n.attrs.get("layer_type") == "swa"
+        ]
+
+        assert len(swa_p2p) == 0, f"SWA layer should not produce P2P, got {len(swa_p2p)}"
+        assert len(swa_ag) == 0, f"SWA layer should not produce AG, got {len(swa_ag)}"
+
+    def test_csa_hca_bytes_differ(self):
+        """CSA and HCA layers should have different stage1 byte counts."""
+        seq_len, hidden, cp, batch = 2048, 4096, 2, 1
+        graph = _make_simple_mlp_graph(seq_len=seq_len, hidden=hidden, num_layers=2)
+
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(
+                seq_len=seq_len, hidden=hidden, cp_kind="compressed",
+                micro_batch=batch,
+                compress_ratios=[4, 128],  # layer 0: CSA, layer 1: HCA
+            ),
+        )
+
+        after_cp = ContextParallelPass().run(graph, ctx)
+        after_comm = CommInserterPass().run(after_cp, ctx)
+
+        csa_p2p_bytes = None
+        hca_p2p_bytes = None
+
+        for n in after_comm.nodes.values():
+            if n.attrs.get("role") == "cp_compressed_stage1":
+                lt = n.attrs.get("layer_type")
+                if lt == "csa":
+                    csa_p2p_bytes = n.attrs["bytes"]
+                elif lt == "hca":
+                    hca_p2p_bytes = n.attrs["bytes"]
+
+        assert csa_p2p_bytes is not None, "CSA P2P node not found"
+        assert hca_p2p_bytes is not None, "HCA P2P node not found"
+        assert csa_p2p_bytes != hca_p2p_bytes, (
+            f"CSA ({csa_p2p_bytes}) and HCA ({hca_p2p_bytes}) P2P bytes must differ"
+        )
+        # HCA has m'=128 (32x more), so stage1 P2P is ~32x larger
+        assert hca_p2p_bytes > csa_p2p_bytes, (
+            f"HCA s1 should be > CSA s1 (m' >> m); "
+            f"got CSA={csa_p2p_bytes}, HCA={hca_p2p_bytes}"
+        )
+
+    def test_layer_type_inferred_from_scope(self):
+        """When no compress_ratios configured, layer_type inferred from scope.
+
+        The inference function ``_infer_compressed_layer_type_from_scope``
+        is called as a last-resort fallback after ``resolve_layer_cp_type``
+        and the cp_split annotation. Use the inference function directly
+        here (rather than going through a full graph) since graph-level
+        classification is exercised by the other tests in this class.
+        """
+        from python.zrt.transform.parallel.comm_inserter import (
+            _infer_compressed_layer_type_from_scope,
+        )
+
+        # HCA marker in scope
+        assert _infer_compressed_layer_type_from_scope(
+            "model.layers.0.hca_attn.linear", "0"
+        ) == "hca"
+
+        # SWA marker in scope
+        assert _infer_compressed_layer_type_from_scope(
+            "model.layers.0.swa_attn.linear", "0"
+        ) == "swa"
+
+        # SWA marker in layer name
+        assert _infer_compressed_layer_type_from_scope(
+            "model.layers.0.attn.linear", "swa_layer_0"
+        ) == "swa"
+
+        # CSA default
+        assert _infer_compressed_layer_type_from_scope(
+            "model.layers.0.attn.linear", "0"
+        ) == "csa"
+
+        # CSA via sparse/indexer marker
+        assert _infer_compressed_layer_type_from_scope(
+            "model.layers.0.sparse_attn.linear", "0"
+        ) == "csa"
+        assert _infer_compressed_layer_type_from_scope(
+            "model.layers.0.csa_attn.linear", "0"
+        ) == "csa"
+        assert _infer_compressed_layer_type_from_scope(
+            "model.layers.0.indexer.linear", "0"
+        ) == "csa"
+
+        # Empty / unknown → CSA default
+        assert _infer_compressed_layer_type_from_scope("", "") == "csa"
 
 
 class TestCPFLOPsScaling:

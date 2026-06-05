@@ -313,6 +313,14 @@ class TrainingConfig:
     num_kv_heads: int = 0    # 0 = fallback to num_heads
     head_dim: int = 0        # 0 = derived from hidden // num_heads
 
+    # Compressed CP layer geometry (DeepSeek-V4 two-stage)
+    num_csa_layers: int = 0         # Layers with small compression ratio (m=4)
+    num_hca_layers: int = 0         # Layers with large compression ratio (m'=128)
+    num_swa_only_layers: int = 0    # Sliding-window-only layers (skip CP)
+    kv_head_dim: int = 512         # KV head dim (for compressed CP byte calc)
+    indexer_head_dim: int = 128    # Indexer head dim (CSA only)
+    compress_ratios: list[int] | None = None  # Per-layer compression ratios
+
     def resolve_cp_kind(self, model_id: str = "", cp: int = 1) -> str:
         """Resolve cp_kind based on model type and CP configuration.
         
@@ -343,9 +351,46 @@ class TrainingConfig:
         # DeepSeek-V4 uses compressed (two-stage) CP
         if "deepseek" in model_lower and ("v4" in model_lower):
             return "compressed"
-        
+
         # All other models use Ulysses (A2A-based) CP
         return "ulysses"
+
+    def resolve_layer_cp_type(self, layer_id: int) -> str:
+        """Resolve per-layer CP type (csa / hca / swa) for compressed CP.
+
+        Mirrors ``ModelSpec.get_layer_cp_type`` from the training IR, but
+        operates on the lightweight ``TrainingConfig`` exposed to the
+        graph-capture flow. Used by the CP comm inserter to pick the right
+        ``CompressedCPCommAnalyzer`` formula and to skip SWA-only layers.
+
+        Falls back to "csa" if no compressed-layer metadata is configured
+        (matches the legacy graph-capture behavior where all layers were
+        treated as CSA, and avoids silently dropping CP communication).
+        """
+        if self.compress_ratios is not None:
+            if layer_id >= len(self.compress_ratios):
+                return "csa"
+            ratio = self.compress_ratios[layer_id]
+            if ratio == 0:
+                return "swa"
+            if ratio <= 4:
+                return "csa"
+            return "hca"
+
+        if self.num_csa_layers == 0 and self.num_hca_layers == 0:
+            return "csa"
+
+        if layer_id < self.num_swa_only_layers:
+            return "swa"
+        csa_start = self.num_swa_only_layers
+        csa_end = csa_start + self.num_csa_layers
+        if csa_start <= layer_id < csa_end:
+            return "csa"
+        hca_start = csa_end
+        hca_end = hca_start + self.num_hca_layers
+        if hca_start <= layer_id < hca_end:
+            return "hca"
+        return "csa"
 
     def effective_ns_steps(self, model_type: str | None = None) -> int:
         """Return effective NS steps, handling None fallback logic.

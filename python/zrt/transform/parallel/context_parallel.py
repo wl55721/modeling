@@ -61,6 +61,27 @@ def _is_kv_proj_scope(scope: str) -> bool:
     return any(kw in scope.lower() for kw in _KV_PROJ_SCOPE_KW)
 
 
+def _infer_layer_type_from_scope(scope: str) -> str:
+    """Infer CP layer type (csa / hca / swa) from module scope.
+
+    Used as a fallback when no ``TrainingConfig`` is available.  Mirrors
+    the layer-type taxonomy of ``ModelSpec.get_layer_cp_type``:
+
+    - scope contains ``swa`` / ``sliding`` → ``swa``
+    - scope contains ``hca`` → ``hca``
+    - scope contains ``sparse`` / ``csa`` / ``indexer`` → ``csa``
+    - otherwise → ``csa`` (DeepSeek-V4 default)
+    """
+    s = scope.lower()
+    if "swa" in s or "sliding" in s:
+        return "swa"
+    if "hca" in s:
+        return "hca"
+    if "sparse" in s or "csa" in s or "indexer" in s:
+        return "csa"
+    return "csa"
+
+
 # ── Weight detection (scope suffix + op-type position + shared tensors) ─
 
 _PARAM_SCOPE_SUFFIXES = (
@@ -302,6 +323,15 @@ class ContextParallelPass(GraphPass):
             if cp_kind == "hybrid":
                 ann["cp_ulysses"] = cp_ulysses
                 ann["cp_ring"] = cp_ring
+            if cp_kind == "compressed":
+                try:
+                    layer_id = int(node.layer) if node.layer else -1
+                except (ValueError, TypeError):
+                    layer_id = -1
+                if layer_id >= 0 and ctx.training is not None:
+                    ann["layer_type"] = ctx.training.resolve_layer_cp_type(layer_id)
+                else:
+                    ann["layer_type"] = _infer_layer_type_from_scope(node.scope or "")
             node.annotations["cp_split"] = ann
 
         for edge in g.edges:

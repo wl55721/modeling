@@ -40,6 +40,81 @@ def _make_comm_node(node_id: str, collective: str,
     return node
 
 
+def _infer_compressed_layer_type_from_scope(scope: str, layer: str) -> str:
+    """Infer per-layer CP type from module scope and layer name.
+
+    Mirrors ``ModelSpec.get_layer_cp_type`` for the graph-capture flow
+    (where no full ``ModelSpec`` is available).
+
+    - SWA markers (``swa`` / ``sliding``) → ``swa`` (skipped at comm insert)
+    - HCA markers (``hca``) → ``hca`` (m'=128)
+    - CSA / sparse / indexer markers → ``csa`` (m=4)
+    - otherwise → ``csa`` (DeepSeek-V4 default)
+    """
+    s = (scope or "").lower() + " " + (layer or "").lower()
+    if "swa" in s or "sliding" in s:
+        return "swa"
+    if "hca" in s:
+        return "hca"
+    if "sparse" in s or "csa" in s or "indexer" in s:
+        return "csa"
+    return "csa"
+
+
+def _compute_compressed_cp_bytes(
+    layer_type: str, seq_len: int, cp: int, hidden: int,
+    micro_batch: int, ctx: "TransformContext",
+) -> tuple[int, int, int]:
+    """Compute Stage 1 (P2P) and Stage 2 (AllGather) byte budgets for
+    compressed CP. Returns ``(p2p_bytes, ag_bytes, compression_ratio)``.
+
+    Delegates to ``CompressedCPCommAnalyzer`` from
+    ``python.zrt.training.models.compressed_cp`` when available — this keeps
+    the graph-capture flow aligned with the training Spec flow on the
+    exact CSA/HCA/SWA breakdown. Falls back to the legacy
+    ``ratio=4`` approximation only when the analyzer is unavailable or
+    layer geometry is missing.
+    """
+    compression_ratio = 4 if layer_type == "csa" else 128
+
+    analyzer = None
+    if ctx is not None and ctx.training is not None:
+        try:
+            from zrt.training.models.compressed_cp import (
+                CompressedCPConfig, CompressedCPCommAnalyzer,
+            )
+            kv_head_dim = ctx.training.kv_head_dim or 512
+            indexer_head_dim = ctx.training.indexer_head_dim or 128
+            cfg = CompressedCPConfig(
+                cp_size=cp,
+                kv_head_dim=kv_head_dim,
+                indexer_head_dim=indexer_head_dim,
+            )
+            analyzer = CompressedCPCommAnalyzer(cfg)
+        except Exception:
+            analyzer = None
+
+    if analyzer is not None:
+        if layer_type == "csa":
+            p2p_bytes = int(analyzer.stage1_comm_bytes_csa())
+            ag_bytes = int(analyzer.stage2_comm_bytes_csa(seq_len))
+            compression_ratio = analyzer.config.compression_ratio_csa
+        elif layer_type == "hca":
+            p2p_bytes = int(analyzer.stage1_comm_bytes_hca())
+            ag_bytes = int(analyzer.stage2_comm_bytes_hca(seq_len))
+            compression_ratio = analyzer.config.compression_ratio_hca
+        else:
+            seq_local = seq_len // cp
+            p2p_bytes = micro_batch * seq_local * hidden * 2
+            ag_bytes = p2p_bytes // 4
+        return p2p_bytes, ag_bytes, compression_ratio
+
+    seq_local = seq_len // cp
+    p2p_bytes = micro_batch * seq_local * hidden * 2
+    ag_bytes = p2p_bytes // compression_ratio
+    return p2p_bytes, ag_bytes, compression_ratio
+
+
 def _propagate_phase(src: OpNode, dst: OpNode) -> None:
     """Copy ``annotations["phase"]`` from src to dst if present."""
     phase = src.annotations.get("phase", "")
@@ -323,7 +398,7 @@ class CommInserterPass(GraphPass):
 
             elif cp_kind == "compressed":
                 self._insert_compressed_cp_comm_block(
-                    g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd"
+                    g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd", ctx=ctx
                 )
 
         for layer, nodes in layer_bwd_groups.items():
@@ -359,7 +434,7 @@ class CommInserterPass(GraphPass):
 
             elif cp_kind == "compressed":
                 self._insert_compressed_cp_comm_block(
-                    g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd"
+                    g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd", ctx=ctx
                 )
 
     def _create_ulysses_comm_nodes(
@@ -562,16 +637,41 @@ class CommInserterPass(GraphPass):
 
     def _insert_compressed_cp_comm_block(
         self, g: "OpGraph", first_node: OpNode, last_node: OpNode,
-        seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
+        seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str,
+        ctx: "TransformContext" = None,
     ) -> None:
-        """DeepSeek-V4两段式Compressed CP，只在block边界插入。"""
+        """DeepSeek-V4 two-stage Compressed CP, inserted at block boundary.
+
+        Stage 1 (P2P boundary exchange) and Stage 2 (AllGather compressed KV)
+        volumes are sourced from ``CompressedCPCommAnalyzer`` so that CSA
+        (``m=4``) and HCA (``m'=128``) layers receive their correct byte
+        budgets — matching the precision of the training Spec flow
+        (``training/ir/shard.py:_insert_cp_collectives``).
+
+        SWA-only layers are skipped entirely (no P2P, no AG), matching the
+        training Spec ``if cp_type == 'swa': continue`` behavior at
+        ``shard.py:425``.
+        """
         layer = first_node.layer or "root"
 
         cp_split_info = first_node.annotations.get("cp_split", {})
         if cp_split_info.get("skip_comm", False):
             return
 
-        if "swa" in layer.lower() or "sliding" in first_node.scope.lower():
+        layer_type = cp_split_info.get("layer_type", "")
+        if not layer_type and ctx is not None and ctx.training is not None:
+            try:
+                layer_id = int(layer) if layer.isdigit() else -1
+            except (ValueError, TypeError):
+                layer_id = -1
+            if layer_id >= 0:
+                layer_type = ctx.training.resolve_layer_cp_type(layer_id)
+        if not layer_type:
+            layer_type = _infer_compressed_layer_type_from_scope(
+                first_node.scope or "", layer,
+            )
+
+        if layer_type == "swa" or layer_type == "none":
             return
 
         seq_local = seq_len // cp
@@ -582,9 +682,15 @@ class CommInserterPass(GraphPass):
         else:
             shape = (micro_batch, seq_local, hidden)
 
-        compression_ratio = 4
+        p2p_bytes, ag_bytes, compression_ratio = _compute_compressed_cp_bytes(
+            layer_type=layer_type,
+            seq_len=seq_len,
+            cp=cp,
+            hidden=hidden,
+            micro_batch=micro_batch,
+            ctx=ctx,
+        )
 
-        p2p_bytes = micro_batch * seq_local * hidden * 2
         p2p_comm = OpNode(
             id=f"comm_p2p_compressed_stage1_layer_{layer}_{phase_suffix}",
             op_type="comm.send_recv",
@@ -597,6 +703,7 @@ class CommInserterPass(GraphPass):
                 "stage": "p2p_boundary_exchange",
                 "bytes": p2p_bytes,
                 "layer": layer,
+                "layer_type": layer_type,
             },
             annotations={
                 "phase": phase,
@@ -612,8 +719,6 @@ class CommInserterPass(GraphPass):
         )
         _prepend_comm(g, first_node.id, p2p_comm)
 
-        # Stage 2: AllGather compressed KV (after block)
-        ag_bytes = p2p_bytes // compression_ratio
         ag_comm = OpNode(
             id=f"comm_ag_compressed_stage2_layer_{layer}_{phase_suffix}",
             op_type="comm.all_gather",
@@ -627,6 +732,7 @@ class CommInserterPass(GraphPass):
                 "bytes": ag_bytes,
                 "compression_ratio": compression_ratio,
                 "layer": layer,
+                "layer_type": layer_type,
             },
             annotations={
                 "phase": phase,
