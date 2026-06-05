@@ -757,3 +757,203 @@ class TestCPMetadataAnnotations:
             assert phase in ["fwd", "bwd", None], (
                 f"Node {node.id}: unexpected phase annotation {phase}"
             )
+
+
+def _make_mixed_graph(seq_len=2048, hidden=4096, num_heads=32, head_dim=128):
+    """Graph with attention + non-attention nodes for CPKind testing."""
+    nodes = {}
+    edges = []
+    batch = 1
+    inp = TensorMeta(id="inp", shape=(batch, seq_len, hidden), dtype=DType.BF16,
+                     mem_bytes=batch * seq_len * hidden * 2)
+    qkv_out = TensorMeta(
+        id="qkv_out", shape=(batch, seq_len, num_heads * head_dim * 3),
+        dtype=DType.BF16, mem_bytes=batch * seq_len * num_heads * head_dim * 3 * 2,
+    )
+    q_4d = TensorMeta(
+        id="q_4d", shape=(batch, num_heads, seq_len, head_dim),
+        dtype=DType.BF16, mem_bytes=batch * num_heads * seq_len * head_dim * 2,
+    )
+    attn_scores = TensorMeta(
+        id="attn_scores", shape=(batch, num_heads, seq_len, seq_len),
+        dtype=DType.BF16, mem_bytes=batch * num_heads * seq_len * seq_len * 2,
+    )
+    attn_out = TensorMeta(
+        id="attn_out", shape=(batch, seq_len, num_heads * head_dim),
+        dtype=DType.BF16, mem_bytes=batch * seq_len * num_heads * head_dim * 2,
+    )
+    mlp_out = TensorMeta(
+        id="mlp_out", shape=(batch, seq_len, hidden),
+        dtype=DType.BF16, mem_bytes=batch * seq_len * hidden * 2,
+    )
+
+    norm = OpNode(id="norm", op_type="aten.rms_norm",
+                  inputs=[inp], outputs=[inp],
+                  scope="model.layers.0.input_layernorm",
+                  layer="0", category="compute")
+    qkv = OpNode(id="qkv_proj", op_type="aten.linear",
+                 inputs=[inp], outputs=[qkv_out],
+                 scope="model.layers.0.self_attn.q_proj",
+                 layer="0", category="compute")
+    reshape = OpNode(id="reshape_q", op_type="aten.view",
+                     inputs=[qkv_out], outputs=[q_4d],
+                     scope="model.layers.0.self_attn",
+                     layer="0", category="memory")
+    score = OpNode(id="attn_score", op_type="aten.bmm",
+                   inputs=[q_4d, q_4d], outputs=[attn_scores],
+                   scope="model.layers.0.self_attn",
+                   layer="0", category="compute")
+    sdpa = OpNode(id="sdpa", op_type="aten._scaled_dot_product_attention",
+                  inputs=[attn_scores], outputs=[attn_out],
+                  scope="model.layers.0.self_attn",
+                  layer="0", category="compute")
+    o_proj = OpNode(id="o_proj", op_type="aten.linear",
+                    inputs=[attn_out], outputs=[inp],
+                    scope="model.layers.0.self_attn.o_proj",
+                    layer="0", category="compute")
+    mlp = OpNode(id="mlp", op_type="aten.linear",
+                 inputs=[inp], outputs=[mlp_out],
+                 scope="model.layers.0.mlp.gate_proj",
+                 layer="0", category="compute")
+
+    for n in [norm, qkv, reshape, score, sdpa, o_proj, mlp]:
+        nodes[n.id] = n
+    edges.append(Edge(src="norm", src_idx=0, dst="qkv_proj", dst_idx=0, tensor=inp))
+    edges.append(Edge(src="qkv_proj", src_idx=0, dst="reshape_q", dst_idx=0, tensor=qkv_out))
+    edges.append(Edge(src="reshape_q", src_idx=0, dst="attn_score", dst_idx=0, tensor=q_4d))
+    edges.append(Edge(src="attn_score", src_idx=0, dst="sdpa", dst_idx=0, tensor=attn_scores))
+    edges.append(Edge(src="sdpa", src_idx=0, dst="o_proj", dst_idx=0, tensor=attn_out))
+    edges.append(Edge(src="o_proj", src_idx=0, dst="mlp", dst_idx=0, tensor=inp))
+
+    return OpGraph(name="mixed", phase="forward", nodes=nodes, edges=edges,
+                   metadata={"seq_len": seq_len, "hidden": hidden})
+
+
+class TestCPKindAwareSplitting:
+    """Test CPKind-differentiated shape splitting."""
+
+    def test_ulysses_attn_heads_split_seq_preserved(self):
+        """Ulysses: attention nodes split heads, seq unchanged."""
+        seq_len, hidden, cp = 2048, 4096, 2
+        num_heads, head_dim = 32, 128
+        graph = _make_mixed_graph(seq_len, hidden, num_heads, head_dim)
+
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(
+                seq_len=seq_len, hidden=hidden, cp_kind="ulysses",
+                num_heads=num_heads, head_dim=head_dim,
+            ),
+        )
+        g = ContextParallelPass().run(graph, ctx)
+
+        sdpa = g.nodes["sdpa"]
+        for t in sdpa.inputs + sdpa.outputs:
+            if len(t.shape) >= 2:
+                assert seq_len in t.shape, (
+                    f"Ulysses attn: seq_len should be preserved, got {t.shape}"
+                )
+
+        score = g.nodes["attn_score"]
+        for t in score.outputs:
+            if len(t.shape) == 4:
+                assert t.shape[1] == num_heads // cp, (
+                    f"Ulysses: heads should be {num_heads // cp}, got {t.shape[1]}"
+                )
+                assert t.shape[2] == seq_len
+                assert t.shape[3] == seq_len
+
+    def test_ulysses_non_attn_seq_split(self):
+        """Ulysses: non-attention nodes split seq."""
+        seq_len, hidden, cp = 2048, 4096, 2
+        num_heads, head_dim = 32, 128
+        graph = _make_mixed_graph(seq_len, hidden, num_heads, head_dim)
+
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(
+                seq_len=seq_len, hidden=hidden, cp_kind="ulysses",
+                num_heads=num_heads, head_dim=head_dim,
+            ),
+        )
+        g = ContextParallelPass().run(graph, ctx)
+
+        mlp = g.nodes["mlp"]
+        for t in mlp.inputs + mlp.outputs:
+            if len(t.shape) >= 2 and seq_len in t.shape:
+                assert seq_len // cp in t.shape, (
+                    f"Ulysses non-attn: seq should be split, got {t.shape}"
+                )
+
+    def test_ring_all_seq_split(self):
+        """Ring: all nodes split seq."""
+        seq_len, hidden, cp = 2048, 4096, 4
+        num_heads, head_dim = 32, 128
+        graph = _make_mixed_graph(seq_len, hidden, num_heads, head_dim)
+
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(
+                seq_len=seq_len, hidden=hidden, cp_kind="ring",
+                num_heads=num_heads, head_dim=head_dim,
+            ),
+        )
+        g = ContextParallelPass().run(graph, ctx)
+
+        for node in g.nodes.values():
+            for t in node.inputs + node.outputs:
+                if seq_len in t.shape:
+                    assert seq_len // cp in t.shape, (
+                        f"Ring: all seq dims should be split, "
+                        f"node={node.id} shape={t.shape}"
+                    )
+
+    def test_hybrid_dual_split(self):
+        """Hybrid: attn splits heads by cp_ulysses + seq by cp_ring."""
+        seq_len, hidden = 2048, 4096
+        num_heads, head_dim = 32, 128
+        cp_ulysses, cp_ring = 2, 2
+        cp = cp_ulysses * cp_ring
+        graph = _make_mixed_graph(seq_len, hidden, num_heads, head_dim)
+
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp, cp_ulysses=cp_ulysses, cp_ring=cp_ring),
+            training=TrainingConfig(
+                seq_len=seq_len, hidden=hidden, cp_kind="hybrid",
+                num_heads=num_heads, head_dim=head_dim,
+            ),
+        )
+        g = ContextParallelPass().run(graph, ctx)
+
+        score = g.nodes["attn_score"]
+        for t in score.outputs:
+            if len(t.shape) == 4:
+                assert t.shape[1] == num_heads // cp_ulysses, (
+                    f"Hybrid: heads should be {num_heads // cp_ulysses}, got {t.shape[1]}"
+                )
+                assert t.shape[2] == seq_len // cp_ring, (
+                    f"Hybrid: seq should be {seq_len // cp_ring}, got {t.shape[2]}"
+                )
+
+    def test_ulysses_fallback_no_num_heads(self):
+        """Ulysses without num_heads falls back to seq-split."""
+        seq_len, hidden, cp = 2048, 4096, 2
+        graph = _make_mixed_graph(seq_len, hidden)
+
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(seq_len=seq_len, hidden=hidden, cp_kind="ulysses"),
+        )
+        g = ContextParallelPass().run(graph, ctx)
+
+        for node in g.nodes.values():
+            for t in node.inputs + node.outputs:
+                if seq_len in t.shape:
+                    assert seq_len // cp in t.shape, (
+                        f"Fallback: seq should be split, got {t.shape}"
+                    )

@@ -30,11 +30,18 @@ class ParallelConfig:
     ep: int = 1
     dp: int = 1
     cp: int = 1
+    cp_ulysses: int | None = None
+    cp_ring: int | None = None
     sp: bool = False
 
     @property
     def total_devices(self) -> int:
         return self.tp * self.pp * self.ep * self.dp * self.cp
+
+    def hybrid_cp_factors(self) -> tuple[int, int]:
+        if self.cp_ulysses is not None and self.cp_ring is not None:
+            return self.cp_ulysses, self.cp_ring
+        return self.cp, self.cp
 
     def describe(self) -> str:
         parts = []
@@ -302,6 +309,9 @@ class TrainingConfig:
     # Model geometry for CP shape split (used by ContextParallelPass)
     seq_len: int = 2048  # Sequence length (required for seq/cp split)
     hidden: int = 7168   # Hidden dimension (required for CP communication sizing)
+    num_heads: int = 0       # 0 = unknown; used for Ulysses/Hybrid head splitting
+    num_kv_heads: int = 0    # 0 = fallback to num_heads
+    head_dim: int = 0        # 0 = derived from hidden // num_heads
 
     def resolve_cp_kind(self, model_id: str = "", cp: int = 1) -> str:
         """Resolve cp_kind based on model type and CP configuration.
@@ -331,7 +341,7 @@ class TrainingConfig:
         model_lower = model_id.lower()
         
         # DeepSeek-V4 uses compressed (two-stage) CP
-        if "deepseek" in model_lower and ("v4" in model_lower or "v3.2" in model_lower):
+        if "deepseek" in model_lower and ("v4" in model_lower):
             return "compressed"
         
         # All other models use Ulysses (A2A-based) CP

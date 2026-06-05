@@ -1,29 +1,29 @@
-"""Context Parallel pass: splits seq dimension by CP factor.
+"""Context Parallel pass: CPKind-aware shape splitting.
 
-Design (Simplified):
-- 规则：只要 tensor shape 中包含 seq_len，就切分
-- 排除：权重节点(is_param)、通信节点、optimizer节点
-- 切分方式：将所有匹配 seq_len 的维度切分为 seq_len/cp
+Follows the training-side sharding semantics (``shard.py::_apply_cp_sharding``)
+and the scope-classification pattern from ``tensor_parallel.py``.
 
-会被切分的算子（shape包含seq_len）:
-  - Embedding (输出)
-  - QKV 线性层
-  - Attention 全套
-  - LayerNorm/RMSNorm
-  - MLP/FFN
-  - Dropout
-  - RoPE
-  - Activations (SiLU, etc.)
-  
-不会被切分的算子:
-  - 权重/参数 (is_param=True)
-  - Loss/Optimizer
-  - 标量/常量操作
-  - 通信节点
+Splitting rules by CPKind
+--------------------------
+Ulysses:
+  - Attention-internal nodes: heads ÷ cp, seq unchanged (A2A gathers seq).
+  - Other nodes: seq ÷ cp.
+Ring / Compressed:
+  - All nodes: seq ÷ cp.
+Hybrid:
+  - Attention-internal nodes: heads ÷ cp_ulysses, seq ÷ cp_ring.
+  - Other nodes: seq ÷ cp.
+
+Attention-internal scopes
+--------------------------
+Any node whose ``scope`` places it inside the self-attention region:
+QKV projections, attention score / softmax, RoPE, output projection,
+and MLA-specific projections (q_a_proj, kv_a_proj, etc.).
 """
 from __future__ import annotations
 
 import logging
+from math import prod
 from typing import Dict, List
 
 from python.zrt.ir.graph import OpGraph
@@ -35,177 +35,348 @@ from python.zrt.transform.context import TransformContext
 logger = logging.getLogger(__name__)
 
 
+_ATTN_SCOPE_KW = (
+    "self_attn", "attention", "attn",
+    "q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
+    "q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj",
+    "q_a_layernorm", "kv_a_layernorm",
+    "rotary", "rope",
+)
+
+_KV_PROJ_SCOPE_KW = ("k_proj", "v_proj", "kv_a_proj", "kv_b_proj")
+
+
+def _is_attn_scope(scope: str) -> bool:
+    s = scope.lower()
+    if "layernorm" in s or "rmsnorm" in s or "rms_norm" in s or "layer_norm" in s:
+        return False
+    return any(kw in s for kw in _ATTN_SCOPE_KW)
+
+
+def _is_kv_proj_scope(scope: str) -> bool:
+    return any(kw in scope.lower() for kw in _KV_PROJ_SCOPE_KW)
+
+
 class ContextParallelPass(GraphPass):
-    """Context Parallel pass: split all tensors containing seq_len.
-    
-    Simplified rule: if any tensor shape dimension equals seq_len, split it.
+    """CPKind-aware Context Parallel pass.
+
+    Mirrors the training-side ``_apply_cp_sharding`` logic:
+    - Ulysses splits heads for attention, seq for everything else.
+    - Ring / Compressed split seq everywhere.
+    - Hybrid splits heads by ``cp_ulysses`` and seq by ``cp_ring``.
     """
+
     name = "context_parallel"
 
     def run(self, graph: OpGraph, ctx: TransformContext) -> OpGraph:
         if ctx.parallel.cp <= 1:
             return graph
-        
+
         g = graph.clone()
         cp = ctx.parallel.cp
-        
-        if ctx.training:
-            cp_kind = ctx.training.resolve_cp_kind(ctx.model_id, cp)
-        else:
-            cp_kind = "ulysses"
-        
+
+        cp_kind = (
+            ctx.training.resolve_cp_kind(ctx.model_id, cp)
+            if ctx.training
+            else "ulysses"
+        )
+
         seq_len = ctx.training.seq_len if ctx.training else 2048
-        
-        nodes_to_split = self._identify_nodes_with_seq_len(g, seq_len)
-        
-        g, split_nodes = self._split_tensor_shapes(g, nodes_to_split, seq_len, cp, cp_kind)
-        
-        for node in split_nodes:
-            node.annotations["cp_split"] = {
-                "kind": cp_kind,
-                "cp": cp,
-            }
-        
-        return g
+        num_heads = ctx.training.num_heads if ctx.training else 0
+        num_kv_heads = (
+            ctx.training.num_kv_heads
+            if ctx.training and ctx.training.num_kv_heads > 0
+            else num_heads
+        )
+        tp = ctx.parallel.tp
+        num_heads_tp = num_heads // tp if num_heads > 0 and tp > 0 else 0
+        num_kv_heads_tp = num_kv_heads // tp if num_kv_heads > 0 and tp > 0 else 0
 
-    def _identify_nodes_with_seq_len(self, graph: OpGraph, seq_len: int) -> List[OpNode]:
-        """识别所有含 seq_len tensor 的节点，切分这些 tensor。
-        
-        规则（简化）：
-        1. 节点的输入/输出中，只要有含 seq_len 的 tensor，就处理
-        2. 不过滤权重算子（w1/w2/linear 等），让激活 tensor 被切分
-        3. 权重 tensor（不含 seq_len）自然不会被切分
-        4. 排除通信节点
-        
-        这样：
-        - w1/w2/linear: 激活 tensor 被切分，权重 tensor 不变
-        - silu/layernorm: 所有 tensor 被切分
-        """
-        candidates = []
-        
-        for node in graph.topo_sort():
-            # 排除通信节点
-            if node.category == "communication":
-                continue
-            
-            # 检查是否有含 seq_len 的 tensor
-            has_seq = any(seq_len in tensor.shape for tensor in node.inputs + node.outputs)
-            
-            if has_seq:
-                candidates.append(node)
-        
-        logger.info(f"ContextParallelPass identified {len(candidates)} nodes with seq_len tensor")
-        if candidates:
-            sample_shapes = []
-            for n in candidates[:5]:
-                shapes = [t.shape for t in n.inputs[:2] if seq_len in t.shape]
-                if shapes:
-                    sample_shapes.append(f"{n.op_type}: {shapes[0]}")
-            logger.info(f"  Sample: {sample_shapes}")
-        
-        return candidates
+        cp_ulysses, cp_ring = ctx.parallel.hybrid_cp_factors()
 
-    def _split_tensor_shapes(
-        self, 
-        graph: OpGraph, 
-        nodes_to_split: List[OpNode],
-        seq_len: int,
-        cp: int,
-        cp_kind: str,
-    ) -> tuple[OpGraph, List[OpNode]]:
-        seq_local = seq_len // cp
+        attn_nodes, general_nodes = self._classify_nodes(g, seq_len)
+
         tensor_map: Dict[str, TensorMeta] = {}
         split_nodes: List[OpNode] = []
-        
-        for node in nodes_to_split:
-            new_inputs = [
-                self._split_seq_dim(t, seq_len, seq_local, tensor_map)
-                for t in node.inputs
-            ]
-            new_outputs = [
-                self._split_seq_dim(t, seq_len, seq_local, tensor_map)
-                for t in node.outputs
-            ]
-            
-            new_node = OpNode(
-                id=node.id,
-                op_type=node.op_type,
-                inputs=new_inputs,
-                outputs=new_outputs,
-                attrs=node.attrs,
-                scope=node.scope,
-                layer=node.layer,
-                category=node.category,
-                annotations=node.annotations,
-                op_short=node.op_short,
-                module_class=node.module_class,
-                component=node.component,
-                name=node.name,
-                provenance=node.provenance,
-                src_file=node.src_file,
-                src_line=node.src_line,
-                src_code=node.src_code,
-                call_id=node.call_id,
-                fused_from=node.fused_from,
-                num_sub_ops=node.num_sub_ops,
-                fusion_level=node.fusion_level,
+
+        for node in general_nodes:
+            changed = self._apply_seq_split(
+                g, node, seq_len, cp, tensor_map,
             )
-            graph.nodes[node.id] = new_node
-            
-            if any(t.id in tensor_map for t in node.inputs + node.outputs):
-                split_nodes.append(new_node)
-        
-        for edge in graph.edges:
+            if changed:
+                split_nodes.append(node)
+
+        for node in attn_nodes:
+            changed = self._apply_attn_split(
+                g, node, seq_len, cp_kind, cp,
+                cp_ulysses, cp_ring,
+                num_heads_tp, num_kv_heads_tp,
+                _is_kv_proj_scope(node.scope or ""),
+                tensor_map,
+            )
+            if changed:
+                split_nodes.append(node)
+
+        for node in split_nodes:
+            ann = {"kind": cp_kind, "cp": cp}
+            if cp_kind == "hybrid":
+                ann["cp_ulysses"] = cp_ulysses
+                ann["cp_ring"] = cp_ring
+            node.annotations["cp_split"] = ann
+
+        for edge in g.edges:
             if edge.tensor and edge.tensor.id in tensor_map:
                 edge.tensor = tensor_map[edge.tensor.id]
-        
-        return graph, split_nodes
+
+        logger.info(
+            "ContextParallelPass: cp=%s kind=%s | "
+            "attn_nodes=%d general_nodes=%d split_nodes=%d",
+            cp, cp_kind, len(attn_nodes), len(general_nodes), len(split_nodes),
+        )
+
+        return g
+
+    # ── node classification ──────────────────────────────────────────────
+
+    def _classify_nodes(
+        self, graph: OpGraph, seq_len: int,
+    ) -> tuple[List[OpNode], List[OpNode]]:
+        attn_nodes: List[OpNode] = []
+        general_nodes: List[OpNode] = []
+
+        for node in graph.topo_sort():
+            if node.category == "communication":
+                continue
+            has_seq = any(
+                seq_len in t.shape for t in node.inputs + node.outputs
+            )
+            if not has_seq:
+                continue
+            if node.scope and _is_attn_scope(node.scope):
+                attn_nodes.append(node)
+            else:
+                general_nodes.append(node)
+
+        return attn_nodes, general_nodes
+
+    # ── seq-split (non-attention nodes) ──────────────────────────────────
+
+    def _apply_seq_split(
+        self,
+        graph: OpGraph,
+        node: OpNode,
+        seq_len: int,
+        cp: int,
+        tensor_map: Dict[str, TensorMeta],
+    ) -> bool:
+        seq_local = seq_len // cp
+        changed = False
+
+        new_inputs = []
+        for t in node.inputs:
+            nt = self._split_seq_dim(t, seq_len, seq_local, tensor_map)
+            new_inputs.append(nt)
+            if nt is not t:
+                changed = True
+
+        new_outputs = []
+        for t in node.outputs:
+            nt = self._split_seq_dim(t, seq_len, seq_local, tensor_map)
+            new_outputs.append(nt)
+            if nt is not t:
+                changed = True
+
+        if changed:
+            graph.nodes[node.id] = self._rebuild_node(
+                node, new_inputs, new_outputs,
+            )
+        return changed
+
+    # ── attention-internal split ─────────────────────────────────────────
+
+    def _apply_attn_split(
+        self,
+        graph: OpGraph,
+        node: OpNode,
+        seq_len: int,
+        cp_kind: str,
+        cp: int,
+        cp_ulysses: int,
+        cp_ring: int,
+        num_heads_tp: int,
+        num_kv_heads_tp: int,
+        is_kv_proj: bool,
+        tensor_map: Dict[str, TensorMeta],
+    ) -> bool:
+        if cp_kind == "ulysses":
+            heads_factor = cp
+            seq_factor = None
+        elif cp_kind == "hybrid":
+            heads_factor = cp_ulysses
+            seq_factor = cp_ring
+        elif cp_kind in ("ring", "compressed"):
+            heads_factor = None
+            seq_factor = cp
+        else:
+            heads_factor = None
+            seq_factor = cp
+
+        heads_dim = num_kv_heads_tp if is_kv_proj else num_heads_tp
+
+        if heads_factor and heads_dim == 0:
+            seq_factor = heads_factor
+            heads_factor = None
+
+        changed = False
+        new_inputs = []
+        for t in node.inputs:
+            nt = self._split_attn_tensor(
+                t, seq_len, seq_factor, heads_dim, heads_factor, tensor_map,
+            )
+            new_inputs.append(nt)
+            if nt is not t:
+                changed = True
+
+        new_outputs = []
+        for t in node.outputs:
+            nt = self._split_attn_tensor(
+                t, seq_len, seq_factor, heads_dim, heads_factor, tensor_map,
+            )
+            new_outputs.append(nt)
+            if nt is not t:
+                changed = True
+
+        if changed:
+            graph.nodes[node.id] = self._rebuild_node(
+                node, new_inputs, new_outputs,
+            )
+        return changed
+
+    # ── tensor-level helpers ─────────────────────────────────────────────
+
+    def _split_attn_tensor(
+        self,
+        tensor: TensorMeta,
+        seq_len: int,
+        seq_factor: int | None,
+        heads_dim: int,
+        heads_factor: int | None,
+        tensor_map: Dict[str, TensorMeta],
+    ) -> TensorMeta:
+        if tensor.id in tensor_map:
+            return tensor_map[tensor.id]
+
+        shape = tensor.shape
+        new_shape = list(shape)
+        found = False
+
+        if heads_factor and heads_dim > 0:
+            if len(shape) == 4:
+                if shape[1] == heads_dim:
+                    new_shape[1] = max(1, heads_dim // heads_factor)
+                    found = True
+                for i in range(2, len(shape)):
+                    if seq_factor and shape[i] == seq_len:
+                        new_shape[i] = seq_len // seq_factor
+                        found = True
+            else:
+                for i in range(len(shape)):
+                    if shape[i] == heads_dim:
+                        new_shape[i] = max(1, shape[i] // heads_factor)
+                        found = True
+                        break
+
+        if seq_factor:
+            protect_attn_seq = bool(heads_factor and heads_dim > 0) and len(shape) == 4
+            if not found or not protect_attn_seq:
+                if len(shape) == 2 and shape[0] == seq_len:
+                    new_shape[0] = seq_len // seq_factor
+                    found = True
+                for i in range(1, len(shape)):
+                    if shape[i] == seq_len and (
+                        not protect_attn_seq or i not in (2, 3)
+                    ):
+                        new_shape[i] = seq_len // seq_factor
+                        found = True
+
+        if not found:
+            return tensor
+
+        return self._make_tensor(tensor, tuple(new_shape), tensor_map)
 
     def _split_seq_dim(
-        self, 
-        tensor: TensorMeta, 
+        self,
+        tensor: TensorMeta,
         seq_len: int,
         seq_local: int,
         tensor_map: Dict[str, TensorMeta],
     ) -> TensorMeta:
-        """Split dimensions matching seq_len.
-        
-        规则：
-        - 2D tensor (seq, hidden): dim[0] 是 seq，切分
-        - 3D+ tensor: dim[0] 是 batch/heads，不切；从 dim[1] 开始检查
-        """
         if tensor.id in tensor_map:
             return tensor_map[tensor.id]
-        
+
         shape = tensor.shape
         new_shape = list(shape)
         found_seq = False
-        
-        # 2D tensor: dim[0] 可能是 seq，检查并切分
+
         if len(shape) == 2 and shape[0] == seq_len:
             new_shape[0] = seq_local
             found_seq = True
-        
-        # 3D+ tensor: dim[0] 是 batch/heads，跳过；从 dim[1] 开始检查
+
         for i in range(1, len(shape)):
             if shape[i] == seq_len:
                 new_shape[i] = seq_local
                 found_seq = True
-        
+
         if not found_seq:
             return tensor
-        
-        from math import prod
-        new_shape_tuple = tuple(new_shape)
-        new_numel = prod(new_shape_tuple) if new_shape_tuple else 1
+
+        return self._make_tensor(tensor, tuple(new_shape), tensor_map)
+
+    # ── shared helpers ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_tensor(
+        tensor: TensorMeta,
+        new_shape: tuple[int, ...],
+        tensor_map: Dict[str, TensorMeta],
+    ) -> TensorMeta:
+        new_numel = prod(new_shape) if new_shape else 1
         new_bytes = int(new_numel * tensor.dtype.itemsize)
-        
         new_tensor = TensorMeta(
             id=tensor.id,
-            shape=new_shape_tuple,
+            shape=new_shape,
             dtype=tensor.dtype,
             mem_bytes=new_bytes,
         )
-        
         tensor_map[tensor.id] = new_tensor
         return new_tensor
+
+    @staticmethod
+    def _rebuild_node(
+        node: OpNode,
+        new_inputs: list[TensorMeta],
+        new_outputs: list[TensorMeta],
+    ) -> OpNode:
+        return OpNode(
+            id=node.id,
+            op_type=node.op_type,
+            inputs=new_inputs,
+            outputs=new_outputs,
+            attrs=node.attrs,
+            scope=node.scope,
+            layer=node.layer,
+            category=node.category,
+            annotations=node.annotations,
+            op_short=node.op_short,
+            module_class=node.module_class,
+            component=node.component,
+            name=node.name,
+            provenance=node.provenance,
+            src_file=node.src_file,
+            src_line=node.src_line,
+            src_code=node.src_code,
+            call_id=node.call_id,
+            fused_from=node.fused_from,
+            num_sub_ops=node.num_sub_ops,
+            fusion_level=node.fusion_level,
+        )
