@@ -1,4 +1,4 @@
-from backend.kepler.engine.common.tensor_base import DType
+from backend.inference.kepler.engine.common.tensor_base import DType
 
 from .base import OpVectorBase, TensorBase
 

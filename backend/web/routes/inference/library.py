@@ -6,12 +6,12 @@ import os
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from ..schemas import SaveHardwareRequest
-from ...utils.log import logger
+from .schemas import SaveHardwareRequest
+from backend.utils.log import logger
 
 router = APIRouter(prefix="/api/library", tags=["library"])
 
-_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "inference", "data")
 
 
 # ── Operators ──────────────────────────────────────────

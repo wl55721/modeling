@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from ..schemas import SimulateRequest, SimulateMultiResponse
-from ..services.simulation import SimulationService
+from .schemas import SimulateRequest, SimulateMultiResponse
+from .services.simulation import SimulationService
 
 router = APIRouter(prefix="/api", tags=["simulate"])
 

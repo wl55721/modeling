@@ -13,12 +13,12 @@ from ..schemas import (
     OperatorStatistics, LayerResultPerRank, RankResult, WorkloadEntry,
     TensorInfo,
 )
-from ...engine.executor import execute_model, OperatorExecuteResult
-from ...engine.model_config import ModelConfig
-from ...engine.chips.config import AIChipConfig
-from ...utils.log import logger
+from backend.inference.kepler.engine.executor import execute_model, OperatorExecuteResult
+from backend.inference.kepler.engine.model_config import ModelConfig
+from backend.inference.kepler.engine.chips.config import AIChipConfig
+from backend.utils.log import logger
 
-_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "inference", "data")
 
 
 def _fmt_context(ctx: dict) -> str:

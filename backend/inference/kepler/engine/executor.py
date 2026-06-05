@@ -16,7 +16,7 @@ from .chips.config import AIChipConfig
 from .layers.base import OperatorExecuteResult
 from .model_config import ModelConfig, OperatorConfig
 from . import layers as _layers
-from ..utils.log import logger
+from ....utils.log import logger
 
 
 # 非张量配置键（在 fill_operator 中提取为 attrs）

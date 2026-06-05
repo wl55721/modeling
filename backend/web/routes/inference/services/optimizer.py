@@ -12,7 +12,7 @@ from ..schemas import (
     ParallelConfig, WorkloadEntry, SimulateRequest,
 )
 from .simulation import SimulationService
-from ...utils.log import logger
+from backend.utils.log import logger
 
 
 def _factors(n: int) -> list[int]:

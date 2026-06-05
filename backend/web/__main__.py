@@ -24,7 +24,7 @@ def _setup_file_logging(log_dir: str, level: int, level_name: str) -> None:
     """Attach a RotatingFileHandler to the global kepler logger and to
     the uvicorn logger family.  Also set up console handlers for
     uvicorn so the terminal stays readable."""
-    from kepler.utils.log import logger
+    from backend.utils.log import logger
 
     logger.propagate = True
     logger.setLevel(level)
@@ -97,7 +97,7 @@ def main():
 
     import uvicorn
     uvicorn.run(
-        "kepler.web.app:app",
+        "backend.web.app:app",
         host=args.host,
         port=args.port,
         log_level=level_name,
