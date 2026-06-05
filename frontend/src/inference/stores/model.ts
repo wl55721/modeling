@@ -848,6 +848,7 @@ export const useModelStore = create<ModelState>((set, get) => ({
         params: toList(op.params),
         outputs: toList(op.outputs),
         compute_flops: op.compute_flops || '0',
+        compute_unit: op.compute_unit || 'cube',
       }
     })
 
@@ -924,6 +925,7 @@ export const useModelStore = create<ModelState>((set, get) => ({
         params: Array.isArray(op.params) ? op.params : toList(op.params),
         outputs: Array.isArray(op.outputs) ? op.outputs : toList(op.outputs),
         compute_flops: op.compute_flops || '0',
+        compute_unit: op.compute_unit || 'cube',
       }
       const idx = _nextId++
       nodes.push({ index: idx, operator, label: `${op.op_name}_${op.op_id}`, rank: op.rank_idx ?? 0 })

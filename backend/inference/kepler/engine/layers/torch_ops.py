@@ -1,4 +1,4 @@
-from .base import OpVectorBase, OpCubeBase, TensorBase
+from .op_base import OpVectorBase, OpCubeBase, TensorBase
 
 
 class TorchMul(OpVectorBase):

@@ -1,10 +1,12 @@
-from .base import OperatorBase, OperatorExecuteResult, OpCubeBase, OpVectorBase, OpMixBase
+from .op_base import OperatorBase, OperatorExecuteResult, OpCubeBase, OpVectorBase, OpMixBase
+from .custom_op import CustomOp
 from .rms_norm import RMSNorm, AddRMSNorm, AddRMSNormQuant, GemmaRMSNorm, RMSNormGated, RMSNormQuant
 from .attention import FlashAttention, SparseAttentionSharedKV, ScaledDotProductAttn, PageAttention, SparseFlashAttention
 from .embedding import Embedding
 from .linear import MatMul, Linear, ColumnParallelLinear, RowParallelLinear, GroupMatMul, ColumnParallelLinearQuant
 from .swiglu import SwiGlu, SwiGluQuant, Sigmoid
-from .moe import MoEGateTopK, MoEDispatch, MoECombine, MoEGate, MoETopK, MoEGateHashTopK, LightningIndexer, IndexPrologV4, MLAPrologV4, MLAEpilogV4
+from .moe import MoEGateTopK, MoEGate, MoETopK, MoEGateHashTopK, LightningIndexer, IndexPrologV4, MLAPrologV4, MLAEpilogV4
+from .communication import MoEDispatch, MoECombine
 from .flow import START, END
 from .communication import OpCommBase, AllReduce, AllGather
 from .position import RopeComplex, RopeInterLeave
@@ -73,4 +75,5 @@ __all__ = [
     "TorchCumsum",
     "TorchMm",
     "TorchSort",
+    "CustomOp",
 ]

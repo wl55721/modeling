@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING
 
-from .base import OperatorExecuteResult, OperatorBase, TensorBase
+from .op_base import OperatorExecuteResult, OperatorBase, TensorBase
 
 if TYPE_CHECKING:
     from ..chips.config import AIChipConfig

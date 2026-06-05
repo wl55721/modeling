@@ -1,4 +1,5 @@
 {
+  "name": "B300_Server",
   "hw_env": "B300_Server",
   "chip_name": "B300",
   "vendor": "NVIDIA",

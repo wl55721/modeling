@@ -4,8 +4,16 @@ import { SectionHeader } from './OperatorDetail'
 import ModuleSelect from './ModuleSelect'
 import type { OperatorDef, TensorMeta } from '../../types/model'
 
+const COMPUTE_UNITS = [
+  { value: 'cube', label: 'Cube（矩阵乘/密集计算）' },
+  { value: 'vector', label: 'Vector（逐元素操作）' },
+  { value: 'mix', label: 'Mix（混合计算）' },
+  { value: 'sfu', label: 'SFU（特殊函数：exp/sin/sigmoid 等）' },
+  { value: 'communication', label: 'Communication（通信）' },
+]
+
 function emptyOp(): OperatorDef {
-  return { name: '', module: '', description: '', inputs: [], params: [], outputs: [], compute_flops: '0' }
+  return { name: '', module: '', description: '', inputs: [], params: [], outputs: [], compute_flops: '0', compute_unit: 'cube' }
 }
 
 function TensorRows({ sectionId, arr, collapsed, onChange }: {
@@ -95,6 +103,16 @@ export default function CustomOperatorDialog({
             <span>描述</span>
             <input value={op.description} placeholder="简短描述"
               onChange={(e) => setOp({ ...op, description: e.target.value })} />
+          </label>
+
+          <label className="mod-field">
+            <span>计算单元</span>
+            <select value={op.compute_unit || 'cube'}
+              onChange={(e) => setOp({ ...op, compute_unit: e.target.value })}>
+              {COMPUTE_UNITS.map((u) => (
+                <option key={u.value} value={u.value}>{u.label}</option>
+              ))}
+            </select>
           </label>
 
           <SectionHeader title="Inputs" count={op.inputs.length} collapsed={collapsed.has('inputs')}

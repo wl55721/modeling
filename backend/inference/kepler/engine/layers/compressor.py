@@ -1,6 +1,6 @@
 import math
 
-from .base import OpMixBase, OpVectorBase, TensorBase
+from .op_base import OpMixBase, OpVectorBase, TensorBase
 
 
 class Compressor(OpMixBase):

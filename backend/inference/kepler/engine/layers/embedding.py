@@ -1,4 +1,4 @@
-from .base import OpVectorBase, TensorBase
+from .op_base import OpVectorBase, TensorBase
 
 
 class Embedding(OpVectorBase):

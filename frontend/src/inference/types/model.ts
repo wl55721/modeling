@@ -14,6 +14,7 @@ export interface OperatorDef {
   params: TensorMeta[]
   outputs: TensorMeta[]
   compute_flops: string
+  compute_unit?: string  // "cube" | "vector" | "mix" | "communication"
   rank_size?: string
 }
 
