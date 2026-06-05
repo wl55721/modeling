@@ -175,7 +175,10 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys, tm
         "llama3_8b_unified_graph.onnx",
     }
     onnx_by_name = {call["output_path"].name: call["graph"] for call in onnx_calls}
-    assert onnx_by_name["llama3_8b_unified_graph.onnx"] is transformed_unified
+    assert onnx_by_name["llama3_8b_unified_graph.onnx"].name == "transformed_unified"
+    assert onnx_by_name["llama3_8b_train_forward_graph.onnx"].name == "transformed_train_forward"
+    assert onnx_by_name["llama3_8b_train_backward_graph.onnx"].name == "transformed_train_backward"
+    assert set(onnx_by_name["llama3_8b_unified_graph.onnx"].nodes) == set(transformed_unified.nodes)
     assert {n.op_type for n in onnx_by_name["llama3_8b_train_forward_graph.onnx"].nodes.values()} == {
         "comm.all_to_all",
         "GroupedMatMul",

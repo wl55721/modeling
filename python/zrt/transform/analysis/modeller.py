@@ -26,6 +26,20 @@ from zrt.training.spec.report import TrainingReport
 logger = logging.getLogger(__name__)
 
 
+def _training_artifact_base_name(name: str | None) -> str:
+    """Return a model-ish base name for training debug artifacts."""
+    base = (name or "model").replace("/", "_").replace(":", "_")
+    for suffix in (
+        "_train_forward",
+        "_train_backward",
+        "_train",
+        "_unified",
+    ):
+        if base.endswith(suffix):
+            return base[: -len(suffix)] or "model"
+    return base
+
+
 def estimate_training_from_graphs(
     *,
     forward_graph: "OpGraph",
@@ -223,21 +237,21 @@ def estimate_training_from_graphs(
         from python.zrt.report.dot_exporter import export_dot, render_dot
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
-        model_name = forward_graph.name or "model"
+        model_name = _training_artifact_base_name(forward_graph.name)
 
         def _maybe_render(graph, dot_path):
             if len(graph.nodes) <= _RENDER_DOT_NODE_BUDGET:
                 render_dot(dot_path)  # no-op when graphviz absent
 
-        # Export raw forward and backward graphs separately
-        dot_path = export_dot(forward_graph, out / f"{model_name}_train_forward.dot")
+        # Export raw forward and backward graphs separately.
+        dot_path = export_dot(forward_graph, out / f"{model_name}_raw_train_forward.dot")
         _maybe_render(forward_graph, dot_path)
         if backward_graph is not None:
-            dot_path = export_dot(backward_graph, out / f"{model_name}_train_backward.dot")
+            dot_path = export_dot(backward_graph, out / f"{model_name}_raw_train_backward.dot")
             _maybe_render(backward_graph, dot_path)
-        # Export transformed graphs (unified or forward-only)
+        # Export transformed graphs (unified or forward-only).
         for tag, g in results.items():
-            dot_path = export_dot(g, out / f"{model_name}_{tag}.dot")
+            dot_path = export_dot(g, out / f"{model_name}_transformed_{tag}.dot")
             _maybe_render(g, dot_path)
 
         # ── PP Chrome Trace export ──────────────────────────────────────────

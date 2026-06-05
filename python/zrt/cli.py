@@ -966,9 +966,24 @@ def _phase_subgraph_for_training_export(graph, *, phase: str, name_suffix: str):
         return None
 
     sub = graph.subgraph(node_ids)
-    sub.name = f"{graph.name}_{name_suffix}" if graph.name else name_suffix
+    base_name = _training_graph_base_name(getattr(graph, "name", ""))
+    sub.name = f"{base_name}_{name_suffix}" if base_name else name_suffix
     sub.phase = phase
     return sub
+
+
+def _training_graph_base_name(name: str) -> str:
+    """Strip phase suffixes before naming derived training graph exports."""
+    base = (name or "").replace("/", "_").replace(":", "_")
+    for suffix in (
+        "_train_forward",
+        "_train_backward",
+        "_train",
+        "_unified",
+    ):
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
+    return base
 
 
 def _training_export_graphs(result, transformed: dict) -> dict:
@@ -1004,7 +1019,10 @@ def _training_export_graphs(result, transformed: dict) -> dict:
             export_graphs["train_backward"] = bwd
 
     if unified is not None:
-        export_graphs["unified"] = unified
+        unified_for_export = unified.clone()
+        base_name = _training_graph_base_name(getattr(unified, "name", ""))
+        unified_for_export.name = f"{base_name}_unified" if base_name else "unified"
+        export_graphs["unified"] = unified_for_export
 
     if not export_graphs:
         export_graphs.update(getattr(result, "graphs", {}) or {})
