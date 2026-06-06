@@ -1786,3 +1786,98 @@ class TestModellerCompressRatiosPlumbing:
         # Legacy behavior: all layers treated as CSA when no metadata present
         assert ctx.training.resolve_layer_cp_type(0) == "csa"
         assert ctx.training.resolve_layer_cp_type(1) == "csa"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2D backward sum dim-1 special case
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_2d_sum_graph(seq_len, hidden, sum_id, phase=None):
+    """Build a graph with a 2D sum node (output shape = (hidden, seq_len)).
+
+    Mirrors the backward layout produced by real captures: gradient
+    accumulation collapses a leading batch+seq axis into the seq dim,
+    yielding ``aten.sum`` with output ``(hidden, seq_len)``.
+    """
+    act = TensorMeta(id="act", shape=(hidden, seq_len), dtype=DType.BF16,
+                     mem_bytes=hidden * seq_len * 2)
+    out = TensorMeta(id="sum_out", shape=(hidden, seq_len), dtype=DType.BF16,
+                     mem_bytes=hidden * seq_len * 2)
+    node = OpNode(
+        id=sum_id, op_type="aten.sum.dim_IntList",
+        inputs=[act], outputs=[out],
+        scope="model.layers.0", layer="0", category="compute",
+        annotations={"phase": phase} if phase else {},
+    )
+    return OpGraph(name="sum_bwd", phase="forward", nodes={node.id: node},
+                   edges=[], metadata={"seq_len": seq_len, "hidden": hidden})
+
+
+class TestPostprocessBwdSumAnnotation:
+    """Regression: 2D bwd sum gating must use phase annotation, not id-prefix.
+
+    Prior to the fix, ``_postprocess_remaining_seq_tensors`` used
+    ``node.id.startswith("bwd_")`` to detect backward sum nodes. This was
+    brittle (any id rename broke the gating) and silently relied on the
+    bwd_ prefix convention from ``adapter.py:665``. The fix reads
+    ``node.annotations["phase"] == "bwd"`` instead, so the gate works even
+    if upstream code stops prefixing bwd node IDs.
+    """
+
+    def test_bwd_sum_with_phase_annotation_splits_dim1(self):
+        """phase=bwd 2D sum splits dim 1 to seq_local."""
+        seq_len, hidden, cp = 128, 64, 2
+        graph = _make_2d_sum_graph(seq_len, hidden, sum_id="sum_grad_0",
+                                    phase="bwd")
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(seq_len=seq_len, hidden=hidden, cp_kind="ring"),
+        )
+        g = ContextParallelPass().run(graph, ctx)
+        out = g.nodes["sum_grad_0"].outputs[0]
+        assert out.shape == (hidden, seq_len // cp), (
+            f"phase=bwd 2D sum should split dim 1 to {hidden}x{seq_len // cp}, "
+            f"got {out.shape}"
+        )
+
+    def test_bwd_sum_with_bwd_prefix_id_splits_dim1(self):
+        """phase=bwd + bwd_-prefix id (real captured graph layout) splits dim 1.
+
+        Mirrors ``adapter.py:665`` which sets both ``id = "bwd_..."`` and
+        ``annotations["phase"] = "bwd"`` for bwd nodes. Verifies the post-fix
+        code preserves the existing captured-graph behavior.
+        """
+        seq_len, hidden, cp = 128, 64, 2
+        graph = _make_2d_sum_graph(seq_len, hidden, sum_id="bwd_sum_grad_0",
+                                    phase="bwd")
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(seq_len=seq_len, hidden=hidden, cp_kind="ring"),
+        )
+        g = ContextParallelPass().run(graph, ctx)
+        out = g.nodes["bwd_sum_grad_0"].outputs[0]
+        assert out.shape == (hidden, seq_len // cp), (
+            f"phase=bwd + bwd_-prefix 2D sum should split dim 1 to "
+            f"{hidden}x{seq_len // cp}, got {out.shape}"
+        )
+
+    def test_fwd_sum_splits_dim1_via_default(self):
+        """phase=fwd 2D sum still gets split via the default fallback."""
+        seq_len, hidden, cp = 128, 64, 2
+        graph = _make_2d_sum_graph(seq_len, hidden, sum_id="sum_fwd_0",
+                                    phase="fwd")
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(seq_len=seq_len, hidden=hidden, cp_kind="ring"),
+        )
+        g = ContextParallelPass().run(graph, ctx)
+        out = g.nodes["sum_fwd_0"].outputs[0]
+        # The default fallback also splits the seq dim, so result is the same
+        # as the bwd path. The test guards against regressions in the default.
+        assert out.shape == (hidden, seq_len // cp), (
+            f"phase=fwd 2D sum should be split by default fallback to "
+            f"{hidden}x{seq_len // cp}, got {out.shape}"
+        )

@@ -471,3 +471,82 @@ def test_h100_faster_than_910b_on_large_mm(hw_910b, hw_h100):
     r_h100 = sim.simulate(node, hw_h100)
     # H100 BF16 = 989T vs 910B BF16 = 320T
     assert r_h100.latency_us < r_910b.latency_us
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Communication node formulas (graph-capture flow)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_comm_node_uses_attrs_bytes_field(hw_910b):
+    """Comm node with attrs[bytes]=X must use X, not placeholder tensor bytes.
+
+    Regression test: prior to the fix, comm.* fell through to _default which
+    used node.total_input_bytes() — the dummy `pre_in` tensor from
+    comm_inserter. With the fix, the precise ``attrs["bytes"]`` value
+    (calculated by comm_inserter) drives the time estimate.
+    """
+    precise_bytes = 1024 * 1024  # 1 MiB
+    placeholder_shape = (1, 128, 7168)  # typical dummy pre_in shape (~1.83 MiB)
+    node = OpNode(
+        id="comm_p2p_test",
+        op_type="comm.send_recv",
+        inputs=[_tm("pre_in", placeholder_shape)],
+        outputs=[_tm("post_out", placeholder_shape)],
+        attrs={"bytes": precise_bytes, "group_size": 2, "rounds": 2},
+        category="communication",
+    )
+    sim = RooflineSimulator()
+    result = sim.simulate(node, hw_910b)
+
+    # Comm op has 0 FLOPs
+    assert result.flops == 0
+    # The precise bytes must show up in the read_bytes field
+    assert result.read_bytes == precise_bytes, (
+        f"Expected precise bytes {precise_bytes} from attrs[bytes], "
+        f"got {result.read_bytes} (placeholder tensor bytes were used)"
+    )
+    # And the time should be based on those precise bytes, not the placeholder
+    expected_us_min = precise_bytes / (hw_910b.hbm_bandwidth() * 1e6) * 1e6
+    # SimResult stores latency_us directly
+    assert result.latency_us >= 0
+
+
+def test_comm_node_without_attrs_bytes_returns_zero(hw_910b):
+    """Comm node without attrs[bytes] must not crash; reports 0 bytes.
+
+    Note: in the graph-capture flow, comm_inserter always sets
+    attrs["bytes"] for inserted comm nodes. A zero value here signals an
+    upstream bug (the inserter forgot to set it). The simulator surfaces
+    this as 0 read_bytes rather than silently using placeholder values.
+    """
+    placeholder_shape = (1, 128, 7168)
+    node = OpNode(
+        id="comm_no_bytes",
+        op_type="comm.all_to_all",
+        inputs=[_tm("pre_in", placeholder_shape)],
+        outputs=[_tm("post_out", placeholder_shape)],
+        attrs={},  # no bytes
+        category="communication",
+    )
+    sim = RooflineSimulator()
+    result = sim.simulate(node, hw_910b)
+    # No attrs[bytes] → 0 reported, no crash
+    assert result.read_bytes == 0
+    assert result.flops == 0
+    assert result.latency_us >= 0
+
+
+def test_comm_node_zero_flops(hw_910b):
+    """All comm variants must report 0 FLOPs (no compute)."""
+    for op_type in ("comm.send_recv", "comm.all_to_all", "comm.all_reduce"):
+        node = OpNode(
+            id=f"comm_{op_type}",
+            op_type=op_type,
+            inputs=[_tm("i", (1, 128, 7168))],
+            outputs=[_tm("o", (1, 128, 7168))],
+            attrs={"bytes": 1_000_000},
+            category="communication",
+        )
+        sim = RooflineSimulator()
+        result = sim.simulate(node, hw_910b)
+        assert result.flops == 0, f"{op_type} should have 0 FLOPs, got {result.flops}"

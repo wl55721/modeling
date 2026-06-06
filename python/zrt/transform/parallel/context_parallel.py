@@ -645,8 +645,12 @@ class ContextParallelPass(GraphPass):
                 
                 # Special handling for backward sum operations with seq_len in dim 1
                 # Pattern: 2D output tensor [hidden, seq_len] from sum operations
-                if (len(t.shape) == 2 and t.shape[1] == seq_len and 
-                    "sum" in node.op_type.lower() and node.id.startswith("bwd_")):
+                # Gate on phase annotation (set by adapter.stitch_fwd_bwd), not
+                # the bwd_ id prefix — id-based gating is brittle and coupled
+                # to adapter.py:665.
+                if (len(t.shape) == 2 and t.shape[1] == seq_len and
+                    "sum" in node.op_type.lower() and
+                    node.annotations.get("phase") == "bwd"):
                     # Split dim 1 instead of dim 0
                     new_shape = (t.shape[0], seq_local)
                 else:

@@ -1337,6 +1337,13 @@ class RooflineSimulator(OpSimulator):
     def _fmr(self, node: "OpNode") -> FMR:
         op = node.op_type
 
+        # 0. Communication nodes: use precise attrs["bytes"] from comm_inserter
+        #    (overrides the dummy `pre_in` placeholder tensor bytes that
+        #    _default would otherwise return). Zero FLOPs — comm has no compute.
+        if node.is_comm:
+            bytes_val = int(node.attrs.get("bytes", 0))
+            return 0.0, float(bytes_val), 0.0
+
         # 1. Exact match
         fn = _EXACT_FORMULAS.get(op)
         if fn is not None:
