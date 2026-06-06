@@ -473,17 +473,15 @@ class TransformedGraphExcelWriter:
                 node.annotations.get("write_bytes", ""),
                 formulas["write_sym"],
                 formulas["write_num"],
-                node.annotations.get("saved_activation_bytes", 0),
-                round(node.annotations.get("activation_memory_us", 0), 3) if node.annotations.get("activation_memory_us") else "",
-                # comm
+                node.sim_result.saved_activation_bytes,
+                round(node.sim_result.activation_memory_us, 3) if node.sim_result.activation_memory_us else "",
                 comm_vol,
-                # timing & bound
-                round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
-                round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
-                round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
-                round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
-                node.annotations.get("bound", ""),
-                round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
+                round(node.sim_result.compute_us, 3) if node.sim_result.compute_us else "",
+                round(node.sim_result.memory_us, 3) if node.sim_result.memory_us else "",
+                round(node.sim_result.base_latency_us, 3) if node.sim_result.base_latency_us else "",
+                round(node.sim_result.latency_us, 3) if node.sim_result.latency_us else "",
+                node.sim_result.bound,
+                round(node.sim_result.arithmetic_intensity, 2) if node.sim_result.arithmetic_intensity else "",
                 annotations_str,
             ]
 
@@ -692,10 +690,26 @@ def export_transformed_graph(graph: OpGraph, ctx: TransformContext,
     json_path = output_dir / f"{base_name}_transformed_graph.json"
     _export_json(graph, ctx, json_path)
 
+    onnx_path = output_dir / f"{base_name}_transformed_graph.onnx"
+    export_transformed_graph_onnx(graph, onnx_path)
+
     return {
         "excel": excel_path,
         "json": json_path,
+        "onnx": onnx_path,
     }
+
+
+def export_transformed_graph_onnx(graph: OpGraph, output_path: Path) -> Path:
+    """Export a transformed OpGraph to ONNX for Netron visualization."""
+    base_name = graph.name.replace("/", "_").replace(":", "_")
+    from python.zrt.report.onnx_exporter import export_onnx_from_records
+    return export_onnx_from_records(
+        _graph_to_fused_records(graph, preserve_topological_order=True),
+        output_path,
+        f"{base_name}_transformed",
+        is_fused=True,
+    )
 
 
 def _export_json(graph: OpGraph, ctx: TransformContext, output_path: Path) -> None:
@@ -947,16 +961,16 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 node.annotations.get("write_bytes", ""),
                 formulas["write_sym"],
                 formulas["write_num"],
-                node.annotations.get("saved_activation_bytes", 0),
-                round(node.annotations.get("activation_memory_us", 0), 3) if node.annotations.get("activation_memory_us") else "",
+                node.sim_result.saved_activation_bytes,
+                round(node.sim_result.activation_memory_us, 3) if node.sim_result.activation_memory_us else "",
                 _comm_vol(node),
-                round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
-                round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
-                round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
+                round(node.sim_result.compute_us, 3) if node.sim_result.compute_us else "",
+                round(node.sim_result.memory_us, 3) if node.sim_result.memory_us else "",
+                round(node.sim_result.base_latency_us, 3) if node.sim_result.base_latency_us else "",
                 "",
-                round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
-                node.annotations.get("bound", ""),
-                round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
+                round(node.sim_result.latency_us, 3) if node.sim_result.latency_us else "",
+                node.sim_result.bound,
+                round(node.sim_result.arithmetic_intensity, 2) if node.sim_result.arithmetic_intensity else "",
             ]
             fill = self._comm_fill if node.is_comm else self._compute_fill
             self._write_row(ws, row_idx, values, fill)
@@ -966,7 +980,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
         if bwd_graph is not None:
             for node in _phase_nodes(bwd_graph, "bwd"):
                 formulas = get_op_formulas(node)
-                replay_us = node.annotations.get("recompute_latency_us", 0.0) or 0.0
+                replay_us = node.sim_result.recompute_latency_us
                 is_recompute = (
                     replay_us > 0
                     or node.annotations.get("recompute", False)
@@ -1003,13 +1017,13 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                     "",
                     "",
                     _comm_vol(node),
-                    round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
-                    round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
-                    round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
+                    round(node.sim_result.compute_us, 3) if node.sim_result.compute_us else "",
+                    round(node.sim_result.memory_us, 3) if node.sim_result.memory_us else "",
+                    round(node.sim_result.base_latency_us, 3) if node.sim_result.base_latency_us else "",
                     round(replay_us, 3) if replay_us else "",
-                    round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
-                    node.annotations.get("bound", ""),
-                    round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
+                    round(node.sim_result.latency_us, 3) if node.sim_result.latency_us else "",
+                    node.sim_result.bound,
+                    round(node.sim_result.arithmetic_intensity, 2) if node.sim_result.arithmetic_intensity else "",
                 ]
                 self._write_row(ws, row_idx, values, fill)
                 row_idx += 1
@@ -1056,9 +1070,9 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         for row_idx, node in enumerate(recompute_nodes, 2):
             lat = (
-                node.annotations.get("recompute_latency_us", 0)
-                or node.annotations.get("base_latency_us", 0)
-                or node.annotations.get("latency_us", 0)
+                node.sim_result.recompute_latency_us
+                or node.sim_result.base_latency_us
+                or node.sim_result.latency_us
                 or 0
             )
             flops = node.annotations.get("flops", 0) or 0
@@ -1071,7 +1085,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 node.layer or "",
                 flops,
                 round(lat, 3),
-                node.annotations.get("bound", ""),
+                node.sim_result.bound,
                 ", ".join(str(t.shape) for t in node.inputs),
             ]
             self._write_row(ws, row_idx, values, _fill)
@@ -1166,9 +1180,8 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             step_flops = float(attrs.get("step_flops", 0) or 0)
             group_size = int(attrs.get("group_size", 0) or 0)
 
-            # Read timing from annotations (set by TrainingPipelinePass)
-            latency_us = float(node.annotations.get("latency_us", 0) or 0)
-            compute_us = float(node.annotations.get("compute_us", 0) or 0)
+            latency_us = float(node.sim_result.latency_us or 0)
+            compute_us = float(node.sim_result.compute_us or 0)
             comm_time_us = float(node.annotations.get("comm_time_us", 0) or 0)
             
             # Fallback: compute from attrs if annotations not set
@@ -1478,7 +1491,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             layer_type_raw = layer_profile.layer_types[layer_idx]
             # Convert to string (handle both enum and string)
             layer_type = layer_type_raw.value if hasattr(layer_type_raw, "value") else str(layer_type_raw)
-            latency_us = node.annotations.get("latency_us", 0.0)
+            latency_us = node.sim_result.latency_us
 
             if node.category == "communication":
                 continue
@@ -1748,7 +1761,8 @@ def _get_fused_dtypes_from_sem_io(node: OpNode, direction: str) -> str:
 
 
 def _graph_to_fused_records(graph: OpGraph,
-                            phase_filter: str | None = None) -> List[Dict[str, Any]]:
+                            phase_filter: str | None = None,
+                            preserve_topological_order: bool = False) -> List[Dict[str, Any]]:
     """Build fused-record dicts from an OpGraph for the Fused Operators sheet.
 
     When the graph is a stitched fwd+bwd unified graph, ``phase_filter``
@@ -1756,10 +1770,32 @@ def _graph_to_fused_records(graph: OpGraph,
     """
     arrow = " → "
     records: List[Dict[str, Any]] = []
-    nodes = layer_stable_sort(graph.topo_sort(), graph=graph)
+    nodes = graph.topo_sort()
+    if not preserve_topological_order:
+        nodes = layer_stable_sort(nodes, graph=graph)
     if phase_filter is not None and (graph.phase == "train"
                                      or graph.metadata.get("fwd_bwd_stitched")):
         nodes = [n for n in nodes if n.annotations.get("phase") == phase_filter]
+    included_ids = {node.id for node in nodes}
+    incoming: dict[str, list[tuple[int, int]]] = {node.id: [] for node in nodes}
+    outgoing: dict[str, list[tuple[int, int]]] = {node.id: [] for node in nodes}
+    next_tensor_id = 0
+    for edge in graph.edges:
+        if edge.src not in included_ids or edge.dst not in included_ids:
+            continue
+        tensor_id = next_tensor_id
+        next_tensor_id += 1
+        outgoing[edge.src].append((edge.src_idx, tensor_id))
+        incoming[edge.dst].append((edge.dst_idx, tensor_id))
+    for node in nodes:
+        if not incoming[node.id]:
+            for input_idx, _tensor in enumerate(node.inputs):
+                incoming[node.id].append((input_idx, next_tensor_id))
+                next_tensor_id += 1
+        if not outgoing[node.id]:
+            for output_idx, _tensor in enumerate(node.outputs):
+                outgoing[node.id].append((output_idx, next_tensor_id))
+                next_tensor_id += 1
     for idx, node in enumerate(nodes):
         constituents = node.fused_from or [node.op_type]
         # Recover the "raw Node IDs that fused into this node".  Strip the
@@ -1812,6 +1848,8 @@ def _graph_to_fused_records(graph: OpGraph,
             "fused_output_dtypes": _get_fused_dtypes_from_sem_io(node, "output"),
             "fused_input_sources": "",
             "fused_output_sources": "",
+            "_input_ids": [tid for _slot, tid in sorted(incoming[node.id])],
+            "_output_ids": [tid for _slot, tid in sorted(outgoing[node.id])],
         })
     return records
 

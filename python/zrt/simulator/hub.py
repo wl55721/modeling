@@ -86,6 +86,10 @@ class SimulatorHub:
     ) -> dict[str, SimResult]:
         """Simulate every node in *graph* in topological order.
 
+        Nodes with pre-computed ``sim_result`` (set by RooflinePass) are
+        reused directly, avoiding redundant Roofline recalculation.
+        Nodes without ``sim_result`` fall back to the normal backend chain.
+
         Returns a dict mapping node_id → SimResult.
         """
         results: dict[str, SimResult] = {}
@@ -95,7 +99,10 @@ class SimulatorHub:
             len(nodes), hw.name, cost_model_policy.name
         )
         for node in nodes:
-            results[node.id] = self.simulate(node, hw, cost_model_policy)
+            if node.sim_result.backend:
+                results[node.id] = node.sim_result
+            else:
+                results[node.id] = self.simulate(node, hw, cost_model_policy)
         return results
 
     # ── cache control ────────────────────────────────────────────────────────

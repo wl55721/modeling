@@ -70,6 +70,54 @@ def _is_expert_matmul(node: OpNode) -> bool:
     ) and bool(node.inputs) and bool(node.outputs)
 
 
+def _is_router_control_node(node: OpNode, layer_key: str, phase: str) -> bool:
+    node_phase = node.annotations.get("phase", phase)
+    if phase and node_phase and node_phase != phase:
+        return False
+    scope = (node.scope or "").lower()
+    op = (node.op_type or "").lower()
+    component = str(getattr(node, "component", "") or node.annotations.get("component", "")).lower()
+    layer_prefix = layer_key.lower()
+    if not scope.startswith(layer_prefix):
+        return False
+    return (
+        op == "moe_gate"
+        or component == "moe_gate"
+        or ".ffn.gate" in scope
+        or scope.endswith(".gate")
+    )
+
+
+def _routing_control_ids(g: "OpGraph", layer_key: str, phase: str,
+                         excluded_ids: set[str]) -> list[str]:
+    """Return terminal router/control nodes for the MoE layer."""
+    candidates = [
+        n for n in g.topo_sort()
+        if n.id not in excluded_ids and _is_router_control_node(n, layer_key, phase)
+    ]
+    if not candidates:
+        return []
+    candidate_ids = {n.id for n in candidates}
+    terminal = [
+        n for n in candidates
+        if not any(s in candidate_ids for s in g.successors(n.id))
+    ]
+    return [terminal[-1].id if terminal else candidates[-1].id]
+
+
+def _consistent_token_dim(nodes: list[OpNode]) -> int | None:
+    """Return the shared leading token dim from original expert tensors."""
+    dims: set[int] = set()
+    for node in nodes:
+        for tensor in list(node.inputs) + list(node.outputs):
+            if tensor.shape:
+                dims.add(int(tensor.shape[0]))
+    if len(dims) != 1:
+        return None
+    value = next(iter(dims))
+    return value if value > 0 else None
+
+
 def _make_grouped_mm(node_id: str, scope: str,
                      inputs: list[TensorMeta],
                      outputs: list[TensorMeta],
@@ -312,6 +360,9 @@ class ExpertGroupedMMPass(GraphPass):
             gate_up.annotations["ep_tokens_per_rank"] = tokens_per_ep_rank
             gate_up.annotations["ep_tokens_per_expert"] = M
             gate_up.annotations["ep_a2a_inserted"] = False
+            control_ids = _routing_control_ids(g, layer_key, phase, old_ids)
+            if control_ids:
+                gate_up.annotations["ep_routing_control_ids"] = control_ids
 
             act_id = f"{layer_key.replace('.','_')}_grouped_silu"
             act_node = OpNode(
@@ -468,6 +519,9 @@ class ExpertGroupedMMPass(GraphPass):
 
         if not gates or not ups or not downs:
             return
+
+        M = _consistent_token_dim(gates + ups + downs) or M
+        tokens_per_rank = G * M
 
         # Backward down consumes grad wrt the forward output (H_out) and
         # produces grad wrt the expert activation (ffn).

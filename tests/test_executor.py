@@ -82,6 +82,28 @@ def test_stream_serialization():
     assert sched["b"].start_us >= sched["a"].end_us
 
 
+def test_scheduler_uses_layer_stable_priority_for_ready_nodes():
+    """Ready-node tie-break follows effective layer before insertion order."""
+    later = _node("later_layer", latency_us=10.0, stream_id=0)
+    earlier = _node("earlier_layer", latency_us=5.0, stream_id=0)
+    later.layer = "3"
+    earlier.layer = "2"
+
+    # Insert later first. Plain topo_sort would schedule it first, but the
+    # scheduler should use layer-stable ready priority for trace readability.
+    g = _graph([later, earlier], [])
+
+    tl = DAGScheduler().schedule(g)
+
+    assert [op.node_id for op in tl.scheduled_ops] == [
+        "earlier_layer",
+        "later_layer",
+    ]
+    sched = {op.node_id: op for op in tl.scheduled_ops}
+    assert sched["earlier_layer"].start_us == pytest.approx(0.0)
+    assert sched["later_layer"].start_us == pytest.approx(5.0)
+
+
 def test_parallel_independent_different_streams():
     """Two independent nodes on different streams run concurrently after shared pred."""
     root  = _node("root", latency_us=10.0, stream_id=0)
@@ -351,8 +373,8 @@ def test_comm_latency_pass_intra_node():
 
     # Should use intra_node bandwidth (NVLink)
     assert result_node.annotations.get("cross_node") is False
-    latency = result_node.annotations.get("latency_us")
-    assert latency is not None and latency > 0.0
+    latency = result_node.sim_result.latency_us
+    assert latency > 0.0
 
 
 def test_comm_latency_pass_cross_node():
@@ -380,8 +402,8 @@ def test_comm_latency_pass_cross_node():
 
     # Should use inter_node bandwidth (RoCE/IB)
     assert result_node.annotations.get("cross_node") is True
-    latency = result_node.annotations.get("latency_us")
-    assert latency is not None and latency > 0.0
+    latency = result_node.sim_result.latency_us
+    assert latency > 0.0
 
 
 def test_comm_latency_pass_zero_group_size():
@@ -408,7 +430,7 @@ def test_comm_latency_pass_zero_group_size():
     result_node = result.nodes["allreduce_0"]
 
     # Should be zero latency
-    assert result_node.annotations.get("latency_us") == pytest.approx(0.0)
+    assert result_node.sim_result.latency_us == pytest.approx(0.0)
 
 
 def test_comm_latency_pass_alltoall():
@@ -434,6 +456,6 @@ def test_comm_latency_pass_alltoall():
     result = CommLatencyPass().run(g, ctx)
     result_node = result.nodes["a2a_0"]
 
-    latency = result_node.annotations.get("latency_us")
-    assert latency is not None and latency > 0.0
+    latency = result_node.sim_result.latency_us
+    assert latency > 0.0
     assert result_node.annotations.get("comm_algorithm") == "all_to_all"

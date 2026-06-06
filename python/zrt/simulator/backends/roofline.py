@@ -1292,6 +1292,9 @@ class RooflineSimulator(OpSimulator):
         return True
 
     def simulate(self, node: "OpNode", hw: "HardwareSpec") -> SimResult:
+        if node.sim_result.backend:
+            return node.sim_result
+
         flops, read_bytes, write_bytes = self._fmr(node)
         total_bytes = read_bytes + write_bytes
 

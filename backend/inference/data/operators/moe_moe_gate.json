@@ -1,0 +1,28 @@
+{
+  "name": "MoEGate",
+  "description": "MoE Gate: computes expert affinity scores from hidden states",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [
+    {
+      "name": "gate_weight",
+      "shape": "[num_experts, hidden_dim]",
+      "dtype": "fp32"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "scores",
+      "shape": "[B, S, num_experts]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "2 * B * S * hidden_dim * num_experts * fp32 + 5 * B * S * num_experts * fp32",
+  "module": "moe.gate",
+  "category": "MoE"
+}

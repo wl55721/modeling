@@ -51,12 +51,11 @@ class LookupSimulator(OpSimulator):
         return True
 
     def simulate(self, node: "OpNode", hw: "HardwareSpec") -> SimResult:
-        # 初始化 cost model 调用器，必须知道硬件型号
         self.init_once(hw)
 
         if self.caller is None:
             logger.warning(f"call cost model for {node}(op_short={node.op_short}) failed, cost model caller is none")
-            return _build_sim_result(node, hw, node.annotations.get("latency_us", 0), "roofline", 0.3)
+            return self._fallback_result(node, hw)
 
         inputs = [_convert_tensor(input_tensor) for input_tensor in node.inputs]
         outputs = [_convert_tensor(output_tensor) for output_tensor in node.outputs]
@@ -69,19 +68,40 @@ class LookupSimulator(OpSimulator):
                 logger.warning(
                     f"call cost model for {node}(op_short={node.op_short}) failed, "
                     f"result code: {result_code}, msg: {msg}, result: {result}, op_type: {cost_model_op_type}")
-                latency_us = node.annotations.get("latency_us", 0)
-                confidence = 0.3
-            else:
-                logger.debug(
-                    f"call cost model for {node}(op_short={node.op_short}) success, "
-                    f"result code: {result_code}, msg: {msg}, result: {result}, op_type: {cost_model_op_type}")
-                latency_us = result["predict_time"]
-                confidence = 0.8
+                return self._fallback_result(node, hw)
 
-            return _build_sim_result(node, hw, latency_us, self.name, confidence)
+            latency_us = result["predict_time"]
+            logger.debug(
+                f"call cost model for {node}(op_short={node.op_short}) success, "
+                f"result code: {result_code}, msg: {msg}, result: {result}, op_type: {cost_model_op_type}")
+            return self._update_sim_result(node, hw, latency_us)
         except Exception as e:
             logger.warning(f"call cost model for {node}(op_short={node.op_short}) failed, error message: {e}")
-            return _build_sim_result(node, hw, node.annotations.get("latency_us", 0), "roofline", 0.3)
+            return self._fallback_result(node, hw)
+
+    def _update_sim_result(self, node: "OpNode", hw: "HardwareSpec", latency_us: float) -> SimResult:
+        """CostModel 成功时，更新 node.sim_result 的 latency 并返回。"""
+        if node.sim_result.backend:
+            node.sim_result.latency_us = latency_us
+            node.sim_result.hw_utilization = _calculate_hw_util(node, hw, latency_us)
+            node.sim_result.backend = self.name
+            node.sim_result.confidence = 0.8
+            return node.sim_result
+        logger.error(
+            "node %s (op_short=%s) has no sim_result when calling CostModel, "
+            "RooflinePass should have set it", node.id, node.op_short,
+        )
+        return None
+
+    def _fallback_result(self, node: "OpNode", hw: "HardwareSpec") -> SimResult:
+        """CostModel 失败时，回退到 node.sim_result。"""
+        if node.sim_result.backend:
+            return node.sim_result
+        logger.error(
+            "node %s (op_short=%s) has no sim_result for fallback, "
+            "RooflinePass should have set it", node.id, node.op_short,
+        )
+        return None
 
 
 _HW_ENV_DICT: dict[str, dict[str, str]] = {
@@ -184,20 +204,4 @@ def _calculate_hw_util(node: "OpNode", hw: "HardwareSpec", latency_us: "float") 
     return hw_util
 
 
-def _build_sim_result(node, hw, latency_us, backend, confidence) -> SimResult:
-    # 当 node.annotations 无赋值时，全部使用默认值 0，confidence设置为 0
-    hw_utilization = _calculate_hw_util(node, hw, latency_us)
-    return SimResult(
-        op_node_id=node.id,
-        latency_us=latency_us,
-        compute_us=node.annotations.get("compute_us", 0),
-        memory_us=node.annotations.get("memory_us", 0),
-        flops=node.annotations.get("flops", 0),
-        read_bytes=node.annotations.get("read_bytes", 0),
-        write_bytes=node.annotations.get("write_bytes", 0),
-        arithmetic_intensity=node.annotations.get("arithmetic_intensity", 0),
-        bound=node.annotations.get("bound", "memory"),
-        hw_utilization=hw_utilization,
-        backend=backend,
-        confidence=confidence if hw_utilization != 0 else 0,
-    )
+

@@ -26,6 +26,20 @@ from zrt.training.spec.report import TrainingReport
 logger = logging.getLogger(__name__)
 
 
+def _training_artifact_base_name(name: str | None) -> str:
+    """Return a model-ish base name for training debug artifacts."""
+    base = (name or "model").replace("/", "_").replace(":", "_")
+    for suffix in (
+        "_train_forward",
+        "_train_backward",
+        "_train",
+        "_unified",
+    ):
+        if base.endswith(suffix):
+            return base[: -len(suffix)] or "model"
+    return base
+
+
 def estimate_training_from_graphs(
     *,
     forward_graph: "OpGraph",
@@ -39,6 +53,7 @@ def estimate_training_from_graphs(
     seq_len: int = 128,
     batch_size: int = 1,
     tp: int = 1, pp: int = 1, ep: int = 1, dp: int = 1, cp: int = 1,
+    tp_extend_ep: bool = False,
     cp_kind: str = "ulysses",
     zero_stage: int = 1,
     optimizer: str = "adam",
@@ -58,6 +73,8 @@ def estimate_training_from_graphs(
     vpp_chunks: int = 1,
     pp_mode: str = "trace",
     tp_coc: bool = False,
+    trace_ep_waves: bool = False,
+    trace_moe_fb_overlap: bool = False,
     return_transformed: bool = False,
     quant: str | None = None,
     quant_preset: str | None = None,
@@ -164,7 +181,9 @@ def estimate_training_from_graphs(
     ctx = TransformContext(
         hw_spec=hw_spec,
         model_id=model_id,
-        parallel=ParallelConfig(tp=tp, pp=pp, ep=ep, dp=dp, cp=cp),
+        parallel=ParallelConfig(
+            tp=tp, pp=pp, ep=ep, dp=dp, cp=cp, tp_extend_ep=tp_extend_ep,
+        ),
         training=TrainingConfig(
             optimizer=optimizer,
             zero_stage=zero_stage,
@@ -182,6 +201,8 @@ def estimate_training_from_graphs(
             vpp_chunks=vpp_chunks,
             pp_mode=pp_mode,
             tp_coc=tp_coc,
+            trace_ep_waves=trace_ep_waves,
+            trace_moe_fb_overlap=trace_moe_fb_overlap,
             seq_len=seq_len,
             hidden=hidden,
             cp_kind=cp_kind,
@@ -231,21 +252,21 @@ def estimate_training_from_graphs(
         from python.zrt.report.dot_exporter import export_dot, render_dot
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
-        model_name = forward_graph.name or "model"
+        model_name = _training_artifact_base_name(forward_graph.name)
 
         def _maybe_render(graph, dot_path):
             if len(graph.nodes) <= _RENDER_DOT_NODE_BUDGET:
                 render_dot(dot_path)  # no-op when graphviz absent
 
-        # Export raw forward and backward graphs separately
-        dot_path = export_dot(forward_graph, out / f"{model_name}_train_forward.dot")
+        # Export raw forward and backward graphs separately.
+        dot_path = export_dot(forward_graph, out / f"{model_name}_raw_train_forward.dot")
         _maybe_render(forward_graph, dot_path)
         if backward_graph is not None:
-            dot_path = export_dot(backward_graph, out / f"{model_name}_train_backward.dot")
+            dot_path = export_dot(backward_graph, out / f"{model_name}_raw_train_backward.dot")
             _maybe_render(backward_graph, dot_path)
-        # Export transformed graphs (unified or forward-only)
+        # Export transformed graphs (unified or forward-only).
         for tag, g in results.items():
-            dot_path = export_dot(g, out / f"{model_name}_{tag}.dot")
+            dot_path = export_dot(g, out / f"{model_name}_transformed_{tag}.dot")
             _maybe_render(g, dot_path)
 
         # ── PP Chrome Trace export ──────────────────────────────────────────
@@ -256,7 +277,12 @@ def estimate_training_from_graphs(
                 from python.zrt.executor.chrome_trace import ChromeTraceExporter
                 trace_dir = out / "pp_trace"
                 trace_dir.mkdir(parents=True, exist_ok=True)
-                exporter = ChromeTraceExporter()
+                trace_moe_fb = ctx.training.trace_moe_fb_overlap if ctx.training else False
+                exporter = ChromeTraceExporter(
+                    trace_ep_waves=(ctx.training.trace_ep_waves and not trace_moe_fb) if ctx.training else False,
+                    trace_moe_fb_overlap=trace_moe_fb,
+                    ep_wave_k=getattr(hw_spec.compute, "ep_overlap_waves", 0),
+                )
                 M = pp_timeline.M
 
                 tl_list = [
@@ -367,6 +393,12 @@ def estimate_training_from_graphs(
         ep_exposed_ms=_d("ep_exposed_ms", 0.0),
         ep_hidden_ms=_d("ep_hidden_ms", 0.0),
         ep_total_ms=_d("ep_total_ms", 0.0),
+        ep_fb_total_ms=_d("ep_fb_total_ms", 0.0),
+        ep_fb_hidden_ms=_d("ep_fb_hidden_ms", 0.0),
+        ep_fb_exposed_ms=_d("ep_fb_exposed_ms", 0.0),
+        ep_fb_steady_hidden_ms=_d("ep_fb_steady_hidden_ms", 0.0),
+        ep_fb_boundary_hidden_ms=_d("ep_fb_boundary_hidden_ms", 0.0),
+        mega_moe_hidden_ms=_d("mega_moe_hidden_ms", 0.0),
         pp_exposed_ms=_d("pp_exposed_ms", 0.0),
         pp_hidden_ms=_d("pp_hidden_ms", 0.0),
         pp_total_ms=_d("pp_total_ms", 0.0),

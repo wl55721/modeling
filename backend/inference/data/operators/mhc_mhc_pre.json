@@ -1,0 +1,38 @@
+{
+  "name": "MHCPre",
+  "description": "hc_pre in deepseek-v4: projects hidden states for MHC computation",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hc_mult, hidden_dim]",
+      "dtype": "bf16"
+    }
+  ],
+  "params": [
+    {
+      "name": "hc_fn",
+      "shape": "[(2+hc_mult)*hc_mult, hc_mult * hidden_dim]",
+      "dtype": "fp32"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "bf16"
+    },
+    {
+      "name": "post",
+      "shape": "[B, S, hc_mult]",
+      "dtype": "fp32"
+    },
+    {
+      "name": "comb",
+      "shape": "[B, S, hc_mult * hc_mult]",
+      "dtype": "fp32"
+    }
+  ],
+  "compute_flops": "6*B*S*hc_mult*hidden_dim*fp32 + 2*B*S*hc_mult*hidden_dim*(2+hc_mult)*hc_mult*fp32",
+  "module": "mhc_pre",
+  "category": "MHC"
+}

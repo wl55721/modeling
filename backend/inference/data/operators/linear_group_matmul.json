@@ -1,0 +1,28 @@
+{
+  "name": "GroupMatMul",
+  "description": "Grouped Matrix Multiplication for MoE experts",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [
+    {
+      "name": "weight",
+      "shape": "[expert_groups, 2 * moe_intermediate_size, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "expert_out",
+      "shape": "[B, S, 2 * moe_intermediate_size]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "2 * B * S * expert_groups * hidden_dim * (2 * moe_intermediate_size) * fp16",
+  "module": "moe.routed_expert.gate_up_proj",
+  "category": "Linear"
+}

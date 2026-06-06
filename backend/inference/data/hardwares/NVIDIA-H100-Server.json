@@ -1,0 +1,20 @@
+{
+  "name": "H100_Server",
+  "hw_env": "H100_Server",
+  "chip_name": "H100",
+  "vendor": "NVIDIA",
+  "spec_memory_size": 80,
+  "spec_cube_fp16": 989,
+  "spec_vect_fp16": 67,
+  "spec_sfu_fp16": 30,
+  "spec_bw_memory": 3.35,
+  "spec_comm_intra": 450,
+  "spec_comm_inter": 50,
+  "spec_l2cache_size": 50,
+  "memory_noise": 5,
+  "compute_ratio": 0.6,
+  "bw_gmem_ratio": 0.8,
+  "comm_intra_ratio": 0.8,
+  "comm_inter_ratio": 0.8,
+  "superpod_limit": 8
+}

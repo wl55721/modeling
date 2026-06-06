@@ -207,6 +207,9 @@ class Strategy:
     # overlap
     tp_overlap: TPOverlap = TPOverlap.NONE
     ep_overlap: bool = False
+    # MindSpeed-style MoE forward/backward A2A overlap.  Pipeline schedules
+    # provide windows; this flag allows MoE EP A2A to consume them.
+    moe_fb_overlap: bool = False
     # Spec-path fused MoE operator. When enabled, MoE routed experts are built
     # as one mega_moe op that includes dispatch, expert FFN, and combine.
     mega_moe: bool = False

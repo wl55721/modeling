@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import pytest
 
+from python.zrt.ir.node import get_recompute_flops
+
 pytestmark = pytest.mark.recompute
 
 _HW, _TP, _EP = "nvidia_h100_sxm", 1, 1
@@ -287,7 +289,7 @@ class TestRecomputeE2E:
             pytest.skip("captured DSv4 E2E graph uses unfused attention in this environment")
         for n in internal:
             assert n.annotations.get("flops_fwd", 0) != n.annotations.get("flops", 0) * 2
-            assert n.annotations.get("recompute_flops", 0) == 0
+            assert get_recompute_flops(n) == 0
 
     def test_non_recompute_nodes_1x(self, none_all):
         _, _, t = none_all
@@ -343,7 +345,7 @@ class TestRecomputeE2E:
                    if n.annotations.get("phase") == phase)
 
     def _forward_activation_memory_sum(self, g):
-        return sum(n.annotations.get("activation_memory_us", 0.0) for n in _forward_nodes(g))
+        return sum(n.sim_result.activation_memory_us for n in _forward_nodes(g))
 
     def test_fwd_activation_save_time_reduced_by_recompute(self, none_all, full_all, sel_all):
         u_none = none_all[2]["unified"]
@@ -481,14 +483,14 @@ class TestRecomputeE2E:
     def test_forward_activation_save_time_is_per_node_final_latency(self, none_all, full_all):
         for graph in (none_all[2]["unified"], full_all[2]["unified"]):
             for node in _forward_nodes(graph):
-                activation_us = node.annotations.get("activation_memory_us", 0.0)
+                activation_us = node.sim_result.activation_memory_us
                 if node.annotations.get("recompute"):
-                    assert node.annotations.get("saved_activation_bytes", 0) == 0
+                    assert node.sim_result.saved_activation_bytes == 0
                     assert activation_us == pytest.approx(0.0)
                 else:
                     assert activation_us >= 0
-                assert node.annotations.get("latency_us", 0.0) == pytest.approx(
-                    node.annotations.get("base_latency_us", 0.0) + activation_us,
+                assert node.sim_result.latency_us == pytest.approx(
+                    node.sim_result.base_latency_us + activation_us,
                     abs=1e-6,
                 )
 
@@ -541,12 +543,12 @@ class TestRecomputeE2E:
         assert replay_rows
         for row in replay_rows[:20]:
             node = graph.nodes[row["Node ID"]]
-            replay = node.annotations.get("recompute_latency_us", 0.0)
-            final = node.annotations.get("latency_us", 0.0)
+            replay = node.sim_result.recompute_latency_us
+            final = node.sim_result.latency_us
             assert float(row["Recompute Replay (µs)"]) == pytest.approx(replay, abs=1e-3)
             assert float(row["Final Latency (µs)"]) == pytest.approx(final, abs=1e-3)
             assert final == pytest.approx(
-                node.annotations.get("base_latency_us", 0.0) + replay,
+                node.sim_result.base_latency_us + replay,
                 abs=1e-6,
             )
 

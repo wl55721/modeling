@@ -1,0 +1,22 @@
+{
+  "name": "END",
+  "description": "模型出口，标记推理终点",
+  "inputs": [
+    {
+      "name": "in",
+      "shape": "[B, S, vocab_size]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "out",
+      "shape": "[B, S, vocab_size]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "0",
+  "module": "END",
+  "category": "Flow"
+}

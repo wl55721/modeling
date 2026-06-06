@@ -1,0 +1,27 @@
+{
+  "name": "TorchMul",
+  "description": "Element-wise tensor multiplication: y = a * b",
+  "inputs": [
+    {
+      "name": "a",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "b",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "B * S * hidden_dim * fp16",
+  "module": "torch.mul",
+  "category": "Torch"
+}

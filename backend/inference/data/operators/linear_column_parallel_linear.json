@@ -1,0 +1,28 @@
+{
+  "name": "ColumnParallelLinear",
+  "description": "TP Column-Parallel Linear: weight sharded along out_features dimension",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_size]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [
+    {
+      "name": "weight_shard",
+      "shape": "[intermediate_dim, hidden_size]",
+      "dtype": "fp16"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "y_shard",
+      "shape": "[B, S, intermediate_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "2 * B * S * hidden_size * intermediate_dim * fp16",
+  "module": "attn.x_proj",
+  "category": "Linear"
+}

@@ -1,0 +1,22 @@
+{
+  "name": "TorchSum",
+  "description": "Sum reduction: y = sum(x, dim=d)",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "(B * S * hidden_dim - 1) * fp16",
+  "module": "torch.sum",
+  "category": "Torch"
+}

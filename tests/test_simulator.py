@@ -474,6 +474,120 @@ def test_h100_faster_than_910b_on_large_mm(hw_910b, hw_h100):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SimResult unification (node.sim_result)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_roofline_simulator_reuses_node_sim_result(hw_910b):
+    """RooflineSimulator.simulate() 应直接返回 node.sim_result（若已存在），避免重复计算。"""
+    node = _node("aten.mm.default",
+                 inputs=[_tm("a", (64, 128)), _tm("b", (128, 64))],
+                 outputs=[_tm("o", (64, 64))])
+    node.id = "op_reuse"
+    preset = SimResult(
+        op_node_id="op_reuse", latency_us=42.0,
+        compute_us=40.0, memory_us=2.0,
+        flops=1000, read_bytes=500, write_bytes=500,
+        arithmetic_intensity=1.0, bound="compute",
+        hw_utilization=0.5, backend="roofline", confidence=0.3,
+    )
+    node.sim_result = preset
+    sim = RooflineSimulator()
+    result = sim.simulate(node, hw_910b)
+    assert result is preset
+    assert result.latency_us == 42.0
+
+
+def test_simulate_graph_prefers_node_sim_result(hw_910b):
+    """simulate_graph() 应优先使用 node.sim_result，不调用后端重算。"""
+    from python.zrt.ir.graph import OpGraph
+
+    graph = OpGraph(name="test", phase="prefill")
+    n0 = OpNode(id="op_0", op_type="aten.mm.default",
+                inputs=[_tm("a", (64, 128)), _tm("b", (128, 64))],
+                outputs=[_tm("out0", (64, 64))])
+    preset = SimResult(
+        op_node_id="op_0", latency_us=99.0,
+        compute_us=90.0, memory_us=9.0,
+        flops=2000, read_bytes=800, write_bytes=800,
+        arithmetic_intensity=1.25, bound="compute",
+        hw_utilization=0.6, backend="roofline", confidence=0.3,
+    )
+    n0.sim_result = preset
+    graph.add_node(n0)
+
+    hub = SimulatorHub.default()
+    results = hub.simulate_graph(graph, hw_910b)
+    assert results["op_0"] is preset
+    assert results["op_0"].latency_us == 99.0
+
+
+def test_update_latency_only_writes_sim_result():
+    """update_latency() 有 sim_result 时只更新 sim_result，不写 annotations。"""
+    from python.zrt.ir.node import update_latency
+
+    node = OpNode(id="op_sync", op_type="aten.mm.default")
+    node.sim_result = SimResult(
+        op_node_id="op_sync", latency_us=10.0,
+        compute_us=8.0, memory_us=2.0,
+        flops=100, read_bytes=50, write_bytes=50,
+        arithmetic_intensity=1.0, bound="compute",
+        hw_utilization=0.5, backend="roofline", confidence=0.3,
+    )
+
+    update_latency(node, 25.0)
+    assert node.sim_result.latency_us == 25.0
+    assert "latency_us" not in node.annotations
+
+
+def test_update_latency_without_sim_result_fallback():
+    """update_latency() 直接写入 sim_result。"""
+    from python.zrt.ir.node import update_latency
+
+    node = OpNode(id="op_no_sr", op_type="aten.mm.default")
+    assert node.sim_result.backend == ""
+    update_latency(node, 15.0)
+    assert node.sim_result.latency_us == 15.0
+
+
+def test_lookup_update_sim_result_logs_error_when_none(hw_910b, caplog):
+    """LookupSimulator._update_sim_result 在 sim_result 未填充时 log error，不构建新 SimResult。"""
+    import logging
+    from python.zrt.simulator.backends.lookup import LookupSimulator
+
+    node = OpNode(id="op_no_sr", op_type="aten.mm.default",
+                  inputs=[_tm("a", (64, 128)), _tm("b", (128, 64))],
+                  outputs=[_tm("o", (64, 64))])
+    assert node.sim_result.backend == ""
+
+    sim = LookupSimulator()
+    with caplog.at_level(logging.ERROR):
+        result = sim._update_sim_result(node, hw_910b, 100.0)
+    assert result is None
+    assert any("sim_result" in r.message.lower() for r in caplog.records)
+
+
+def test_lookup_fallback_returns_sim_result(hw_910b):
+    """LookupSimulator._fallback_result 在 sim_result 存在时直接返回。"""
+    from python.zrt.simulator.backends.lookup import LookupSimulator
+
+    node = OpNode(id="op_fb", op_type="aten.mm.default",
+                  inputs=[_tm("a", (64, 128)), _tm("b", (128, 64))],
+                  outputs=[_tm("o", (64, 64))])
+    preset = SimResult(
+        op_node_id="op_fb", latency_us=42.0,
+        compute_us=40.0, memory_us=2.0,
+        flops=1000, read_bytes=500, write_bytes=500,
+        arithmetic_intensity=1.0, bound="compute",
+        hw_utilization=0.5, backend="roofline", confidence=0.3,
+    )
+    node.sim_result = preset
+
+    sim = LookupSimulator()
+    result = sim._fallback_result(node, hw_910b)
+    assert result is preset
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Communication node formulas (graph-capture flow)
 # ─────────────────────────────────────────────────────────────────────────────
 

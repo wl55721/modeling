@@ -1,0 +1,27 @@
+{
+  "name": "TorchSort",
+  "description": "Sort tensor along a dimension: values, indices = sort(x, dim=d)",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "values",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "indices",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "int64"
+    }
+  ],
+  "compute_flops": "B * S * hidden_dim * 14",
+  "module": "torch.sort",
+  "category": "Torch"
+}

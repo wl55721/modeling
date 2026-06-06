@@ -1,0 +1,129 @@
+[
+    {
+        "name": "IndexPrologV4",
+        "module": "attn.indexer",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "bf16"
+            },
+            {
+                "name": "qr",
+                "shape": "[B, S, q_lora_rank]",
+                "dtype": "fp8"
+            }
+        ],
+        "params": [
+            {
+                "name": "weight_proj",
+                "shape": "[index_n_heads, hidden_size]",
+                "dtype": "fp16"
+            },
+            {
+                "name": "q_b",
+                "shape": "[index_n_heads * index_head_dim, q_lora_rank]",
+                "dtype": "fp8"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "query",
+                "shape": "[B, S, index_n_heads]",
+                "dtype": "fp16"
+            },
+            {
+                "name": "query",
+                "shape": "[B, S, index_n_heads * index_head_dim]",
+                "dtype": "fp16"
+            }
+        ],
+        "compute_flops": "2*B*S*hidden_size*index_n_heads*bf16 + 2*B*S*q_lora_rank*index_n_heads*index_head_dim*fp8"
+    },
+    {
+        "name": "Compressor",
+        "module": "attn.indexer.compressor",
+        "inputs": [
+            {
+                "name": "kv",
+                "shape": "[B, S, hidden_size]",
+                "dtype": "fp16"
+            }
+        ],
+        "params": [
+            {
+                "name": "wkv",
+                "shape": "[index_head_dim, hidden_size]",
+                "dtype": "fp16"
+            },
+            {
+                "name": "wgate",
+                "shape": "[index_head_dim, hidden_size]",
+                "dtype": "fp16"
+            },
+            {
+                "name": "ape",
+                "shape": "[compress_ratio, index_head_dim]",
+                "dtype": "fp32"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "kv",
+                "shape": "[B, S // compress_ratio, index_head_dim]",
+                "dtype": "fp16"
+            }
+        ],
+        "compute_flops": "4 * B * S * hidden_size * index_head_dim * fp16"
+    },
+    {
+        "name": "IndexCompressorEpilog",
+        "module": "attn.indexer.compressor",
+        "inputs": [
+            {
+                "name": "compressed_idx",
+                "shape": "[B, S // compress_ratio, index_head_dim]",
+                "dtype": "fp16"
+            }
+        ],
+        "params": [],
+        "outputs": [
+            {
+                "name": "indices",
+                "shape": "[B, S // compress_ratio, index_head_dim]",
+                "dtype": "fp8"
+            }
+        ],
+        "compute_flops": "factor * 2 * B * S // compress_ratio * index_head_dim * fp16"
+    },
+    {
+        "name": "LightningIndexer",
+        "module": "attn.indexer",
+        "inputs": [
+            {
+                "name": "query",
+                "shape": "[B, S, index_n_heads, index_head_dim]",
+                "dtype": "fp8"
+            },
+            {
+                "name": "key",
+                "shape": "[B, seq_len // compress_ratio, index_head_dim]",
+                "dtype": "fp8"
+            },
+            {
+                "name": "weights",
+                "shape": "[B, S, index_n_heads]",
+                "dtype": "bf16"
+            }
+        ],
+        "params": [],
+        "outputs": [
+            {
+                "name": "topk_indices",
+                "shape": "[B, S, seq_len // compress_ratio]",
+                "dtype": "int64"
+            }
+        ],
+        "compute_flops": "2*B*S*index_n_heads*index_head_dim*seq_len//compress_ratio*fp8 + 5*B*S*index_n_heads*seq_len//compress_ratio*fp16"
+    }
+]

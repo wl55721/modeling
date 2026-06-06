@@ -1,0 +1,48 @@
+[
+    {
+        "name": "Embedding",
+        "module": "embed",
+        "inputs": [
+            {
+                "name": "token_ids",
+                "shape": "[B, S]",
+                "dtype": "int64"
+            }
+        ],
+        "params": [
+            {
+                "name": "weight",
+                "shape": "[vocab_size // embed_tp_size, hidden_dim]",
+                "dtype": "bf16"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_dim]",
+                "dtype": "bf16"
+            }
+        ],
+        "compute_flops": "0"
+    },
+    {
+        "name": "AllReduce",
+        "inputs": [
+            {
+                "name": "x",
+                "shape": "[B, S, hidden_dim]",
+                "dtype": "fp16"
+            }
+        ],
+        "params": [],
+        "outputs": [
+            {
+                "name": "y",
+                "shape": "[B, S, hidden_dim]",
+                "dtype": "fp16"
+            }
+        ],
+        "compute_flops": "0",
+        "module": "embed"
+    }
+]

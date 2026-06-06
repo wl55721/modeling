@@ -1,0 +1,33 @@
+{
+  "name": "MoEGateTopK",
+  "description": "MoE Router with Top-K gating: scores = softmax(TopK(X @ W_gate))",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [
+    {
+      "name": "gate_weight",
+      "shape": "[num_experts, hidden_dim]",
+      "dtype": "fp32"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "topk_weights",
+      "shape": "[B, S, top_k]",
+      "dtype": "fp32"
+    },
+    {
+      "name": "topk_indices",
+      "shape": "[B, S, top_k]",
+      "dtype": "int64"
+    }
+  ],
+  "compute_flops": "2*B*S*hidden_dim*num_experts*fp32 + 7*B*S*num_experts*fp32",
+  "module": "moe.gate_topk",
+  "category": "MoE"
+}

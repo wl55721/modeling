@@ -1,0 +1,27 @@
+{
+  "name": "SwiGluQuant",
+  "description": "SwiGlu activation with quantization: quant(swiglu(x))",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": "[B, S, 2 * intermediate_size]",
+      "dtype": "bf16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "y",
+      "shape": "[B, S, intermediate_size]",
+      "dtype": "fp8"
+    },
+    {
+      "name": "scale",
+      "shape": "[B, S]",
+      "dtype": "fp32"
+    }
+  ],
+  "compute_flops": "9 * B * S * intermediate_size * bf16",
+  "module": "mlp.act_fn",
+  "category": "Activation"
+}

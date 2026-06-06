@@ -33,6 +33,7 @@ class ParallelConfig:
     cp_ulysses: int | None = None
     cp_ring: int | None = None
     sp: bool = False
+    tp_extend_ep: bool = False
 
     @property
     def total_devices(self) -> int:
@@ -274,6 +275,7 @@ class TrainingConfig:
     # Graph-capture MegaMoE controls
     mega_moe: bool = False
     mega_moe_waves: int = 0
+    moe_fb_overlap: bool = False
 
     # Pipeline schedule
     pp_schedule: str = "1f1b"  # "1f1b", "interleaved", "dualpipe", "dualpipev", "zb"
@@ -302,6 +304,8 @@ class TrainingConfig:
     # (K-wave overlap), reducing exposed comm time in trace mode.
     tp_coc: bool = False
     tp_coc_tile_k: int = 4
+    trace_ep_waves: bool = False
+    trace_moe_fb_overlap: bool = False
 
     # Memory offloading (optional, disabled by default)
     offload: OffloadConfig | None = None

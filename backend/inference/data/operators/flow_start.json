@@ -1,0 +1,22 @@
+{
+  "name": "START",
+  "description": "模型入口，标记推理起点",
+  "inputs": [
+    {
+      "name": "out",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "out",
+      "shape": "[B, S, hidden_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "0",
+  "module": "START",
+  "category": "Flow"
+}

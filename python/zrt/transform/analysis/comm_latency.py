@@ -8,11 +8,26 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from python.zrt.ir.node import update_latency
 from python.zrt.transform.base import GraphPass
 
 if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
     from python.zrt.transform.context import TransformContext
+
+
+def _rank_to_node(rank: int, devices_per_node: int) -> int:
+    return rank // max(1, devices_per_node)
+
+
+def _cross_node_from_rank_sample(
+    rank_sample: list[int] | tuple[int, ...],
+    devices_per_node: int,
+) -> bool:
+    if not rank_sample:
+        return False
+    nodes = {_rank_to_node(int(rank), devices_per_node) for rank in rank_sample}
+    return len(nodes) > 1
 
 
 def _estimate_comm_latency(
@@ -143,7 +158,13 @@ class CommLatencyPass(GraphPass):
 
             # Determine if cross-node
             intra_node_devices = hw_spec.interconnect.intra_node.num_devices
-            cross_node = group_size > intra_node_devices
+            rank_sample = node.attrs.get("rank_sample")
+            if rank_sample is not None:
+                cross_node = _cross_node_from_rank_sample(rank_sample, intra_node_devices)
+                placement_source = "rank_sample"
+            else:
+                cross_node = group_size > intra_node_devices
+                placement_source = "group_size"
 
             # Select appropriate link
             if cross_node:
@@ -160,9 +181,9 @@ class CommLatencyPass(GraphPass):
                 collective, group_size, data_bytes, bandwidth_bps, link.latency_us
             )
 
-            # Annotate results
-            node.annotations["latency_us"] = latency_us
+            update_latency(node, latency_us)
             node.annotations["cross_node"] = cross_node
+            node.annotations["placement_source"] = placement_source
             node.annotations["comm_algorithm"] = "ring" if collective == "all_reduce" else collective
 
         return g

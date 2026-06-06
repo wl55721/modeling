@@ -192,6 +192,13 @@ def main() -> None:
         help="Context-parallel degree (default: 1).",
     )
     parser.add_argument(
+        "--tp-extend-ep",
+        action="store_true",
+        default=False,
+        help="Use TP ranks as part of the MoE EP domain in graph capture "
+             "(ETP=1 instead of ETP=TP).",
+    )
+    parser.add_argument(
         "--cp-kind",
         default="none",
         choices=["none", "ulysses", "ring", "hybrid", "compressed"],
@@ -313,6 +320,17 @@ def main() -> None:
         help="Enable CoC (Communication-over-Computation) overlap for TP "
              "all_reduce.  Comm starts after 1/K of the predecessor compute "
              "instead of waiting for it to finish (K=4).",
+    )
+    parser.add_argument(
+        "--trace-ep-waves", action="store_true", default=False,
+        help="Render EP all-to-all and routed-expert compute as wave-level "
+             "segments in PP Chrome traces. This changes trace presentation "
+             "only; it does not alter step-time modelling.",
+    )
+    parser.add_argument(
+        "--trace-moe-fb-overlap", action="store_true", default=False,
+        help="Render MindSpeed-style MoE forward/backward A2A overlap metadata "
+             "in PP Chrome traces when available.",
     )
 
     args = parser.parse_args()
@@ -613,6 +631,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
         build_default_pipeline, TransformContext,
         ParallelConfig, StreamConfig,
     )
+    from python.zrt.transform.exporter import export_transformed_graph
     from python.zrt.transform.context import QuantConfig
     from python.zrt.report import export_reports
 
@@ -622,6 +641,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
         hw_spec=hw,
         parallel=ParallelConfig(
             tp=args.tp, pp=args.pp, ep=args.ep, dp=args.dp, cp=args.cp,
+            tp_extend_ep=args.tp_extend_ep,
         ),
         stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
         quant=quant,
@@ -636,6 +656,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
 
     for phase, raw_graph in result.graphs.items():
         g = pipe.run(raw_graph, ctx)
+        export_transformed_graph(g, ctx, result.output_dir)
 
         # Single call: schedule + simulate + all exports
         try:
@@ -672,7 +693,10 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         聚合为 block-level ops 后才能完全替代。
     """
     from python.zrt.transform.analysis import estimate_training_from_graphs
-    from python.zrt.transform.exporter import export_training_graphs
+    from python.zrt.transform.exporter import (
+        export_training_graphs,
+        export_transformed_graph_onnx,
+    )
 
     raw_fwd = result.graphs.get("train_forward")
     if raw_fwd is None:
@@ -745,6 +769,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         ep=args.ep,
         dp=args.dp,
         cp=args.cp,
+        tp_extend_ep=args.tp_extend_ep,
         cp_kind=getattr(args, "cp_kind", "ulysses"),
         zero_stage=args.zero_stage,
         optimizer=args.optimizer,
@@ -765,6 +790,8 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         dp_bucket_mode="ddp" if getattr(args, "dp_ddp_buckets", False) else "layer",
         dp_bucket_cap_mb=args.dp_bucket_cap_mb if args.dp_bucket_cap_mb is not None else 25.0,
         tp_coc=args.tp_coc,
+        trace_ep_waves=getattr(args, "trace_ep_waves", False),
+        trace_moe_fb_overlap=getattr(args, "trace_moe_fb_overlap", False),
         return_transformed=True,
         quant=args.quant,
         moe_total_experts=_moe_total,
@@ -827,6 +854,11 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
 
         # Hierarchical HTML + Chrome Trace (single export_reports call)
         train_graph = transformed.get("unified") or transformed.get("train_forward")
+        export_graphs = _training_export_graphs(result, transformed)
+        for graph_key, graph_obj in export_graphs.items():
+            filename_key = "unified" if graph_key in ("unified", "train") else graph_key
+            onnx_path = output_dir / f"{slug}_{filename_key}_graph.onnx"
+            export_transformed_graph_onnx(graph_obj, onnx_path)
         if train_graph is not None:
             from python.zrt.report import export_reports
 
@@ -948,6 +980,87 @@ def _model_spec_from_hf(model_id: str, args) -> "ModelSpec":
         num_experts=num_experts, top_k=top_k, moe_ffn=moe_ffn,
         act_dtype=Dtype.BF16,
     )
+
+
+def _phase_subgraph_for_training_export(graph, *, phase: str, name_suffix: str):
+    """Extract a phase-specific transformed graph for training graph export."""
+    phase_aliases = {
+        "train_forward": {"fwd", "forward", "train_forward"},
+        "train_backward": {"bwd", "backward", "train_backward"},
+    }.get(phase)
+    if phase_aliases is None:
+        return None
+    node_ids = {
+        node_id
+        for node_id, node in graph.nodes.items()
+        if str((node.annotations or {}).get("phase", "")).lower() in phase_aliases
+    }
+    if not node_ids:
+        return None
+
+    sub = graph.subgraph(node_ids)
+    base_name = _training_graph_base_name(getattr(graph, "name", ""))
+    sub.name = f"{base_name}_{name_suffix}" if base_name else name_suffix
+    sub.phase = phase
+    return sub
+
+
+def _training_graph_base_name(name: str) -> str:
+    """Strip phase suffixes before naming derived training graph exports."""
+    base = (name or "").replace("/", "_").replace(":", "_")
+    for suffix in (
+        "_train_forward",
+        "_train_backward",
+        "_train",
+        "_unified",
+    ):
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
+    return base
+
+
+def _training_export_graphs(result, transformed: dict) -> dict:
+    """Choose transformed graphs for training graph exports.
+
+    The training traceview uses pipeline-transformed graphs. When the modeller
+    stitches fwd+bwd, it returns only ``unified``; derive fwd/bwd exports from
+    that transformed unified graph rather than falling back to raw graphs.
+    """
+    export_graphs: dict = {}
+    unified = transformed.get("unified") or transformed.get("train")
+
+    if transformed.get("train_forward") is not None:
+        export_graphs["train_forward"] = transformed["train_forward"]
+    elif unified is not None:
+        fwd = _phase_subgraph_for_training_export(
+            unified,
+            phase="train_forward",
+            name_suffix="train_forward",
+        )
+        if fwd is not None:
+            export_graphs["train_forward"] = fwd
+
+    if transformed.get("train_backward") is not None:
+        export_graphs["train_backward"] = transformed["train_backward"]
+    elif unified is not None:
+        bwd = _phase_subgraph_for_training_export(
+            unified,
+            phase="train_backward",
+            name_suffix="train_backward",
+        )
+        if bwd is not None:
+            export_graphs["train_backward"] = bwd
+
+    if unified is not None:
+        unified_for_export = unified.clone()
+        base_name = _training_graph_base_name(getattr(unified, "name", ""))
+        unified_for_export.name = f"{base_name}_unified" if base_name else "unified"
+        export_graphs["unified"] = unified_for_export
+
+    if not export_graphs:
+        export_graphs.update(getattr(result, "graphs", {}) or {})
+
+    return export_graphs
 
 
 def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool = False) -> None:

@@ -82,12 +82,11 @@ class TestComputeExposedCommTime:
         exposed = compute_exposed_comm_time(200.0, "mc2")
         assert exposed == 0.0
 
-    def test_coc_fully_hidden(self):
-        """CoC: comm fits inside overlap window → exposed = 0."""
-        # t_matmul = 100, k = 4 → overlap window = 100 * 3/4 = 75
-        # t_comm = 50 < 75 → fully hidden
+    def test_coc_tile_pipeline_keeps_one_comm_tile_exposed(self):
+        """CoC: tiled overlap still exposes the first comm tile."""
+        # t_matmul = 100, k = 4, t_comm = 50 -> comm tile = 12.5.
         exposed = compute_exposed_comm_time(50.0, "coc", target_latency_us=100.0, coc_tile_k=4)
-        assert exposed == 0.0
+        assert exposed == pytest.approx(12.5)
 
     def test_coc_partially_exposed(self):
         """CoC: comm exceeds overlap window → partial exposure."""
@@ -177,6 +176,58 @@ class TestStreamAssignOverlapDetection:
 class TestOverlapIntegration:
     """Integration: overlap reduces step_time in TrainingPipelinePass."""
 
+    def test_timeline_overlap_without_graph_annotation_does_not_hide_comm(self):
+        """Trace placement alone must not decide exposed/hidden comm accounting."""
+        inp = TensorMeta(id="in", shape=(1, 128, 128), dtype=DType.BF16, mem_bytes=32768)
+        out = TensorMeta(id="out", shape=(1, 128, 128), dtype=DType.BF16, mem_bytes=32768)
+        g = OpGraph(
+            name="trace_overlap_is_display_only",
+            phase="train",
+            nodes={
+                "compute": OpNode(
+                    id="compute",
+                    op_type="aten.mm",
+                    inputs=[inp],
+                    outputs=[out],
+                    category="compute",
+                    annotations={
+                        "phase": "fwd",
+                        "latency_us": 100.0,
+                        "stream_id": 0,
+                        "stream_type": "compute",
+                    },
+                ),
+                "tp_comm": OpNode(
+                    id="tp_comm",
+                    op_type="comm.all_reduce",
+                    inputs=[out],
+                    outputs=[out],
+                    category="communication",
+                    annotations={
+                        "phase": "fwd",
+                        "latency_us": 100.0,
+                        "stream_id": 1,
+                        "stream_type": "comm",
+                        "inserted_by": "tp_pass",
+                    },
+                ),
+            },
+            edges=[],
+            metadata={"training_flops": 1e9},
+        )
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=2, pp=1, dp=1),
+            training=TrainingConfig(micro_batch=1, global_batch=8),
+        )
+
+        result = TrainingPipelinePass().run(g, ctx)
+        metrics = result.metadata["step_result"]
+
+        assert metrics["tp_hidden_ms"] == pytest.approx(0.0)
+        assert metrics["tp_exposed_ms"] == pytest.approx(0.1)
+        assert metrics["exposed_comm_ms"] == pytest.approx(0.8)
+
     def test_overlap_reduces_step_time(self):
         """Step time with overlap should be less than without."""
         seq_len, hidden = 2048, 4096
@@ -195,7 +246,7 @@ class TestOverlapIntegration:
             n.annotations["latency_us"] = 100.0
         ctx = _make_ctx()
         r_no = TrainingPipelinePass().run(g_no, ctx)
-        step_no = r_no.metadata["pipeline_metrics"].step_time_ms
+        step_no = r_no.metadata["step_result"]["step_time_ms"]
 
         # Graph with ring-CP overlap on the comm node
         g_ov = _make_graph_with_comm(seq_len, hidden)
@@ -205,7 +256,7 @@ class TestOverlapIntegration:
         comm.annotations["overlap_type"] = "ring_cp"
         comm.annotations["overlap_target"] = "fa_tile:matmul_0"
         r_ov = TrainingPipelinePass().run(g_ov, ctx)
-        step_ov = r_ov.metadata["pipeline_metrics"].step_time_ms
+        step_ov = r_ov.metadata["step_result"]["step_time_ms"]
 
         assert step_ov < step_no, (
             f"Overlap should reduce step time: {step_ov} >= {step_no}"
@@ -225,7 +276,7 @@ class TestOverlapIntegration:
         for n in g_no.nodes.values():
             n.annotations["latency_us"] = 100.0
         r_no = TrainingPipelinePass().run(g_no, ctx)
-        step_no = r_no.metadata["pipeline_metrics"].step_time_ms
+        step_no = r_no.metadata["step_result"]["step_time_ms"]
 
         g_coc = _make_graph_with_comm(seq_len, hidden)
         for n in g_coc.nodes.values():
@@ -236,7 +287,7 @@ class TestOverlapIntegration:
         # Intentionally no overlap_target: pipeline should use predecessor latency.
 
         r_coc = TrainingPipelinePass().run(g_coc, ctx)
-        step_coc = r_coc.metadata["pipeline_metrics"].step_time_ms
+        step_coc = r_coc.metadata["step_result"]["step_time_ms"]
 
         assert step_coc < step_no, (
             f"CoC fallback should reduce step time: {step_coc} >= {step_no}"

@@ -1,0 +1,2363 @@
+{
+  "name": "deepseek-v4-pro",
+  "num_ops": 66,
+  "num_layers": 3,
+  "num_edges": 65,
+  "operators": [
+    {
+      "op_id": 0,
+      "op_name": "start",
+      "layer_idx": -2,
+      "rank_idx": -1,
+      "op_module": "__builtin__",
+      "inputs": [],
+      "params": [],
+      "outputs": [
+        {
+          "name": "output",
+          "shape": "-",
+          "dtype": "-"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 1,
+      "op_name": "Embedding",
+      "layer_idx": -1,
+      "rank_idx": 0,
+      "op_module": "embed",
+      "inputs": [
+        {
+          "name": "token_ids",
+          "shape": "[B, S]",
+          "dtype": "int64"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[vocab_size // embed_tp_size, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "embeddings",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 2,
+      "op_name": "AllReduce",
+      "layer_idx": -1,
+      "rank_idx": 0,
+      "op_module": "embed",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 3,
+      "op_name": "MHCPre",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "mhc_pre",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [
+        {
+          "name": "hc_fn",
+          "shape": "[(2+hc_mult)*hc_mult, hc_mult * hidden_size]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "post",
+          "shape": "[B, S, hc_mult]",
+          "dtype": "fp32"
+        },
+        {
+          "name": "comb",
+          "shape": "[B, S, hc_mult * hc_mult]",
+          "dtype": "fp32"
+        }
+      ],
+      "compute_flops": "6*B*S*hc_mult*hidden_size*fp32 + 2*B*S*hc_mult*hidden_size*(2+hc_mult)*hc_mult*fp32"
+    },
+    {
+      "op_id": 4,
+      "op_name": "RMSNorm",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "input_norm",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "hidden_states",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * fp32"
+    },
+    {
+      "op_id": 5,
+      "op_name": "MLAPrologV4",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "attn",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [
+        {
+          "name": "q_a",
+          "shape": "[q_lora_rank, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "q_b",
+          "shape": "[num_attention_heads // tp_size * head_dim, q_lora_rank]",
+          "dtype": "fp8"
+        },
+        {
+          "name": "wkv",
+          "shape": "[head_dim, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "query_nope",
+          "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "key_nope",
+          "shape": "[B, S, 1, head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "2*B*S*hidden_dim*q_lora_rank*fp16 + 2*B*S*q_lora_rank*num_attention_heads//tp_size*head_dim*int8 + 2*B*S*hidden_dim*head_dim*fp16 + 4*B*S*(q_lora_rank+num_attention_heads//tp_size*head_dim+head_dim)*fp32"
+    },
+    {
+      "op_id": 6,
+      "op_name": "Compressor",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "attn.compressor",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [
+        {
+          "name": "wkv",
+          "shape": "[head_dim, hidden_size]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "wgate",
+          "shape": "[head_dim, hidden_size]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "ape",
+          "shape": "[compress_ratio, head_dim]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "kv",
+          "shape": "[B, S // compress_ratio, head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * head_dim * fp16"
+    },
+    {
+      "op_id": 7,
+      "op_name": "KVCompressorEpilog",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "attn.compressor",
+      "inputs": [
+        {
+          "name": "kv",
+          "shape": "[B, S // compress_ratio, head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "kv",
+          "shape": "[B, S // compress_ratio, head_dim]",
+          "dtype": "fp8"
+        }
+      ],
+      "compute_flops": "factor * 2 * B * S // compress_ratio * head_dim * fp16"
+    },
+    {
+      "op_id": 8,
+      "op_name": "SparseAttentionSharedKV",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "attn",
+      "inputs": [
+        {
+          "name": "q",
+          "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "kv",
+          "shape": "[B, seq_len, 1, head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "attn_out",
+          "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "5*B*S*num_attention_heads//tp_size*seq_len*fp16 + 4*B*S*num_attention_heads//tp_size*head_dim*seq_len*bf16"
+    },
+    {
+      "op_id": 9,
+      "op_name": "RopeComplex",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "attn",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, num_attention_heads // tp_size, qk_rope_head_dim]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, num_attention_heads // tp_size, qk_rope_head_dim]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "3 * B * S * num_attention_heads // tp_size * qk_rope_head_dim * bf16"
+    },
+    {
+      "op_id": 10,
+      "op_name": "MLAEpilogV4",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "attn.o_proj",
+      "inputs": [
+        {
+          "name": "attn_out",
+          "shape": "[B, S, o_groups, num_attention_heads * head_dim // o_groups]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [
+        {
+          "name": "wo_a",
+          "shape": "[o_groups * o_lora_rank // o_tp_size, num_attention_heads * head_dim // o_groups]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "wo_b",
+          "shape": "[hidden_size, o_groups * o_lora_rank // o_tp_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "2*B*S*o_groups*o_lora_rank//o_tp_size*num_attention_heads*head_dim//o_groups*fp16 + 2*B*S*o_groups*o_lora_rank//o_tp_size*hidden_size*fp8"
+    },
+    {
+      "op_id": 11,
+      "op_name": "AllReduce",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "attn.o_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 12,
+      "op_name": "MHCPost",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "mhc_post",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "residual",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "post",
+          "shape": "[B, S, hc_mult]",
+          "dtype": "fp32"
+        },
+        {
+          "name": "comb",
+          "shape": "[B, S, hc_mult, hc_mult]",
+          "dtype": "fp32"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "2*B*S*hc_mult*hidden_size*fp32 + B*S*hc_mult*(hc_mult+hc_mult-1)*hidden_size*fp32"
+    },
+    {
+      "op_id": 13,
+      "op_name": "MHCPre",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "mhc_pre",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [
+        {
+          "name": "hc_fn",
+          "shape": "[(2+hc_mult)*hc_mult, hc_mult * hidden_size]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "post",
+          "shape": "[B, S, hc_mult]",
+          "dtype": "fp32"
+        },
+        {
+          "name": "comb",
+          "shape": "[B, S, hc_mult * hc_mult]",
+          "dtype": "fp32"
+        }
+      ],
+      "compute_flops": "6*B*S*hc_mult*hidden_size*fp32 + 2*B*S*hc_mult*hidden_size*(2+hc_mult)*hc_mult*fp32"
+    },
+    {
+      "op_id": 14,
+      "op_name": "RMSNorm",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "post_attn_norm",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "hidden_states",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * fp32"
+    },
+    {
+      "op_id": 15,
+      "op_name": "MoEGateTopK",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "moe.gate_topk",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [
+        {
+          "name": "gate_weight",
+          "shape": "[num_experts, hidden_size]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "topk_weights",
+          "shape": "[B, S, top_k]",
+          "dtype": "fp32"
+        },
+        {
+          "name": "topk_indices",
+          "shape": "[B, S, top_k]",
+          "dtype": "int64"
+        }
+      ],
+      "compute_flops": "2*B*S*hidden_dim*num_experts*fp32 + 6*B*S*num_experts*fp32"
+    },
+    {
+      "op_id": 16,
+      "op_name": "MoEDispatch",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "moe.dispatch",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "expert_ids",
+          "shape": "[B, S, top_k]",
+          "dtype": "int32"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "dispatched_x",
+          "shape": "[top_k, B, S, hidden_dim]",
+          "dtype": "int8"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 17,
+      "op_name": "GroupMatMul",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "moe.routed_expert.gate_up_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[expert_groups, 2 * moe_intermediate_size, hidden_size]",
+          "dtype": "fp4"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "expert_out",
+          "shape": "[B, S, 2 * moe_intermediate_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "compute_flops": "2 * B * S * expert_groups * hidden_size * (2 * moe_intermediate_size) * fp8"
+    },
+    {
+      "op_id": 18,
+      "op_name": "SwiGluQuant",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "moe.routed_expert.act_fn",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, moe_intermediate_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, moe_intermediate_size]",
+          "dtype": "fp8"
+        },
+        {
+          "name": "scale",
+          "shape": "[B, S]",
+          "dtype": "fp32"
+        }
+      ],
+      "compute_flops": "9 * B * S * moe_intermediate_size * fp16"
+    },
+    {
+      "op_id": 19,
+      "op_name": "GroupMatMul",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "moe.routed_expert.down_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, moe_intermediate_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[expert_groups, moe_intermediate_size, hidden_size]",
+          "dtype": "fp4"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "expert_out",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "compute_flops": "2 * B * S * expert_groups * hidden_size * moe_intermediate_size * fp8"
+    },
+    {
+      "op_id": 20,
+      "op_name": "MoECombine",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "moe.combine",
+      "inputs": [
+        {
+          "name": "expert_out",
+          "shape": "[top_k, B, S, hidden_dim]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "expert_ids",
+          "shape": "[B, S, top_k]",
+          "dtype": "int32"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 21,
+      "op_name": "MatMul",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "moe.shared_expert.gate_up_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[2 * moe_intermediate_size, hidden_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "gate_up",
+          "shape": "[B, S, 2 * moe_intermediate_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "2 * B * S * hidden_size * 2 * moe_intermediate_size * fp8"
+    },
+    {
+      "op_id": 22,
+      "op_name": "SwiGluQuant",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "moe.shared_expert.act_fn",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, 2 * moe_intermediate_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, moe_intermediate_size]",
+          "dtype": "fp8"
+        },
+        {
+          "name": "scale",
+          "shape": "[B, S]",
+          "dtype": "fp32"
+        }
+      ],
+      "compute_flops": "9 * B * S * moe_intermediate_size * fp16"
+    },
+    {
+      "op_id": 23,
+      "op_name": "MatMul",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "moe.shared_expert.down_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, moe_intermediate_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[hidden_size, moe_intermediate_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "2 * B * S * hidden_size * moe_intermediate_size * fp8"
+    },
+    {
+      "op_id": 24,
+      "op_name": "MHCPost",
+      "layer_idx": 0,
+      "rank_idx": 0,
+      "op_module": "mhc_post",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "residual",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "post",
+          "shape": "[B, S, hc_mult]",
+          "dtype": "fp32"
+        },
+        {
+          "name": "comb",
+          "shape": "[B, S, hc_mult, hc_mult]",
+          "dtype": "fp32"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "2*B*S*hc_mult*hidden_size*fp32 + B*S*hc_mult*(hc_mult+hc_mult-1)*hidden_size*fp32"
+    },
+    {
+      "op_id": 25,
+      "op_name": "MHCPre",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "mhc_pre",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [
+        {
+          "name": "hc_fn",
+          "shape": "[(2+hc_mult)*hc_mult, hc_mult * hidden_size]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "post",
+          "shape": "[B, S, hc_mult]",
+          "dtype": "fp32"
+        },
+        {
+          "name": "comb",
+          "shape": "[B, S, hc_mult * hc_mult]",
+          "dtype": "fp32"
+        }
+      ],
+      "compute_flops": "6*B*S*hc_mult*hidden_size*fp32 + 2*B*S*hc_mult*hidden_size*(2+hc_mult)*hc_mult*fp32"
+    },
+    {
+      "op_id": 26,
+      "op_name": "RMSNorm",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "input_norm",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "hidden_states",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * fp32"
+    },
+    {
+      "op_id": 27,
+      "op_name": "MLAPrologV4",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [
+        {
+          "name": "q_a",
+          "shape": "[q_lora_rank, hidden_size]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "q_b",
+          "shape": "[num_attention_heads // tp_size * head_dim, q_lora_rank]",
+          "dtype": "fp8"
+        },
+        {
+          "name": "wkv",
+          "shape": "[head_dim, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "query_nope",
+          "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "key_nope",
+          "shape": "[B, S, 1, head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "2*B*S*hidden_dim*q_lora_rank*fp16 + 2*B*S*q_lora_rank*num_attention_heads//tp_size*head_dim*int8 + 2*B*S*hidden_dim*head_dim*fp16 + 4*B*S*(q_lora_rank+num_attention_heads//tp_size*head_dim+head_dim)*fp32"
+    },
+    {
+      "op_id": 28,
+      "op_name": "IndexPrologV4",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn.indexer",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "x",
+          "shape": "[B, S, q_lora_rank]",
+          "dtype": "fp8"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight_proj",
+          "shape": "[index_n_heads, hidden_size]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "q_b",
+          "shape": "[index_n_heads * index_head_dim, q_lora_rank]",
+          "dtype": "fp8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "query",
+          "shape": "[B, S, index_n_heads]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "query",
+          "shape": "[B, S, index_n_heads * index_head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "2*B*S*hidden_size*index_n_heads*bf16 + 2*B*S*q_lora_rank*index_n_heads*index_head_dim*fp8"
+    },
+    {
+      "op_id": 29,
+      "op_name": "Compressor",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn.indexer.compressor",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [
+        {
+          "name": "wkv",
+          "shape": "[2 * index_head_dim, hidden_size]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "wgate",
+          "shape": "[2 * index_head_dim, hidden_size]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "ape",
+          "shape": "[compress_ratio, 2 * index_head_dim]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "kv",
+          "shape": "[B, S // compress_ratio, index_head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * 2 * index_head_dim * fp16"
+    },
+    {
+      "op_id": 30,
+      "op_name": "IndexCompressorEpilog",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn.indexer.compressor",
+      "inputs": [
+        {
+          "name": "compressed_idx",
+          "shape": "[B, S // compress_ratio, index_head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "indices",
+          "shape": "[B, S // compress_ratio, index_head_dim]",
+          "dtype": "fp8"
+        }
+      ],
+      "compute_flops": "factor * 2 * B * S // compress_ratio * index_head_dim * fp16"
+    },
+    {
+      "op_id": 31,
+      "op_name": "LightningIndexer",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn.indexer",
+      "inputs": [
+        {
+          "name": "query",
+          "shape": "[B, S, index_n_heads, index_head_dim]",
+          "dtype": "fp8"
+        },
+        {
+          "name": "key",
+          "shape": "[B, seq_len // compress_ratio, index_head_dim]",
+          "dtype": "fp8"
+        },
+        {
+          "name": "weights",
+          "shape": "[B, S, index_n_heads]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "topk_indices",
+          "shape": "[B, S, seq_len // compress_ratio]",
+          "dtype": "int64"
+        }
+      ],
+      "compute_flops": "2*B*S*index_n_heads*index_head_dim*seq_len//compress_ratio*fp8 + 5*B*S*index_n_heads*seq_len//compress_ratio*fp16"
+    },
+    {
+      "op_id": 32,
+      "op_name": "Compressor",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn.compressor",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [
+        {
+          "name": "wkv",
+          "shape": "[2 * head_dim, hidden_size]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "wgate",
+          "shape": "[2 * head_dim, hidden_size]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "ape",
+          "shape": "[compress_ratio, 2 * head_dim]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "kv",
+          "shape": "[B, S // compress_ratio, head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * 2 * head_dim * fp16"
+    },
+    {
+      "op_id": 33,
+      "op_name": "KVCompressorEpilog",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn.compressor",
+      "inputs": [
+        {
+          "name": "kv",
+          "shape": "[B, S // compress_ratio, head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "kv",
+          "shape": "[B, S // compress_ratio, head_dim]",
+          "dtype": "fp8"
+        }
+      ],
+      "compute_flops": "factor * 2 * B * S // compress_ratio * head_dim * fp16"
+    },
+    {
+      "op_id": 34,
+      "op_name": "SparseAttentionSharedKV",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn.flash_attention",
+      "inputs": [
+        {
+          "name": "q",
+          "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "kv",
+          "shape": "[B, seq_len, 1, head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "attn_out",
+          "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "5*B*S*num_attention_heads//tp_size*seq_len*fp16 + 4*B*S*num_attention_heads//tp_size*head_dim*seq_len*bf16"
+    },
+    {
+      "op_id": 35,
+      "op_name": "RopeComplex",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, num_attention_heads // tp_size, qk_rope_head_dim]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, num_attention_heads // tp_size, qk_rope_head_dim]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "3 * B * S * num_attention_heads // tp_size * qk_rope_head_dim * bf16"
+    },
+    {
+      "op_id": 36,
+      "op_name": "MLAEpilogV4",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn.o_proj",
+      "inputs": [
+        {
+          "name": "attn_out",
+          "shape": "[B, S, o_groups, num_attention_heads * head_dim // o_groups]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [
+        {
+          "name": "wo_a",
+          "shape": "[o_groups * o_lora_rank // o_tp_size, num_attention_heads * head_dim // o_groups]",
+          "dtype": "fp16"
+        },
+        {
+          "name": "wo_b",
+          "shape": "[hidden_size, o_groups * o_lora_rank // o_tp_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "2*B*S*o_groups*o_lora_rank//o_tp_size*num_attention_heads*head_dim//o_groups*fp16 + 2*B*S*o_groups*o_lora_rank//o_tp_size*hidden_size*fp8"
+    },
+    {
+      "op_id": 37,
+      "op_name": "AllReduce",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "attn.o_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 38,
+      "op_name": "MHCPost",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "mhc_post",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "residual",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "post",
+          "shape": "[B, S, hc_mult]",
+          "dtype": "fp32"
+        },
+        {
+          "name": "comb",
+          "shape": "[B, S, hc_mult, hc_mult]",
+          "dtype": "fp32"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "2*B*S*hc_mult*hidden_size*fp32 + B*S*hc_mult*(hc_mult+hc_mult-1)*hidden_size*fp32"
+    },
+    {
+      "op_id": 39,
+      "op_name": "MHCPre",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "mhc_pre",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [
+        {
+          "name": "hc_fn",
+          "shape": "[(2+hc_mult)*hc_mult, hc_mult * hidden_size]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "post",
+          "shape": "[B, S, hc_mult]",
+          "dtype": "fp32"
+        },
+        {
+          "name": "comb",
+          "shape": "[B, S, hc_mult * hc_mult]",
+          "dtype": "fp32"
+        }
+      ],
+      "compute_flops": "6*B*S*hc_mult*hidden_size*fp32 + 2*B*S*hc_mult*hidden_size*(2+hc_mult)*hc_mult*fp32"
+    },
+    {
+      "op_id": 40,
+      "op_name": "RMSNorm",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "post_attn_norm",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "hidden_states",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * fp32"
+    },
+    {
+      "op_id": 41,
+      "op_name": "MoEGateTopK",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "moe.gate_topk",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [
+        {
+          "name": "gate_weight",
+          "shape": "[num_experts, hidden_size]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "topk_weights",
+          "shape": "[B, S, top_k]",
+          "dtype": "fp32"
+        },
+        {
+          "name": "topk_indices",
+          "shape": "[B, S, top_k]",
+          "dtype": "int64"
+        }
+      ],
+      "compute_flops": "2*B*S*hidden_dim*num_experts*fp32 + 7*B*S*num_experts*fp32"
+    },
+    {
+      "op_id": 42,
+      "op_name": "MoEDispatch",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "moe.dispatch",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "expert_ids",
+          "shape": "[B, S, top_k]",
+          "dtype": "int32"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "dispatched_x",
+          "shape": "[top_k, B, S, hidden_dim]",
+          "dtype": "int8"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 43,
+      "op_name": "GroupMatMul",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "moe.routed_expert.gate_up_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "params": [
+        {
+          "name": "gate_up_w",
+          "shape": "[expert_groups, 2 * moe_intermediate_size, hidden_size]",
+          "dtype": "fp4"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "expert_out",
+          "shape": "[B, S, 2 * moe_intermediate_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "compute_flops": "2 * B * S * expert_groups * hidden_size * (2 * moe_intermediate_size) * fp8"
+    },
+    {
+      "op_id": 44,
+      "op_name": "SwiGluQuant",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "moe.routed_expert.act_fn",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, moe_intermediate_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, moe_intermediate_size]",
+          "dtype": "fp8"
+        },
+        {
+          "name": "scale",
+          "shape": "[B, S]",
+          "dtype": "fp32"
+        }
+      ],
+      "compute_flops": "9 * B * S * moe_intermediate_size * fp16"
+    },
+    {
+      "op_id": 45,
+      "op_name": "GroupMatMul",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "moe.routed_expert.down_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, moe_intermediate_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[expert_groups, hidden_size, moe_intermediate_size]",
+          "dtype": "fp4"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "expert_out",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "compute_flops": "2 * B * S * expert_groups * hidden_size * moe_intermediate_size * fp8"
+    },
+    {
+      "op_id": 46,
+      "op_name": "MoECombine",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "moe.combine",
+      "inputs": [
+        {
+          "name": "expert_out",
+          "shape": "[top_k, B, S, hidden_dim]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "expert_ids",
+          "shape": "[B, S, top_k]",
+          "dtype": "int32"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 47,
+      "op_name": "MatMul",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "moe.shared_expert.gate_up_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[2 * moe_intermediate_size, hidden_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, 2 * moe_intermediate_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "2 * B * S * hidden_size * 2 * moe_intermediate_size * fp8"
+    },
+    {
+      "op_id": 48,
+      "op_name": "SwiGluQuant",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "moe.shared_expert.act_fn",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, 2 * moe_intermediate_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, moe_intermediate_size]",
+          "dtype": "fp8"
+        },
+        {
+          "name": "scale",
+          "shape": "[B, S]",
+          "dtype": "fp32"
+        }
+      ],
+      "compute_flops": "9 * B * S * moe_intermediate_size * fp16"
+    },
+    {
+      "op_id": 49,
+      "op_name": "MatMul",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "moe.shared_expert.down_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, moe_intermediate_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[hidden_size, moe_intermediate_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp8"
+        }
+      ],
+      "compute_flops": "2 * B * S * hidden_size * moe_intermediate_size * fp8"
+    },
+    {
+      "op_id": 50,
+      "op_name": "MHCPost",
+      "layer_idx": 4,
+      "rank_idx": 0,
+      "op_module": "mhc_post",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "residual",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        },
+        {
+          "name": "post",
+          "shape": "[B, S, hc_mult]",
+          "dtype": "fp32"
+        },
+        {
+          "name": "comb",
+          "shape": "[B, S, hc_mult, hc_mult]",
+          "dtype": "fp32"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "2*B*S*hc_mult*hidden_size*fp32 + B*S*hc_mult*(hc_mult+hc_mult-1)*hidden_size*fp32"
+    },
+    {
+      "op_id": 51,
+      "op_name": "MHCHead",
+      "layer_idx": 900,
+      "rank_idx": 0,
+      "op_module": "mhc_head",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [
+        {
+          "name": "hc_head_fn",
+          "shape": "[hc_mult, hc_mult * hidden_size]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "logits",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "6*B*S*hc_mult*hidden_size*fp32 + 2*B*S*hc_mult*hidden_size*hc_mult*fp32 + 11*B*S*hc_mult*fp32"
+    },
+    {
+      "op_id": 52,
+      "op_name": "RMSNorm",
+      "layer_idx": 900,
+      "rank_idx": 0,
+      "op_module": "lm_head",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "hidden_states",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * fp32"
+    },
+    {
+      "op_id": 53,
+      "op_name": "ColumnParallelLinear",
+      "layer_idx": 900,
+      "rank_idx": 0,
+      "op_module": "lm_head",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight_shard",
+          "shape": "[vocab_size // lmhead_tp_size, hidden_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y_shard",
+          "shape": "[B, S, vocab_size // lmhead_tp_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "2 * B * S * hidden_size * vocab_size // lmhead_tp_size * fp16"
+    },
+    {
+      "op_id": 54,
+      "op_name": "AllGather",
+      "layer_idx": 900,
+      "rank_idx": 0,
+      "op_module": "lm_head",
+      "inputs": [
+        {
+          "name": "logits_shard",
+          "shape": "[B, S, vocab_size // lmhead_tp_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "logits",
+          "shape": "[B, S, vocab_size]",
+          "dtype": "fp16"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 55,
+      "op_name": "Embedding",
+      "layer_idx": 980,
+      "rank_idx": 0,
+      "op_module": "mtp.embed",
+      "inputs": [
+        {
+          "name": "token_ids",
+          "shape": "[B, S]",
+          "dtype": "int64"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[vocab_size // embed_tp_size, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "embeddings",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 56,
+      "op_name": "AllReduce",
+      "layer_idx": 980,
+      "rank_idx": 0,
+      "op_module": "mtp.embed",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 57,
+      "op_name": "RMSNorm",
+      "layer_idx": 980,
+      "rank_idx": 0,
+      "op_module": "mtp.e_norm",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "hidden_states",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * fp32"
+    },
+    {
+      "op_id": 58,
+      "op_name": "RMSNorm",
+      "layer_idx": 980,
+      "rank_idx": 0,
+      "op_module": "mtp.h_norm",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "hidden_states",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * fp32"
+    },
+    {
+      "op_id": 59,
+      "op_name": "Linear",
+      "layer_idx": 980,
+      "rank_idx": 0,
+      "op_module": "mtp.e_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[hidden_size, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "2 * B * S * hidden_size * hidden_size * bf16"
+    },
+    {
+      "op_id": 60,
+      "op_name": "Linear",
+      "layer_idx": 980,
+      "rank_idx": 0,
+      "op_module": "mtp.h_proj",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[hidden_size, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "2 * B * S * hidden_size * hidden_size * bf16"
+    },
+    {
+      "op_id": 61,
+      "op_name": "MHCHead",
+      "layer_idx": 980,
+      "rank_idx": 0,
+      "op_module": "mtp.mhc_head",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hc_mult, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [
+        {
+          "name": "hc_head_fn",
+          "shape": "[hc_mult, hc_mult * hidden_size]",
+          "dtype": "fp32"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "logits",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "6*B*S*hc_mult*hidden_size*fp32 + 2*B*S*hc_mult*hidden_size*hc_mult*fp32 + 11*B*S*hc_mult*fp32"
+    },
+    {
+      "op_id": 62,
+      "op_name": "RMSNorm",
+      "layer_idx": 980,
+      "rank_idx": 0,
+      "op_module": "mtp.lm_head",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "hidden_states",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "4 * B * S * hidden_size * fp32"
+    },
+    {
+      "op_id": 63,
+      "op_name": "ColumnParallelLinear",
+      "layer_idx": 980,
+      "rank_idx": 0,
+      "op_module": "mtp.lm_head",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": "[B, S, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [
+        {
+          "name": "weight",
+          "shape": "[vocab_size // lmhead_tp_size, hidden_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y_shard",
+          "shape": "[B, S, vocab_size // lmhead_tp_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "2 * B * S * hidden_dim * vocab_size // lmhead_tp_size * bf16"
+    },
+    {
+      "op_id": 64,
+      "op_name": "AllGather",
+      "layer_idx": 980,
+      "rank_idx": 0,
+      "op_module": "mtp.lm_head",
+      "inputs": [
+        {
+          "name": "logits_shard",
+          "shape": "[B, S, vocab_size // lmhead_tp_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "params": [],
+      "outputs": [
+        {
+          "name": "logits",
+          "shape": "[B, S, vocab_size]",
+          "dtype": "bf16"
+        }
+      ],
+      "compute_flops": "0"
+    },
+    {
+      "op_id": 65,
+      "op_name": "end",
+      "layer_idx": 1000,
+      "rank_idx": -1,
+      "op_module": "__builtin__",
+      "inputs": [
+        {
+          "name": "input",
+          "shape": "-",
+          "dtype": "-"
+        }
+      ],
+      "params": [],
+      "outputs": [],
+      "compute_flops": "0"
+    }
+  ],
+  "edges": [
+    {
+      "from": 1,
+      "to": 2
+    },
+    {
+      "from": 2,
+      "to": 3
+    },
+    {
+      "from": 3,
+      "to": 4
+    },
+    {
+      "from": 4,
+      "to": 5
+    },
+    {
+      "from": 5,
+      "to": 6
+    },
+    {
+      "from": 6,
+      "to": 7
+    },
+    {
+      "from": 7,
+      "to": 8
+    },
+    {
+      "from": 8,
+      "to": 9
+    },
+    {
+      "from": 9,
+      "to": 10
+    },
+    {
+      "from": 10,
+      "to": 11
+    },
+    {
+      "from": 11,
+      "to": 12
+    },
+    {
+      "from": 12,
+      "to": 13
+    },
+    {
+      "from": 13,
+      "to": 14
+    },
+    {
+      "from": 14,
+      "to": 15
+    },
+    {
+      "from": 15,
+      "to": 16
+    },
+    {
+      "from": 16,
+      "to": 17
+    },
+    {
+      "from": 17,
+      "to": 18
+    },
+    {
+      "from": 18,
+      "to": 19
+    },
+    {
+      "from": 19,
+      "to": 20
+    },
+    {
+      "from": 20,
+      "to": 21
+    },
+    {
+      "from": 21,
+      "to": 22
+    },
+    {
+      "from": 22,
+      "to": 23
+    },
+    {
+      "from": 23,
+      "to": 24
+    },
+    {
+      "from": 24,
+      "to": 25
+    },
+    {
+      "from": 25,
+      "to": 26
+    },
+    {
+      "from": 26,
+      "to": 27
+    },
+    {
+      "from": 27,
+      "to": 28
+    },
+    {
+      "from": 28,
+      "to": 29
+    },
+    {
+      "from": 29,
+      "to": 30
+    },
+    {
+      "from": 30,
+      "to": 31
+    },
+    {
+      "from": 31,
+      "to": 32
+    },
+    {
+      "from": 32,
+      "to": 33
+    },
+    {
+      "from": 33,
+      "to": 34
+    },
+    {
+      "from": 34,
+      "to": 35
+    },
+    {
+      "from": 35,
+      "to": 36
+    },
+    {
+      "from": 36,
+      "to": 37
+    },
+    {
+      "from": 37,
+      "to": 38
+    },
+    {
+      "from": 38,
+      "to": 39
+    },
+    {
+      "from": 39,
+      "to": 40
+    },
+    {
+      "from": 40,
+      "to": 41
+    },
+    {
+      "from": 41,
+      "to": 42
+    },
+    {
+      "from": 42,
+      "to": 43
+    },
+    {
+      "from": 43,
+      "to": 44
+    },
+    {
+      "from": 44,
+      "to": 45
+    },
+    {
+      "from": 45,
+      "to": 46
+    },
+    {
+      "from": 46,
+      "to": 47
+    },
+    {
+      "from": 47,
+      "to": 48
+    },
+    {
+      "from": 48,
+      "to": 49
+    },
+    {
+      "from": 49,
+      "to": 50
+    },
+    {
+      "from": 50,
+      "to": 51
+    },
+    {
+      "from": 51,
+      "to": 52
+    },
+    {
+      "from": 52,
+      "to": 53
+    },
+    {
+      "from": 53,
+      "to": 54
+    },
+    {
+      "from": 54,
+      "to": 55
+    },
+    {
+      "from": 55,
+      "to": 56
+    },
+    {
+      "from": 56,
+      "to": 57
+    },
+    {
+      "from": 57,
+      "to": 58
+    },
+    {
+      "from": 58,
+      "to": 59
+    },
+    {
+      "from": 59,
+      "to": 60
+    },
+    {
+      "from": 60,
+      "to": 61
+    },
+    {
+      "from": 61,
+      "to": 62
+    },
+    {
+      "from": 62,
+      "to": 63
+    },
+    {
+      "from": 63,
+      "to": 64
+    },
+    {
+      "from": 0,
+      "to": 1
+    },
+    {
+      "from": 64,
+      "to": 65
+    }
+  ],
+  "ranks": [
+    {
+      "rank_idx": 0,
+      "ops": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64
+      ],
+      "layers": [
+        {
+          "layer_idx": 0,
+          "repeat": 31,
+          "kind": "regular",
+          "ops": [
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24
+          ]
+        },
+        {
+          "layer_idx": 4,
+          "repeat": 30,
+          "kind": "regular",
+          "ops": [
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47,
+            48,
+            49,
+            50
+          ]
+        },
+        {
+          "layer_idx": 980,
+          "repeat": 1,
+          "kind": "mtp",
+          "ops": [
+            55,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61,
+            62,
+            63,
+            64
+          ]
+        }
+      ]
+    }
+  ]
+}

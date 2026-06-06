@@ -1,0 +1,27 @@
+{
+  "name": "SparseAttentionSharedKV",
+  "description": "Sparse Attention with shared KV cache across attention heads",
+  "inputs": [
+    {
+      "name": "q",
+      "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+      "dtype": "fp16"
+    },
+    {
+      "name": "kv",
+      "shape": "[B, seq_len, 1, head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "params": [],
+  "outputs": [
+    {
+      "name": "attn_out",
+      "shape": "[B, S, num_attention_heads // tp_size, head_dim]",
+      "dtype": "fp16"
+    }
+  ],
+  "compute_flops": "5*B*S*num_attention_heads//tp_size*seq_len*fp16 + 4*B*S*num_attention_heads//tp_size*head_dim*seq_len*bf16",
+  "module": "attn",
+  "category": "Attention"
+}

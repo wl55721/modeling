@@ -13,6 +13,7 @@ import pytest
 from python.zrt.ir.edge import Edge
 from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.node import OpNode
+from python.zrt.simulator.result import SimResult
 from python.zrt.transform.analysis.passes import FlopsPass, RooflinePass
 from python.zrt.transform.analysis.training import (
     TrainingFlopsPass,
@@ -249,9 +250,22 @@ def test_recompute_compute_time_excludes_comm_nodes_defensively():
         annotations={
             "phase": "fwd",
             "recompute": True,
-            "latency_us": 100.0,
-            "base_latency_us": 80.0,
         },
+    )
+    fwd_compute.sim_result = SimResult(
+        op_node_id="fwd_compute",
+        latency_us=100.0,
+        compute_us=100.0,
+        memory_us=0.0,
+        flops=0,
+        read_bytes=0,
+        write_bytes=0,
+        arithmetic_intensity=0.0,
+        bound="",
+        hw_utilization=0.0,
+        backend="test",
+        confidence=1.0,
+        base_latency_us=80.0,
     )
     bwd_compute = OpNode(
         id="bwd_compute",
@@ -260,9 +274,22 @@ def test_recompute_compute_time_excludes_comm_nodes_defensively():
         annotations={
             "phase": "bwd",
             "recompute": True,
-            "latency_us": 90.0,
-            "base_latency_us": 70.0,
         },
+    )
+    bwd_compute.sim_result = SimResult(
+        op_node_id="bwd_compute",
+        latency_us=90.0,
+        compute_us=90.0,
+        memory_us=0.0,
+        flops=0,
+        read_bytes=0,
+        write_bytes=0,
+        arithmetic_intensity=0.0,
+        bound="",
+        hw_utilization=0.0,
+        backend="test",
+        confidence=1.0,
+        base_latency_us=70.0,
     )
     comm = OpNode(
         id="comm",
@@ -271,9 +298,22 @@ def test_recompute_compute_time_excludes_comm_nodes_defensively():
         annotations={
             "phase": "fwd",
             "recompute": True,
-            "latency_us": 1000.0,
-            "base_latency_us": 900.0,
         },
+    )
+    comm.sim_result = SimResult(
+        op_node_id="comm",
+        latency_us=1000.0,
+        compute_us=0.0,
+        memory_us=0.0,
+        flops=0,
+        read_bytes=0,
+        write_bytes=0,
+        arithmetic_intensity=0.0,
+        bound="",
+        hw_utilization=0.0,
+        backend="test",
+        confidence=1.0,
+        base_latency_us=900.0,
     )
     g = _make_graph(
         [fwd_compute, bwd_compute, comm],
@@ -718,8 +758,9 @@ def test_flash_attention_internal_recompute_is_not_external_checkpoint_replay():
     assert g.metadata["recompute_flops"] == 0
 
     g = RooflinePass().run(g, ctx)
-    assert g.nodes["fa_bwd"].annotations["recompute_flops"] == 0
-    assert g.nodes["fa_bwd"].annotations["recompute_latency_us"] == 0.0
+    assert g.nodes["fa_bwd"].sim_result is not None
+    assert g.nodes["fa_bwd"].sim_result.recompute_flops == 0
+    assert g.nodes["fa_bwd"].sim_result.recompute_latency_us == 0.0
 
 
 def test_recompute_helper_classifies_internal_attention_kernels():
