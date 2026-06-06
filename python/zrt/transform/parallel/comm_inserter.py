@@ -98,6 +98,7 @@ def _infer_compressed_layer_type_from_scope(scope: str, layer: str) -> str:
 def _compute_compressed_cp_bytes(
     layer_type: str, seq_len: int, cp: int, hidden: int,
     micro_batch: int, ctx: "TransformContext",
+    tp: int = 1, attn_act_bytes: float = 2.0,
 ) -> tuple[int, int, int]:
     """Compute Stage 1 (P2P) and Stage 2 (AllGather) byte budgets for
     compressed CP. Returns ``(p2p_bytes, ag_bytes, compression_ratio)``.
@@ -105,9 +106,9 @@ def _compute_compressed_cp_bytes(
     Delegates to ``CompressedCPCommAnalyzer`` from
     ``python.zrt.training.models.compressed_cp`` when available — this keeps
     the graph-capture flow aligned with the training Spec flow on the
-    exact CSA/HCA/SWA breakdown. Falls back to the legacy
-    ``ratio=4`` approximation only when the analyzer is unavailable or
-    layer geometry is missing.
+    exact CSA/HCA/SWA breakdown. Falls back to ``_cp_collective_bytes``
+    (the same TP/attn_act-aware formula used by the dense strategies)
+    only when the analyzer is unavailable.
     """
     compression_ratio = 4 if layer_type == "csa" else 128
 
@@ -133,18 +134,21 @@ def _compute_compressed_cp_bytes(
             p2p_bytes = int(analyzer.stage1_comm_bytes_csa())
             ag_bytes = int(analyzer.stage2_comm_bytes_csa(seq_len))
             compression_ratio = analyzer.config.compression_ratio_csa
-        elif layer_type == "hca":
+            return p2p_bytes, ag_bytes, compression_ratio
+        if layer_type == "hca":
             p2p_bytes = int(analyzer.stage1_comm_bytes_hca())
             ag_bytes = int(analyzer.stage2_comm_bytes_hca(seq_len))
             compression_ratio = analyzer.config.compression_ratio_hca
-        else:
-            seq_local = seq_len // cp
-            p2p_bytes = micro_batch * seq_local * hidden * 2
-            ag_bytes = p2p_bytes // 4
-        return p2p_bytes, ag_bytes, compression_ratio
+            return p2p_bytes, ag_bytes, compression_ratio
 
-    seq_local = seq_len // cp
-    p2p_bytes = micro_batch * seq_local * hidden * 2
+    seq_local = seq_len // max(1, cp)
+    p2p_bytes = _cp_collective_bytes(
+        micro_batch=micro_batch,
+        seq_local=seq_local,
+        hidden=hidden,
+        tp=tp,
+        attn_act_bytes=attn_act_bytes,
+    )
     ag_bytes = p2p_bytes // compression_ratio
     return p2p_bytes, ag_bytes, compression_ratio
 
@@ -430,12 +434,6 @@ class CommInserterPass(GraphPass):
             attn_act_bytes = float(ctx.training.effective_attn_act_dtype().bytes)
         else:
             attn_act_bytes = 2.0
-
-        # Resolve cp_kind based on model type
-        if ctx.training:
-            cp_kind_resolved = ctx.training.resolve_cp_kind(ctx.model_id, cp)
-        else:
-            cp_kind_resolved = "ulysses"
 
         cp_nodes = [n for n in g.topo_sort() if n.annotations.get("cp_split")]
 
@@ -798,9 +796,9 @@ class CommInserterPass(GraphPass):
         training Spec ``if cp_type == 'swa': continue`` behavior at
         ``shard.py:425``.
 
-        ``tp`` / ``attn_act_bytes`` are accepted for shape-fallback parity
-        with the dense strategies (the byte budgets themselves come from the
-        analyzer, not from a local formula).
+        When the analyzer is unavailable, byte budgets fall back to
+        ``_cp_collective_bytes`` (TP/attn_act-aware) so the compressed
+        path is no longer BF16-hardcoded and TP-agnostic.
         """
         layer = first_node.layer or "root"
 
@@ -839,6 +837,8 @@ class CommInserterPass(GraphPass):
             hidden=hidden,
             micro_batch=micro_batch,
             ctx=ctx,
+            tp=tp,
+            attn_act_bytes=attn_act_bytes,
         )
 
         p2p_comm = OpNode(

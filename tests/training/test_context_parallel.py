@@ -8,6 +8,7 @@ from zrt.ir.edge import Edge
 from zrt.transform.context import TransformContext, ParallelConfig, TrainingConfig
 from zrt.transform.parallel.context_parallel import ContextParallelPass
 from zrt.transform.parallel.comm_inserter import CommInserterPass
+from zrt.transform.parallel.comm_inserter import _compute_compressed_cp_bytes
 
 
 def _make_attn_graph(seq_len=2048, hidden=4096, num_layers=2):
@@ -360,7 +361,7 @@ class TestCPCorrectedFormulas:
         graph = _make_attn_graph(num_layers=1)
         ctx = TransformContext(
             hw_spec=_make_hardware_spec(),
-            parallel=ParallelConfig(tp=1, cp=cp, cp_ring=cp_ring),
+            parallel=ParallelConfig(tp=1, cp=cp, cp_ulysses=cp_ring, cp_ring=cp_ring),
             training=TrainingConfig(
                 micro_batch=1, global_batch=8, cp_kind="hybrid",
             ),
@@ -431,3 +432,51 @@ class TestCPCorrectedFormulas:
                 f"Node {n.id}: expected {expected_bytes} (with tp={tp}), "
                 f"got {n.attrs['bytes']}"
             )
+
+
+    def test_compressed_fallback_uses_tp_and_attn_act_bytes(self):
+        """Compressed CP fallback (analyzer=None path) now uses _cp_collective_bytes.
+
+        Regression guard: previously the fallback hardcoded
+        ``micro_batch * seq_local * hidden * 2`` (BF16, TP-agnostic).
+        With ``ctx=None`` the analyzer is unavailable, so the helper
+        formula must be the one that produces the byte budget.
+        """
+        seq_len, hidden, cp, micro_batch, tp = 1024, 4096, 4, 2, 2
+        attn_act_bytes = 1.0  # FP8 in mixed-quant V4
+
+        p2p, ag, ratio = _compute_compressed_cp_bytes(
+            layer_type="csa",
+            seq_len=seq_len,
+            cp=cp,
+            hidden=hidden,
+            micro_batch=micro_batch,
+            ctx=None,  # forces analyzer=None → fallback path
+            tp=tp,
+            attn_act_bytes=attn_act_bytes,
+        )
+        # csa: compression_ratio = 4
+        expected_p2p = micro_batch * (seq_len // cp) * (hidden // tp) * attn_act_bytes
+        expected_ag = expected_p2p // 4
+        assert p2p == expected_p2p, (
+            f"p2p_bytes should mirror dense helper (TP-sharded, attn-act-aware); "
+            f"expected {expected_p2p}, got {p2p}"
+        )
+        assert ag == expected_ag
+        assert ratio == 4
+
+
+    def test_compressed_fallback_bf16_tp1_matches_legacy(self):
+        """BF16 + tp=1 keeps the legacy formula numerically stable."""
+        seq_len, hidden, cp, micro_batch = 512, 2048, 2, 1
+        p2p, ag, ratio = _compute_compressed_cp_bytes(
+            layer_type="csa",
+            seq_len=seq_len, cp=cp, hidden=hidden,
+            micro_batch=micro_batch, ctx=None,
+            tp=1, attn_act_bytes=2.0,
+        )
+        # Legacy: micro_batch * seq_local * hidden * 2
+        # New:    micro_batch * (seq_len//cp) * (hidden//1) * 2.0  → same
+        assert p2p == micro_batch * (seq_len // cp) * hidden * 2
+        assert ag == p2p // 4
+        assert ratio == 4
