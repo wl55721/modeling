@@ -149,6 +149,28 @@ def _compute_compressed_cp_bytes(
     return p2p_bytes, ag_bytes, compression_ratio
 
 
+def _cp_collective_bytes(
+    micro_batch: int,
+    seq_local: int,
+    hidden: int,
+    tp: int,
+    attn_act_bytes: float,
+) -> int:
+    """Per-rank CP collective bytes for dense strategies (Ulysses/Ring/Hybrid).
+
+    Mirrors the spec flow formula at
+    ``python/zrt/training/ir/shard.py:325, 356, 379``::
+
+        a2a_bytes / p2p_bytes = (seq_len // cp) * (hidden // tp) * act_bytes
+
+    The graph-capture flow historically hardcoded ``micro_batch * seq_local *
+    hidden * 2`` (BF16 baseline, TP-agnostic); that formula over-counts when
+    TP>1 (CP sharding is downstream of TP, so the local hidden is hidden//tp)
+    and when attn-region dtype is FP8 in V4 mixed-quant (1 byte vs 2).
+    """
+    return int(micro_batch * seq_local * (hidden // max(1, tp)) * attn_act_bytes)
+
+
 def _propagate_phase(src: OpNode, dst: OpNode) -> None:
     """Copy ``annotations["phase"]`` from src to dst if present."""
     phase = src.annotations.get("phase", "")
@@ -402,6 +424,13 @@ class CommInserterPass(GraphPass):
         hidden = ctx.training.hidden if ctx.training else 7168
         micro_batch = ctx.training.micro_batch if ctx.training else 1
 
+        tp = ctx.parallel.tp if ctx.parallel and ctx.parallel.tp else 1
+        cp_ring = ctx.parallel.cp_ring if ctx.parallel and ctx.parallel.cp_ring else cp
+        if ctx.training is not None and hasattr(ctx.training, "effective_attn_act_dtype"):
+            attn_act_bytes = float(ctx.training.effective_attn_act_dtype().bytes)
+        else:
+            attn_act_bytes = 2.0
+
         # Resolve cp_kind based on model type
         if ctx.training:
             cp_kind_resolved = ctx.training.resolve_cp_kind(ctx.model_id, cp)
@@ -438,7 +467,8 @@ class CommInserterPass(GraphPass):
 
             if cp_kind == "ulysses":
                 pre_comm, post_comm = self._create_ulysses_comm_nodes(
-                    first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd"
+                    first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd",
+                    tp=tp, attn_act_bytes=attn_act_bytes,
                 )
                 self._attach_cp_attrs((pre_comm, post_comm), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, pre_comm)
@@ -446,14 +476,16 @@ class CommInserterPass(GraphPass):
 
             elif cp_kind == "ring":
                 ring_comm = self._create_ring_comm_node(
-                    first_node, seq_len, cp, hidden, micro_batch, phase="fwd"
+                    first_node, seq_len, cp, hidden, micro_batch, phase="fwd",
+                    tp=tp, attn_act_bytes=attn_act_bytes,
                 )
                 self._attach_cp_attrs((ring_comm,), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, ring_comm)
 
             elif cp_kind == "hybrid":
                 a2a_pre, a2a_post, p2p = self._create_hybrid_comm_nodes(
-                    first_node, seq_len, cp, hidden, micro_batch, phase="fwd"
+                    first_node, seq_len, cp, hidden, micro_batch, phase="fwd",
+                    tp=tp, attn_act_bytes=attn_act_bytes, cp_ring=cp_ring,
                 )
                 self._attach_cp_attrs((a2a_pre, a2a_post, p2p), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, a2a_pre)
@@ -463,7 +495,8 @@ class CommInserterPass(GraphPass):
             elif cp_kind == "compressed":
                 self._insert_compressed_cp_comm_block(
                     g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd",
-                    rank_sample=cp_rank_sample, ctx=ctx
+                    rank_sample=cp_rank_sample, ctx=ctx,
+                    tp=tp, attn_act_bytes=attn_act_bytes,
                 )
 
         for layer, nodes in layer_bwd_groups.items():
@@ -478,7 +511,8 @@ class CommInserterPass(GraphPass):
 
             if cp_kind == "ulysses":
                 pre_comm, post_comm = self._create_ulysses_comm_nodes(
-                    first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd"
+                    first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd",
+                    tp=tp, attn_act_bytes=attn_act_bytes,
                 )
                 self._attach_cp_attrs((pre_comm, post_comm), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, pre_comm)
@@ -486,14 +520,16 @@ class CommInserterPass(GraphPass):
 
             elif cp_kind == "ring":
                 ring_comm = self._create_ring_comm_node(
-                    first_node, seq_len, cp, hidden, micro_batch, phase="bwd"
+                    first_node, seq_len, cp, hidden, micro_batch, phase="bwd",
+                    tp=tp, attn_act_bytes=attn_act_bytes,
                 )
                 self._attach_cp_attrs((ring_comm,), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, ring_comm)
 
             elif cp_kind == "hybrid":
                 a2a_pre, a2a_post, p2p = self._create_hybrid_comm_nodes(
-                    first_node, seq_len, cp, hidden, micro_batch, phase="bwd"
+                    first_node, seq_len, cp, hidden, micro_batch, phase="bwd",
+                    tp=tp, attn_act_bytes=attn_act_bytes, cp_ring=cp_ring,
                 )
                 self._attach_cp_attrs((a2a_pre, a2a_post, p2p), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, a2a_pre)
@@ -503,7 +539,8 @@ class CommInserterPass(GraphPass):
             elif cp_kind == "compressed":
                 self._insert_compressed_cp_comm_block(
                     g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd",
-                    rank_sample=cp_rank_sample, ctx=ctx
+                    rank_sample=cp_rank_sample, ctx=ctx,
+                    tp=tp, attn_act_bytes=attn_act_bytes,
                 )
 
     def _attach_cp_attrs(
@@ -525,20 +562,24 @@ class CommInserterPass(GraphPass):
 
     def _create_ulysses_comm_nodes(
         self, first_node: OpNode, last_node: OpNode,
-        seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
+        seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str,
+        tp: int = 1, attn_act_bytes: float = 2.0,
     ) -> tuple[OpNode, OpNode]:
         """创建Ulysses pre/post A2A通信节点。"""
         seq_local = seq_len // cp
         layer = first_node.layer or "root"
         phase_suffix = phase
+        hidden_local = hidden // max(1, tp)
 
         if first_node.inputs:
             pre_in_shape = first_node.inputs[0].shape
         else:
-            pre_in_shape = (micro_batch, seq_local, hidden)
+            pre_in_shape = (micro_batch, seq_local, hidden_local)
 
         pre_out_shape = pre_in_shape
-        a2a_bytes = micro_batch * seq_local * hidden * 2
+        a2a_bytes = _cp_collective_bytes(
+            micro_batch, seq_local, hidden, tp, attn_act_bytes,
+        )
 
         pre_comm = OpNode(
             id=f"comm_a2a_cp_pre_layer_{layer}_{phase_suffix}",
@@ -589,18 +630,22 @@ class CommInserterPass(GraphPass):
         return pre_comm, post_comm
 
     def _create_ring_comm_node(
-        self, first_node: OpNode, seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
+        self, first_node: OpNode, seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str,
+        tp: int = 1, attn_act_bytes: float = 2.0,
     ) -> OpNode:
         """创建Ring CP的P2P通信节点。"""
         seq_local = seq_len // cp
-        p2p_bytes = micro_batch * seq_local * hidden * 2
+        p2p_bytes = _cp_collective_bytes(
+            micro_batch, seq_local, hidden, tp, attn_act_bytes,
+        )
         layer = first_node.layer or "root"
         phase_suffix = phase
+        hidden_local = hidden // max(1, tp)
 
         if first_node.inputs:
             ring_shape = first_node.inputs[0].shape
         else:
-            ring_shape = (micro_batch, seq_local, hidden)
+            ring_shape = (micro_batch, seq_local, hidden_local)
 
         ring_comm = OpNode(
             id=f"comm_p2p_ring_layer_{layer}_{phase_suffix}",
@@ -632,19 +677,32 @@ class CommInserterPass(GraphPass):
         return ring_comm
 
     def _create_hybrid_comm_nodes(
-        self, first_node: OpNode, seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
+        self, first_node: OpNode, seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str,
+        tp: int = 1, attn_act_bytes: float = 2.0, cp_ring: int | None = None,
     ) -> tuple[OpNode, OpNode, OpNode]:
-        """创建Hybrid CP通信节点组（A2A pre + P2P + A2A post）。"""
+        """创建Hybrid CP通信节点组（A2A pre + P2P + A2A post）。
+
+        P2P rounds uses ``cp_ring`` (the ring-attention sub-dimension, not the
+        total CP size) to match the spec flow at
+        ``python/zrt/training/ir/shard.py:393``.  When ``cp_ring`` is unset
+        (legacy single-factor configs), it falls back to ``cp``.
+        """
         seq_local = seq_len // cp
-        a2a_bytes = micro_batch * seq_local * hidden * 2
-        p2p_bytes = micro_batch * seq_local * hidden * 2
+        a2a_bytes = _cp_collective_bytes(
+            micro_batch, seq_local, hidden, tp, attn_act_bytes,
+        )
+        p2p_bytes = _cp_collective_bytes(
+            micro_batch, seq_local, hidden, tp, attn_act_bytes,
+        )
         layer = first_node.layer or "root"
         phase_suffix = phase
+        hidden_local = hidden // max(1, tp)
+        p2p_rounds = cp_ring if cp_ring else cp
 
         if first_node.inputs:
             shape = first_node.inputs[0].shape
         else:
-            shape = (micro_batch, seq_local, hidden)
+            shape = (micro_batch, seq_local, hidden_local)
 
         a2a_pre = OpNode(
             id=f"comm_a2a_hybrid_pre_layer_{layer}_{phase_suffix}",
@@ -679,7 +737,7 @@ class CommInserterPass(GraphPass):
                 "collective": "send_recv",
                 "role": "cp_hybrid_p2p",
                 "bytes": p2p_bytes,
-                "rounds": cp,
+                "rounds": p2p_rounds,
                 "overlap": True,
                 "layer": layer,
             },
@@ -726,6 +784,7 @@ class CommInserterPass(GraphPass):
         seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str,
         rank_sample: list[int],
         ctx: "TransformContext" = None,
+        tp: int = 1, attn_act_bytes: float = 2.0,
     ) -> None:
         """DeepSeek-V4 two-stage Compressed CP, inserted at block boundary.
 
@@ -738,6 +797,10 @@ class CommInserterPass(GraphPass):
         SWA-only layers are skipped entirely (no P2P, no AG), matching the
         training Spec ``if cp_type == 'swa': continue`` behavior at
         ``shard.py:425``.
+
+        ``tp`` / ``attn_act_bytes`` are accepted for shape-fallback parity
+        with the dense strategies (the byte budgets themselves come from the
+        analyzer, not from a local formula).
         """
         layer = first_node.layer or "root"
 
@@ -762,11 +825,12 @@ class CommInserterPass(GraphPass):
 
         seq_local = seq_len // cp
         phase_suffix = phase
+        hidden_local = hidden // max(1, tp)
 
         if first_node.inputs:
             shape = first_node.inputs[0].shape
         else:
-            shape = (micro_batch, seq_local, hidden)
+            shape = (micro_batch, seq_local, hidden_local)
 
         p2p_bytes, ag_bytes, compression_ratio = _compute_compressed_cp_bytes(
             layer_type=layer_type,

@@ -281,3 +281,153 @@ class TestCPSkip:
                     if "cp_ulysses" in n.attrs.get("role", "")
                     or n.attrs.get("role") == "cp_ring"]
         assert len(cp_nodes) == 0
+
+
+class TestCPCorrectedFormulas:
+    """Tests that lock in the corrected CP byte / rounds formulas.
+
+    Background: the graph-capture flow historically hardcoded
+    ``micro_batch * seq_local * hidden * 2`` (BF16 baseline, TP-agnostic) and
+    ``rounds=cp`` for Hybrid P2P.  This over-counted when TP>1 (local hidden
+    is ``hidden // tp`` because CP shards downstream of TP) and overstated
+    P2P rounds in Hybrid (spec flow uses ``cp_ring``, not total ``cp``).
+    """
+
+    def test_ulysses_bytes_divided_by_tp(self):
+        """Ulysses A2A bytes = B * S_local * (hidden // tp) * act_bytes."""
+        seq_len, hidden, cp, tp, batch = 2048, 4096, 4, 2, 1
+        graph = _make_attn_graph(seq_len=seq_len, hidden=hidden)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=tp, cp=cp),
+            training=TrainingConfig(
+                micro_batch=batch, global_batch=8, cp_kind="ulysses",
+                seq_len=seq_len, hidden=hidden,
+            ),
+        )
+
+        g = ContextParallelPass().run(graph, ctx)
+        g = CommInserterPass().run(g, ctx)
+
+        expected_bytes = batch * (seq_len // cp) * (hidden // tp) * 2
+
+        a2a_nodes = [
+            n for n in g.nodes.values()
+            if n.op_type == "comm.all_to_all" and "cp_ulysses" in n.attrs.get("role", "")
+        ]
+        assert a2a_nodes, "Ulysses A2A nodes not inserted"
+        for n in a2a_nodes:
+            assert n.attrs["bytes"] == expected_bytes, (
+                f"Node {n.id}: expected {expected_bytes} (with tp={tp}), "
+                f"got {n.attrs['bytes']}"
+            )
+
+    def test_ring_bytes_divided_by_tp(self):
+        """Ring P2P bytes = B * S_local * (hidden // tp) * act_bytes."""
+        seq_len, hidden, cp, tp, batch = 2048, 4096, 4, 2, 1
+        graph = _make_attn_graph(seq_len=seq_len, hidden=hidden)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=tp, cp=cp),
+            training=TrainingConfig(
+                micro_batch=batch, global_batch=8, cp_kind="ring",
+                seq_len=seq_len, hidden=hidden,
+            ),
+        )
+
+        g = ContextParallelPass().run(graph, ctx)
+        g = CommInserterPass().run(g, ctx)
+
+        expected_bytes = batch * (seq_len // cp) * (hidden // tp) * 2
+
+        p2p_nodes = [
+            n for n in g.nodes.values()
+            if n.op_type == "comm.send_recv" and n.attrs.get("role") == "cp_ring"
+        ]
+        assert p2p_nodes, "Ring P2P nodes not inserted"
+        for n in p2p_nodes:
+            assert n.attrs["bytes"] == expected_bytes, (
+                f"Node {n.id}: expected {expected_bytes} (with tp={tp}), "
+                f"got {n.attrs['bytes']}"
+            )
+
+    def test_hybrid_p2p_rounds_uses_cp_ring(self):
+        """Hybrid P2P ``rounds`` = ``cp_ring`` (not total ``cp``).
+
+        Matches the spec flow at ``python/zrt/training/ir/shard.py:393``.
+        """
+        cp, cp_ring = 4, 2
+        graph = _make_attn_graph(num_layers=1)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp, cp_ring=cp_ring),
+            training=TrainingConfig(
+                micro_batch=1, global_batch=8, cp_kind="hybrid",
+            ),
+        )
+
+        g = ContextParallelPass().run(graph, ctx)
+        g = CommInserterPass().run(g, ctx)
+
+        p2p_nodes = [
+            n for n in g.nodes.values()
+            if n.op_type == "comm.send_recv" and n.attrs.get("role") == "cp_hybrid_p2p"
+        ]
+        assert p2p_nodes, "Hybrid P2P nodes not inserted"
+        for n in p2p_nodes:
+            assert n.attrs["rounds"] == cp_ring, (
+                f"Node {n.id}: expected rounds={cp_ring} (cp_ring), "
+                f"got {n.attrs['rounds']} (cp={cp})"
+            )
+
+    def test_hybrid_p2p_rounds_falls_back_to_cp(self):
+        """When ``cp_ring`` is unset, Hybrid P2P rounds falls back to ``cp``."""
+        cp = 4
+        graph = _make_attn_graph(num_layers=1)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=cp),
+            training=TrainingConfig(
+                micro_batch=1, global_batch=8, cp_kind="hybrid",
+            ),
+        )
+
+        g = ContextParallelPass().run(graph, ctx)
+        g = CommInserterPass().run(g, ctx)
+
+        p2p_nodes = [
+            n for n in g.nodes.values()
+            if n.op_type == "comm.send_recv" and n.attrs.get("role") == "cp_hybrid_p2p"
+        ]
+        assert p2p_nodes
+        for n in p2p_nodes:
+            assert n.attrs["rounds"] == cp
+
+    def test_hybrid_bytes_divided_by_tp(self):
+        """Hybrid A2A/P2P bytes = B * S_local * (hidden // tp) * act_bytes."""
+        seq_len, hidden, cp, tp, batch = 2048, 4096, 4, 2, 1
+        graph = _make_attn_graph(seq_len=seq_len, hidden=hidden)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=tp, cp=cp),
+            training=TrainingConfig(
+                micro_batch=batch, global_batch=8, cp_kind="hybrid",
+                seq_len=seq_len, hidden=hidden,
+            ),
+        )
+
+        g = ContextParallelPass().run(graph, ctx)
+        g = CommInserterPass().run(g, ctx)
+
+        expected_bytes = batch * (seq_len // cp) * (hidden // tp) * 2
+
+        hybrid_nodes = [
+            n for n in g.nodes.values()
+            if "cp_hybrid" in n.attrs.get("role", "")
+        ]
+        assert hybrid_nodes
+        for n in hybrid_nodes:
+            assert n.attrs["bytes"] == expected_bytes, (
+                f"Node {n.id}: expected {expected_bytes} (with tp={tp}), "
+                f"got {n.attrs['bytes']}"
+            )
