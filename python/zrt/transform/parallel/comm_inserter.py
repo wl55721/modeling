@@ -670,7 +670,6 @@ class CommInserterPass(GraphPass):
             layer_type = _infer_compressed_layer_type_from_scope(
                 first_node.scope or "", layer,
             )
-
         if layer_type == "swa" or layer_type == "none":
             return
 

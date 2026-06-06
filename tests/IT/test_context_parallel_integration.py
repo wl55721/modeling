@@ -1703,3 +1703,86 @@ class TestCPSkipOps:
         assert par_embed.outputs[0].shape == (128, 4096), (
             f"parallel_embedding output should not be split, got {par_embed.outputs[0].shape}"
         )
+
+
+class TestModellerCompressRatiosPlumbing:
+    """Regression tests for the production path: modeller → TrainingConfig.
+
+    Reproduces the original bug where ``estimate_training_from_graphs`` did
+    not forward ``compress_ratios`` / layer counts from the loaded HF config
+    into ``TrainingConfig``, causing ``resolve_layer_cp_type`` to fall through
+    to the "csa" catch-all for every layer. The fix plumbs six new kwargs
+    through ``estimate_training_from_graphs`` and the CLI.
+    """
+
+    def test_resolve_layer_cp_type_uses_passed_compress_ratios(self):
+        """compress_ratios plumbed via estimate_training_from_graphs are honored."""
+        from python.zrt.transform.analysis import estimate_training_from_graphs
+
+        # Build a minimal graph (1 node) so the function can run
+        g = _make_simple_mlp_graph(seq_len=128, hidden=64, num_layers=3)
+
+        # Per-layer ratios: SWA → CSA → HCA
+        ratios = [0, 4, 128]
+
+        # Capture the TrainingConfig that the function builds internally
+        from python.zrt.transform.context import (
+            FusionConfig, ParallelConfig, QuantConfig, TransformContext,
+        )
+
+        report, ctx, _ = estimate_training_from_graphs(
+            forward_graph=g,
+            backward_graph=None,
+            hw_spec=_make_hardware_spec(),
+            hidden=64,
+            num_layers=3,
+            num_layers_full=3,
+            seq_len=128,
+            batch_size=1,
+            tp=1, pp=1, ep=1, dp=1, cp=2,
+            cp_kind="compressed",
+            compress_ratios=ratios,
+            num_csa_layers=1,
+            num_hca_layers=1,
+            num_swa_only_layers=1,
+            return_transformed=True,
+        )
+
+        assert ctx.training.compress_ratios == ratios
+        assert ctx.training.resolve_layer_cp_type(0) == "swa"
+        assert ctx.training.resolve_layer_cp_type(1) == "csa"
+        assert ctx.training.resolve_layer_cp_type(2) == "hca"
+
+    def test_resolve_layer_cp_type_csa_catchall_without_compress_ratios(self):
+        """Without compress_ratios or counts, the legacy 'csa' catch-all still fires.
+
+        This is the documented safety-net behavior (see context.py:366) — when no
+        compressed-layer metadata is configured, all layers are treated as CSA
+        to avoid silently dropping CP communication. Non-V4 models never reach
+        this path because ``cp_kind != 'compressed'`` gates the resolver.
+        """
+        from python.zrt.transform.analysis import estimate_training_from_graphs
+
+        g = _make_simple_mlp_graph(seq_len=128, hidden=64, num_layers=2)
+
+        report, ctx, _ = estimate_training_from_graphs(
+            forward_graph=g,
+            backward_graph=None,
+            hw_spec=_make_hardware_spec(),
+            hidden=64,
+            num_layers=2,
+            num_layers_full=2,
+            seq_len=128,
+            batch_size=1,
+            tp=1, pp=1, ep=1, dp=1, cp=2,
+            cp_kind="compressed",
+            # No compress_ratios, no counts — exercises the legacy default
+            return_transformed=True,
+        )
+
+        assert ctx.training.compress_ratios is None
+        assert ctx.training.num_csa_layers == 0
+        assert ctx.training.num_hca_layers == 0
+        # Legacy behavior: all layers treated as CSA when no metadata present
+        assert ctx.training.resolve_layer_cp_type(0) == "csa"
+        assert ctx.training.resolve_layer_cp_type(1) == "csa"

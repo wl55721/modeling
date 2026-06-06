@@ -74,6 +74,12 @@ def estimate_training_from_graphs(
     kv_heads: int | None = None,
     head_dim: int | None = None,
     layer_profile: "LayerProfile | None" = None,
+    compress_ratios: "list[int] | None" = None,
+    num_csa_layers: int = 0,
+    num_hca_layers: int = 0,
+    num_swa_only_layers: int = 0,
+    kv_head_dim: int = 512,
+    indexer_head_dim: int = 128,
 ) -> "TrainingReport | tuple[TrainingReport, TransformContext, dict[str, OpGraph]]":
     """Estimate training performance from pre-built OpGraph instances.
 
@@ -179,6 +185,12 @@ def estimate_training_from_graphs(
             seq_len=seq_len,
             hidden=hidden,
             cp_kind=cp_kind,
+            compress_ratios=compress_ratios,
+            num_csa_layers=num_csa_layers,
+            num_hca_layers=num_hca_layers,
+            num_swa_only_layers=num_swa_only_layers,
+            kv_head_dim=kv_head_dim,
+            indexer_head_dim=indexer_head_dim,
         ),
         fusion=fusion_config or FusionConfig(),
         quant=quant_cfg,

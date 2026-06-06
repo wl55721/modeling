@@ -687,6 +687,12 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     # Load model config for MoE sizing (active experts, total experts)
     _moe_active = 1
     _moe_total = 0
+    _compress_ratios = None
+    _num_csa_layers = 0
+    _num_hca_layers = 0
+    _num_swa_only_layers = 0
+    _kv_head_dim = 512
+    _indexer_head_dim = 128
     try:
         import json as _json3
         _cfg_path = Path(model_id) / "config.json"
@@ -703,6 +709,18 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
                 logger.info(
                     "MoE config: %d total experts, %d active per token",
                     _moe_total, _moe_active)
+            # Compressed CP (DeepSeek-V4) per-layer metadata
+            _compress_ratios = _raw_cfg.get("compress_ratios") or None
+            _num_swa_only_layers = int(_raw_cfg.get("num_swa_only_layers", 0) or 0)
+            _num_csa_layers = int(_raw_cfg.get("num_csa_layers", 0) or 0)
+            _num_hca_layers = int(_raw_cfg.get("num_hca_layers", 0) or 0)
+            _kv_head_dim = int(_raw_cfg.get("kv_head_dim", 512) or 512)
+            _indexer_head_dim = int(_raw_cfg.get("indexer_head_dim", 128) or 128)
+            if _compress_ratios:
+                logger.info(
+                    "Compressed CP: %d layers, ratios=%s (swa=%d, csa=%d, hca=%d)",
+                    len(_compress_ratios), _compress_ratios,
+                    _num_swa_only_layers, _num_csa_layers, _num_hca_layers)
     except Exception as _exc:
         logger.warning("Could not read MoE config: %s", _exc)
 
@@ -754,6 +772,12 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         model_id=model_id,
         fusion_config=fusion_cfg,
         layer_profile=layer_profile,
+        compress_ratios=_compress_ratios,
+        num_csa_layers=_num_csa_layers,
+        num_hca_layers=_num_hca_layers,
+        num_swa_only_layers=_num_swa_only_layers,
+        kv_head_dim=_kv_head_dim,
+        indexer_head_dim=_indexer_head_dim,
     )
 
     try:
